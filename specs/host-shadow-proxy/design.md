@@ -102,10 +102,11 @@ Expose CLI options for shared listen address/port, control endpoint, PSK
 identity, PSK secret environment variable or protected file, UDP idle
 timeout, and logging/runtime settings.
 
-For an explicit IPv4 or IPv6 address, bind that family. For a wildcard
-dual-stack configuration, bind one IPv4 and one IPv6 socket on the same
-port and fail clearly if a required bind cannot be established. The
-supported runtime target is Windows.
+The listen address MUST be a specific IPv4 or IPv6 address rather than a
+wildcard. This is required because UDP tuple lookup needs the actual local
+destination address; Tokio's basic `recv_from` API does not expose the
+destination address selected by the host for wildcard receives. The supported
+runtime target is Windows.
 
 ## 3. Invariants
 

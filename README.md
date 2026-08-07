@@ -77,4 +77,6 @@ TLS transport with `--features tls-psk`. Configure the listener and control
 service with CLI options; provide the PSK through `--psk-secret`,
 `SSP_TLS_PSK_SECRET`, or `--psk-secret-file`. The proxy requires a nonzero
 `--udp-idle-timeout-secs` and never falls back to direct forwarding when a
-mapping lookup fails.
+mapping lookup fails. The listen address must be a specific local IPv4 or IPv6
+address, not a wildcard address, so UDP lookups preserve the actual local
+destination tuple.

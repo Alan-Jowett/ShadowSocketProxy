@@ -70,6 +70,12 @@ pub struct ProxyConfig {
 
 impl ProxyConfig {
     pub fn validate(&self) -> Result<(), ProxyError> {
+        if self.listen.ip().is_unspecified() {
+            return Err(ProxyError::InvalidConfiguration(
+                "listen address must be specific so UDP tuples identify the local destination"
+                    .into(),
+            ));
+        }
         if self.control_endpoint.is_empty() {
             return Err(ProxyError::InvalidConfiguration(
                 "control endpoint is required".into(),
@@ -242,39 +248,35 @@ impl<C: MappingClient + 'static> UdpAssociations<C> {
             destination: self.socket.local_addr()?,
             protocol: UDP_PROTOCOL,
         };
-        let association = {
-            let mut entries = self.entries.lock().await;
-            entries.retain(|_, association| {
-                association
-                    .last_seen
-                    .try_lock()
-                    .map(|last_seen| last_seen.elapsed() < self.idle_timeout)
-                    .unwrap_or(true)
+        let existing = self.entries.lock().await.get(&tuple).cloned();
+        let association = if let Some(existing) = existing {
+            existing
+        } else {
+            let mapping = self.client.get_mapping(&tuple).await?;
+            if mapping.protocol != UDP_PROTOCOL {
+                return Err(ProxyError::InvalidMapping(
+                    "UDP lookup returned a non-UDP mapping".into(),
+                ));
+            }
+            let outbound = Arc::new(UdpSocket::bind(unspecified_for(mapping.address)).await?);
+            outbound.connect(mapping.address).await?;
+            let candidate = Arc::new(UdpAssociation {
+                client_address,
+                outbound,
+                last_seen: Mutex::new(std::time::Instant::now()),
             });
+            let mut entries = self.entries.lock().await;
             if let Some(existing) = entries.get(&tuple) {
                 existing.clone()
             } else {
-                let mapping = self.client.get_mapping(&tuple).await?;
-                if mapping.protocol != UDP_PROTOCOL {
-                    return Err(ProxyError::InvalidMapping(
-                        "UDP lookup returned a non-UDP mapping".into(),
-                    ));
-                }
-                let outbound = Arc::new(UdpSocket::bind(unspecified_for(mapping.address)).await?);
-                outbound.connect(mapping.address).await?;
-                let association = Arc::new(UdpAssociation {
-                    client_address,
-                    outbound,
-                    last_seen: Mutex::new(std::time::Instant::now()),
-                });
-                entries.insert(tuple, association.clone());
+                entries.insert(tuple, candidate.clone());
                 spawn_udp_relay(
-                    association.clone(),
+                    candidate.clone(),
                     self.socket.clone(),
                     self.idle_timeout,
                     self.shutdown.clone(),
                 );
-                association
+                candidate
             }
         };
         association.outbound.send(payload).await?;
@@ -441,6 +443,14 @@ mod windows_client {
                     }
                 })?
                 .into_inner();
+            let synthetic = mapping
+                .synthetic
+                .ok_or_else(|| ProxyError::InvalidMapping("missing synthetic tuple".into()))?;
+            if tuple_from_proto(synthetic)? != *tuple {
+                return Err(ProxyError::InvalidMapping(
+                    "mapping synthetic tuple does not match lookup".into(),
+                ));
+            }
             let original = mapping
                 .original
                 .ok_or_else(|| ProxyError::InvalidMapping("missing original tuple".into()))?;
@@ -474,17 +484,18 @@ mod windows_client {
             ));
         }
 
-        fn ip_bytes(address: &IpAddr) -> Vec<u8> {
-            match address {
-                IpAddr::V4(address) => address.octets().to_vec(),
-                IpAddr::V6(address) => address.octets().to_vec(),
-            }
-        }
         Ok(Tuple {
             source: SocketAddr::new(source, tuple.source_port as u16),
             destination: SocketAddr::new(destination, tuple.destination_port as u16),
             protocol: tuple.protocol as u8,
         })
+    }
+
+    fn ip_bytes(address: &IpAddr) -> Vec<u8> {
+        match address {
+            IpAddr::V4(address) => address.octets().to_vec(),
+            IpAddr::V6(address) => address.octets().to_vec(),
+        }
     }
 
     fn ip_from_bytes(family: u32, bytes: &[u8]) -> Result<IpAddr, ProxyError> {
@@ -591,6 +602,22 @@ mod tests {
             udp_idle_timeout: Duration::ZERO,
         };
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn configuration_rejects_wildcard_listen_address() {
+        let config = ProxyConfig {
+            listen: "0.0.0.0:15000".parse().unwrap(),
+            control_endpoint: "https://127.0.0.1:50051".into(),
+            psk_identity: "identity".into(),
+            psk_secret: vec![1],
+            udp_idle_timeout: Duration::from_secs(5),
+        };
+        assert!(matches!(
+            config.validate(),
+            Err(ProxyError::InvalidConfiguration(message))
+                if message.contains("listen address must be specific")
+        ));
     }
 
     #[tokio::test]

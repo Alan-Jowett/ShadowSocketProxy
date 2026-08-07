@@ -20,6 +20,7 @@ consumes the existing `GetMapping` contract without modifying it.
 | TC-037 | REQ-009/014 | Build `host-proxy` for Windows target | Build succeeds with documented features/dependencies |
 | TC-038 | REQ-009 | Bind shared TCP/UDP IPv4 endpoint | Both listeners bind and use the configured port |
 | TC-039 | REQ-009/014 | Bind IPv6 endpoint and construct IPv6 tuple | IPv6 flow data remains family-correct |
+| TC-039A | REQ-014 | Configure an unspecified/wildcard listen address | Startup rejects the configuration before listeners are ready |
 | TC-040 | REQ-010 | TCP observed tuple lookup | Exact peer-to-local tuple is sent to `GetMapping` |
 | TC-041 | REQ-010 | UDP observed tuple lookup | Exact peer-to-local tuple is sent to `GetMapping` |
 | TC-042 | REQ-010 | Missing mapping | TCP closes; UDP drops; no direct fallback |

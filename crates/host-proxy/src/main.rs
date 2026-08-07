@@ -10,7 +10,7 @@ use tokio::sync::watch;
 #[derive(Debug, Parser)]
 #[command(name = "shadow-socket-proxy-host")]
 struct Args {
-    #[arg(long, default_value = "0.0.0.0:15000")]
+    #[arg(long, default_value = "127.0.0.1:15000")]
     listen: SocketAddr,
     #[arg(long, default_value = "https://127.0.0.1:50051")]
     control_endpoint: String,
