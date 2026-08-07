@@ -41,6 +41,7 @@ RST.
 | TC-TC-023 | REQ-TC-006 | Maintenance partial cleanup | Idle/terminal deletion, decode failures, races, and backend errors remain explicit. |
 | TC-TC-024 | REQ-TC-006 | Attach/rollback/detach/shutdown | Owned links and runtime state roll back transactionally and report partial cleanup. |
 | TC-TC-025 | REQ-TC-004/006 | Kernel test-run sequence | `bpf_prog_test_run_opts` asserts bytes, action, checksums, flow state, target miss, control bypass, FIN/ACK, and RST. |
+| TC-TC-026 | REQ-TC-006 | Protobuf wire compatibility | Retired policy tags are reserved; active legacy fields retain their original tags; new fields use fresh tags. |
 
 ## Impact Map
 
@@ -51,7 +52,7 @@ RST.
 | REQ-TC-003 | D-TC-003..005 | TC-TC-009..011, TC-TC-015..017 | BPF listener/lifecycle, maintenance |
 | REQ-TC-004 | D-TC-005, D-TC-009 | TC-TC-012, TC-TC-015..017, TC-TC-025 | Parser/checksum/lifecycle |
 | REQ-TC-005 | D-TC-002, D-TC-005 | TC-TC-006, TC-TC-018, TC-TC-021 | Runtime config/store/backend |
-| REQ-TC-006 | D-TC-001, D-TC-006, D-TC-008 | TC-TC-001..003, TC-TC-022..024 | Loader, attach, protobuf, service |
+| REQ-TC-006 | D-TC-001, D-TC-006, D-TC-008 | TC-TC-001..003, TC-TC-022..024, TC-TC-026 | Loader, attach, protobuf, service |
 | REQ-TC-007 | D-TC-002, D-TC-004, D-TC-007 | TC-TC-009..010, TC-TC-019..020 | Main, lifecycle, config, BPF |
 
 ## Explicit No-Impact Decisions

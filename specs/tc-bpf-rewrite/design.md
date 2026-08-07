@@ -69,6 +69,9 @@ Remove policy types, map discovery, policy backend methods, capacity checks,
 CRUD RPC implementations, and policy status fields. Add target/listener config
 conversion, immutable-listener enforcement, v3 counter decoding, and v3
 runtime-map encoding. `GetConfig` and `SetConfig` remain authenticated.
+Retired protobuf field numbers remain reserved; all new target/listener and
+telemetry fields use previously unused tags so older clients cannot decode a
+new field as a different legacy field.
 
 ### D-TC-007 — Startup and readiness
 
