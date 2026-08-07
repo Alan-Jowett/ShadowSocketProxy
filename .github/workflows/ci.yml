@@ -51,5 +51,12 @@ jobs:
           SSP_TEST_BPF_ELF: ${{ github.workspace }}/crates/bpf/shadow-socket-proxy.bpf.o
           SSP_BPF_PROG_TEST_RUNNER: ${{ github.workspace }}/crates/bpf/ssp-bpf-fixture-runner
         run: |
-          sudo --preserve-env=PATH,HOME,CARGO_HOME,RUSTUP_HOME,SSP_TEST_BPF_PROG_RUN,SSP_TEST_BPF_ELF,SSP_BPF_PROG_TEST_RUNNER \
+          sudo env \
+            "PATH=$PATH" \
+            "HOME=$HOME" \
+            "CARGO_HOME=$CARGO_HOME" \
+            "RUSTUP_HOME=$RUSTUP_HOME" \
+            "SSP_TEST_BPF_PROG_RUN=$SSP_TEST_BPF_PROG_RUN" \
+            "SSP_TEST_BPF_ELF=$SSP_TEST_BPF_ELF" \
+            "SSP_BPF_PROG_TEST_RUNNER=$SSP_BPF_PROG_TEST_RUNNER" \
             cargo test --workspace
