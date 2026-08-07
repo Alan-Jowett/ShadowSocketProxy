@@ -17,9 +17,23 @@ longer a placeholder. It exports:
 Build on Linux with clang and kernel UAPI headers:
 
 ```sh
-clang -O2 -g -target bpf -D__TARGET_ARCH_x86 \
-  -I/usr/include/$(uname -m)-linux-gnu \
-  -c placeholder.bpf.c -o shadow-socket-proxy.bpf.o
+make -C crates/bpf clean all
+```
+
+The Makefile also builds `ssp-bpf-fixture-runner`, a Linux-only Rust helper
+binary that loads the ELF with Aya and executes the required
+`bpf_prog_test_run_opts` fixtures against the ingress/egress classifiers.
+The runner is Linux-only and preserves the approved CLI contract:
+
+```sh
+ssp-bpf-fixture-runner <bpf-elf> \
+  --fixture target-miss \
+  --fixture flow-create \
+  --fixture forward-rewrite \
+  --fixture reverse-rewrite \
+  --fixture control-bypass \
+  --fixture fin-ack-teardown \
+  --fixture rst
 ```
 
 The control service validates all required v3 programs, flow maps, runtime
@@ -44,3 +58,14 @@ The Rust integration gate additionally accepts `SSP_TEST_BPF_PROG_RUN=1` and
 `SSP_BPF_PROG_TEST_RUNNER`; the runner receives the ELF path and the ordered
 fixtures `target-miss`, `flow-create`, `forward-rewrite`, `reverse-rewrite`,
 `control-bypass`, `fin-ack-teardown`, and `rst`.
+
+Example:
+
+```sh
+make -C crates/bpf clean all
+
+SSP_TEST_BPF_PROG_RUN=1 \
+SSP_TEST_BPF_ELF="$PWD/crates/bpf/shadow-socket-proxy.bpf.o" \
+SSP_BPF_PROG_TEST_RUNNER="$PWD/crates/bpf/ssp-bpf-fixture-runner" \
+cargo test --workspace
+```

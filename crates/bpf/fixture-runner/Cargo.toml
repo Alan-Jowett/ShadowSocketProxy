@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 ShadowSocketProxy contributors
+
+[package]
+name = "shadow-socket-proxy-bpf-fixture-runner"
+version = "0.1.0"
+edition = "2021"
+description = "Linux-only BPF fixture runner for ShadowSocketProxy"
+license = "MIT"
+
+[[bin]]
+name = "ssp-bpf-fixture-runner"
+path = "src/main.rs"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+aya = "0.14.0"
+libc = "0.2"

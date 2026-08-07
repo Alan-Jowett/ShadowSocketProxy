@@ -386,6 +386,9 @@ pub trait LinuxTcAdapter: Send + Sync {
     async fn set_runtime_config(&self, _config: &RuntimeConfig) -> Result<(), BackendError> {
         Err(BackendError::Unsupported)
     }
+    async fn read_counters(&self) -> Result<BpfCounters, BackendError> {
+        Err(BackendError::Unsupported)
+    }
     fn map_maxima(&self) -> MapMaxima {
         MapMaxima::default()
     }
@@ -414,6 +417,9 @@ impl LinuxTcAdapter for UnsupportedLinuxTcAdapter {
         Err(BackendError::Unsupported)
     }
     async fn delete_entry(&self, _key: &[u8]) -> Result<bool, BackendError> {
+        Err(BackendError::Unsupported)
+    }
+    async fn read_counters(&self) -> Result<BpfCounters, BackendError> {
         Err(BackendError::Unsupported)
     }
 }

@@ -1093,6 +1093,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "shadow-socket-proxy-bpf-fixture-runner"
+version = "0.1.0"
+dependencies = [
+ "aya",
+ "libc",
+]
+
+[[package]]
 name = "shadow-socket-proxy-control"
 version = "0.1.0"
 dependencies = [
