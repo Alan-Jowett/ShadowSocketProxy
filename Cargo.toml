@@ -2,5 +2,5 @@
 # Copyright (c) 2026 ShadowSocketProxy contributors
 
 [workspace]
-members = ["crates/control-service"]
+members = ["crates/control-service", "crates/host-proxy"]
 resolver = "2"
