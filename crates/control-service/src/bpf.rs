@@ -203,6 +203,13 @@ impl InMemoryBackend {
             },
         );
         memory.flow_indexes.insert(
+            encode_key(&state.target).to_vec(),
+            FlowIndexValue {
+                flow_id: state.flow_id,
+                generation: state.generation,
+            },
+        );
+        memory.flow_indexes.insert(
             encode_key(&state.reverse).to_vec(),
             FlowIndexValue {
                 flow_id: state.flow_id,
@@ -1005,22 +1012,45 @@ impl LinuxTcAdapter for AyaLinuxTcAdapter {
             flow_id,
             generation,
         };
-        let index_keys = Self::with_flow_index_map(&mut state.bpf, |map| {
-            map.iter()
-                .map(|entry| {
-                    let (key, value) = entry.map_err(Self::map_error)?;
-                    let value = crate::mapping::decode_flow_index(&value)
-                        .map_err(|error| Self::operation("flow-index:decode", error))?;
-                    Ok((key, value))
-                })
-                .collect::<Result<Vec<_>, BackendError>>()
-                .map(|entries| {
-                    entries
-                        .into_iter()
-                        .filter_map(|(key, value)| (value == expected).then_some(key))
-                        .collect::<Vec<_>>()
+        let state_key = encode_flow_state_key(flow_id, generation);
+        let flow = Self::with_state_map(&mut state.bpf, |map| {
+            map.get(&state_key, 0)
+                .map(|value| Some(value))
+                .or_else(|error| match error {
+                    aya::maps::MapError::KeyNotFound | aya::maps::MapError::ElementNotFound => {
+                        Ok(None)
+                    }
+                    error => Err(Self::map_error(error)),
                 })
         })?;
+        let mut index_keys = if let Some(flow) = flow {
+            let flow = decode_flow_state(&flow)
+                .map_err(|error| Self::operation("flow-state:decode", error))?;
+            vec![
+                encode_key(&flow.original),
+                encode_key(&flow.target),
+                encode_key(&flow.reverse),
+            ]
+        } else {
+            Self::with_flow_index_map(&mut state.bpf, |map| {
+                map.iter()
+                    .map(|entry| {
+                        let (key, value) = entry.map_err(Self::map_error)?;
+                        let value = crate::mapping::decode_flow_index(&value)
+                            .map_err(|error| Self::operation("flow-index:decode", error))?;
+                        Ok((key, value))
+                    })
+                    .collect::<Result<Vec<_>, BackendError>>()
+                    .map(|entries| {
+                        entries
+                            .into_iter()
+                            .filter_map(|(key, value)| (value == expected).then_some(key))
+                            .collect::<Vec<_>>()
+                    })
+            })?
+        };
+        index_keys.sort_unstable();
+        index_keys.dedup();
         let mut indexes_deleted = 0;
         let mut partial = false;
         for key in index_keys {
@@ -1440,7 +1470,7 @@ mod tests {
             flow_id: 9,
             generation: 1,
             original,
-            target,
+            target: target.clone(),
             reverse,
             last_used_ns: 1,
             protocol_flags: PROTOCOL_FLAG_UDP,
@@ -1450,8 +1480,13 @@ mod tests {
             lifecycle: FlowLifecycle::Active,
             terminal_deadline_ns: 0,
         });
+        assert!(backend
+            .get_entry(&encode_key(&target))
+            .await
+            .unwrap()
+            .is_some());
         let report = backend.delete_flow(9, 1).await.unwrap();
-        assert_eq!(report.indexes_deleted, 2);
+        assert_eq!(report.indexes_deleted, 3);
         assert!(backend.list_flow_states().await.unwrap().is_empty());
         assert!(backend
             .get_policy(&PolicyKey {

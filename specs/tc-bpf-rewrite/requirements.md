@@ -57,10 +57,12 @@ complete value atomically from the BPF lookup perspective.
 
 ### REQ-TC-003 — Canonical bidirectional active-flow state
 
-The active-flow map MUST maintain one canonical flow record linked to two
-directional lookup keys, covering TCP and UDP, with the original tuple,
-snapped target tuple, reverse tuple, protocol, last-used monotonic time, and
-lifecycle metadata. Active-flow insertion/full-map failure MUST drop the
+The active-flow map MUST maintain one canonical flow record linked to three
+lookup keys: the original client-to-destination tuple, the synthetic
+client-to-target tuple used by the host proxy, and the reverse target-to-client
+tuple. It MUST cover TCP and UDP with the original tuple, snapped target tuple,
+reverse tuple, protocol, last-used monotonic time, and lifecycle metadata.
+Active-flow insertion/full-map failure MUST drop the
 eligible packet and expose bounded counters/logs. Policy misses and safely
 unparseable or unsupported packets MUST pass unchanged.
 

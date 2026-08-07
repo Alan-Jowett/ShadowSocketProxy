@@ -54,7 +54,7 @@ pub enum ConfigError {
     InvalidPolicyCapacity,
     #[error("active flow capacity must be between 1 and the ELF maximum")]
     InvalidFlowCapacity,
-    #[error("active flow capacity requires two directional indexes per flow")]
+    #[error("active flow capacity requires three flow indexes per flow")]
     FlowIndexCapacityExceeded,
     #[error("TCP terminal grace must be non-zero")]
     ZeroTerminalGrace,
@@ -90,7 +90,7 @@ impl RuntimeConfig {
         if self.active_flow_capacity == 0 || self.active_flow_capacity > maxima.flow_state {
             return Err(ConfigError::InvalidFlowCapacity);
         }
-        if self.active_flow_capacity.saturating_mul(2) > maxima.flow_index {
+        if self.active_flow_capacity.saturating_mul(3) > maxima.flow_index {
             return Err(ConfigError::FlowIndexCapacityExceeded);
         }
         if self.tcp_terminal_grace.is_zero() {

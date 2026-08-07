@@ -46,9 +46,9 @@ absent rather than report false readiness.
 | TC-TC-021 | REQ-TC-005/006 | Security/failure semantics | Unauthorized policy/config/attach is rejected; no direct-forward fallback; secrets and payloads are not logged. |
 | TC-TC-022 | REQ-TC-001/003/005 | `bpf_prog_test_run` ingress/egress fixtures | The kernel test-run API executes both classifiers against valid and invalid IPv4/IPv6 TCP/UDP fixtures; output bytes, TC action, checksums, and policy/flow-map effects match the expected rewrite/pass/drop behavior. |
 | TC-TC-023 | REQ-TC-003 | Multi-map partial insertion | Inject failure after canonical-state or one-index creation; rollback removes all attempt-owned entries and no `CREATING` flow can rewrite packets. |
-| TC-TC-024 | REQ-TC-003 | Concurrent flow creators | Two creators for one tuple converge on one flow ID; the losing creator cannot delete the winner's indexes or state. |
+| TC-TC-024 | REQ-TC-003 | Concurrent flow creators | Two creators for one tuple converge on one flow ID; the losing creator cannot delete the winner's original, synthetic, or reverse indexes or state. |
 | TC-TC-025 | REQ-TC-004 | Terminal deadline precedence | RST deletes immediately; idle TTL cannot delete a FIN-complete flow before terminal grace; late pre-deadline traffic updates activity without reopening state. |
-| TC-TC-026 | REQ-TC-006 | Fixed maxima and runtime caps | Runtime admission caps never exceed discovered ELF map maxima; cap changes do not resize maps or require re-attach; invalid caps preserve the prior revision. |
+| TC-TC-026 | REQ-TC-006 | Fixed maxima and runtime caps | Runtime admission caps never exceed discovered ELF map maxima; three flow-index entries per active flow are accounted for; cap changes do not resize maps or require re-attach; invalid caps preserve the prior revision. |
 
 ## Impact Map
 

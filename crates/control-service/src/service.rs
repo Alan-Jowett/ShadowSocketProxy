@@ -367,7 +367,10 @@ impl Control for ControlService {
         let offset = if request.page_token.is_empty() {
             0
         } else if request.page_token.len() == 8 {
-            u64::from_be_bytes(request.page_token.as_slice().try_into().unwrap()) as usize
+            usize::try_from(u64::from_be_bytes(
+                request.page_token.as_slice().try_into().unwrap(),
+            ))
+            .map_err(|_| Status::invalid_argument("page token is out of range"))?
         } else {
             return Err(Status::invalid_argument("invalid page token"));
         };
@@ -472,7 +475,10 @@ impl Control for ControlService {
         let offset = if request.page_token.is_empty() {
             0
         } else if request.page_token.len() == 8 {
-            u64::from_be_bytes(request.page_token.as_slice().try_into().unwrap()) as usize
+            usize::try_from(u64::from_be_bytes(
+                request.page_token.as_slice().try_into().unwrap(),
+            ))
+            .map_err(|_| Status::invalid_argument("policy page token is out of range"))?
         } else {
             return Err(Status::invalid_argument("invalid policy page token"));
         };

@@ -508,6 +508,7 @@ static __always_inline int delete_flow(const struct flow_state_value *state)
         .generation = state->generation,
     };
     bpf_map_delete_elem(&ssp_flow_index_v1, &state->original);
+    bpf_map_delete_elem(&ssp_flow_index_v1, &state->target);
     bpf_map_delete_elem(&ssp_flow_index_v1, &state->reverse);
     bpf_map_delete_elem(&ssp_flow_state_v1, &state_key);
     release_flow_slot();
@@ -600,9 +601,12 @@ static __always_inline int process_packet(struct __sk_buff *skb, bool ingress)
             }
         } else if (bpf_map_update_elem(&ssp_flow_index_v1, &lookup_key,
                                        &candidate_index, BPF_NOEXIST) != 0 ||
+                   bpf_map_update_elem(&ssp_flow_index_v1, &candidate->target,
+                                       &candidate_index, BPF_NOEXIST) != 0 ||
                    bpf_map_update_elem(&ssp_flow_index_v1, &candidate->reverse,
                                        &candidate_index, BPF_NOEXIST) != 0) {
             delete_owned_index(&lookup_key, &candidate_index);
+            delete_owned_index(&candidate->target, &candidate_index);
             delete_owned_index(&candidate->reverse, &candidate_index);
             bpf_map_delete_elem(&ssp_flow_state_v1, &state_key);
             release_flow_slot();
@@ -616,6 +620,7 @@ static __always_inline int process_packet(struct __sk_buff *skb, bool ingress)
             if (bpf_map_update_elem(&ssp_flow_state_v1, &state_key, candidate,
                                     BPF_EXIST) != 0) {
                 delete_owned_index(&lookup_key, &candidate_index);
+                delete_owned_index(&candidate->target, &candidate_index);
                 delete_owned_index(&candidate->reverse, &candidate_index);
                 bpf_map_delete_elem(&ssp_flow_state_v1, &state_key);
                 release_flow_slot();

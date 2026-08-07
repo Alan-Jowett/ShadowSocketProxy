@@ -47,8 +47,10 @@ not translated.
 
 ### D-TC-003 — Canonical active-flow state
 
-`ssp_flow_index_v1` contains two directional lookup entries per flow, each
-mapping a full directional 5-tuple to a stable flow ID.
+`ssp_flow_index_v1` contains three lookup entries per flow, each mapping a
+full 5-tuple to a stable flow ID: the original client-to-destination tuple,
+the synthetic client-to-target tuple used by the host proxy, and the reverse
+target-to-client tuple.
 `ssp_flow_state_v1` contains one canonical record per flow:
 
 - original client-to-destination tuple;
@@ -129,7 +131,8 @@ builds retain explicit unsupported behavior and no insecure control fallback.
 Flow creation uses a stable flow ID and a `CREATING` state marker:
 
 1. Reserve the canonical state with `CREATING` and the expected generation.
-2. Add the forward and reverse index entries, each pointing to that flow ID.
+2. Add the original, synthetic, and reverse index entries, each pointing to
+   that flow ID.
 3. Publish the state as `ACTIVE` only after both indexes are present.
 4. If any update fails, delete every entry created by the attempt and expose
    the failure; no packet is rewritten from a `CREATING` record.
