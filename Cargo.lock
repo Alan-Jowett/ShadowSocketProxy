@@ -1119,7 +1119,6 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "clap",
- "futures-util",
  "http",
  "openssl",
  "prost",
