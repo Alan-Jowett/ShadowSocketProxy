@@ -77,11 +77,15 @@ UDP tuple. Each entry stores the client address, an outbound UDP socket
 connected to the mapped original destination, last activity, and cancellation
 state.
 
-The receive loop forwards client datagrams. A per-association task relays
-responses only to that entry's client. An idle reaper removes entries after
-the configured timeout. A missing mapping drops the datagram. A changed
-mapping creates or replaces only the affected association after exact-key
-validation.
+The receive loop performs an authenticated mapping lookup for every client
+datagram. A per-association task relays responses only to that entry's client.
+An existing outbound association is reused only when the fresh lookup returns
+the same original destination; a changed mapping creates or replaces only the
+affected association. An idle reaper removes entries after the configured
+timeout. A missing mapping drops the datagram.
+
+UDP forwarding failures are logged through a one-second rate limiter so a
+persistent control-plane or network failure cannot flood the host logs.
 
 The selected resource policy does not impose a maximum association count;
 allocation, socket, and send/receive errors remain observable.

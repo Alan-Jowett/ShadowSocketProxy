@@ -125,8 +125,16 @@ impl<C: MappingClient + 'static> Proxy<C> {
                 let _ = udp_task.await;
                 Ok(())
             },
-            result = &mut tcp_task => result.map_err(|error| ProxyError::Control(error.to_string())),
-            result = &mut udp_task => result.map_err(|error| ProxyError::Control(error.to_string())),
+            result = &mut tcp_task => {
+                udp_task.abort();
+                let _ = udp_task.await;
+                result.map_err(|error| ProxyError::Control(error.to_string()))
+            },
+            result = &mut udp_task => {
+                tcp_task.abort();
+                let _ = tcp_task.await;
+                result.map_err(|error| ProxyError::Control(error.to_string()))
+            },
         };
         udp.shutdown().await;
         result
@@ -205,7 +213,7 @@ async fn run_udp<C: MappingClient + 'static>(
                     }
                 };
                 if let Err(error) = associations.forward(client_address, &buffer[..length]).await {
-                    tracing::warn!(%error, "UDP forwarding failed");
+                    associations.report_failure(&error).await;
                 }
             }
         }
@@ -218,10 +226,12 @@ struct UdpAssociations<C> {
     entries: Mutex<HashMap<Tuple, Arc<UdpAssociation>>>,
     idle_timeout: Duration,
     shutdown: watch::Receiver<bool>,
+    last_failure_log: Mutex<Option<std::time::Instant>>,
 }
 
 struct UdpAssociation {
     client_address: SocketAddr,
+    destination: SocketAddr,
     outbound: Arc<UdpSocket>,
     last_seen: Mutex<std::time::Instant>,
 }
@@ -239,6 +249,7 @@ impl<C: MappingClient + 'static> UdpAssociations<C> {
             entries: Mutex::new(HashMap::new()),
             idle_timeout,
             shutdown,
+            last_failure_log: Mutex::new(None),
         }
     }
 
@@ -248,40 +259,79 @@ impl<C: MappingClient + 'static> UdpAssociations<C> {
             destination: self.socket.local_addr()?,
             protocol: UDP_PROTOCOL,
         };
+        let mapping = self.client.get_mapping(&tuple).await?;
+        if mapping.protocol != UDP_PROTOCOL {
+            return Err(ProxyError::InvalidMapping(
+                "UDP lookup returned a non-UDP mapping".into(),
+            ));
+        }
         let existing = self.entries.lock().await.get(&tuple).cloned();
         let association = if let Some(existing) = existing {
-            existing
-        } else {
-            let mapping = self.client.get_mapping(&tuple).await?;
-            if mapping.protocol != UDP_PROTOCOL {
-                return Err(ProxyError::InvalidMapping(
-                    "UDP lookup returned a non-UDP mapping".into(),
-                ));
-            }
-            let outbound = Arc::new(UdpSocket::bind(unspecified_for(mapping.address)).await?);
-            outbound.connect(mapping.address).await?;
-            let candidate = Arc::new(UdpAssociation {
-                client_address,
-                outbound,
-                last_seen: Mutex::new(std::time::Instant::now()),
-            });
-            let mut entries = self.entries.lock().await;
-            if let Some(existing) = entries.get(&tuple) {
-                existing.clone()
+            if existing.destination == mapping.address {
+                existing
             } else {
-                entries.insert(tuple, candidate.clone());
-                spawn_udp_relay(
-                    candidate.clone(),
-                    self.socket.clone(),
-                    self.idle_timeout,
-                    self.shutdown.clone(),
-                );
-                candidate
+                self.replace_association(tuple, client_address, mapping)
+                    .await?
             }
+        } else {
+            self.insert_association(tuple, client_address, mapping)
+                .await?
         };
         association.outbound.send(payload).await?;
         *association.last_seen.lock().await = std::time::Instant::now();
         Ok(())
+    }
+
+    async fn insert_association(
+        &self,
+        tuple: Tuple,
+        client_address: SocketAddr,
+        mapping: OriginalDestination,
+    ) -> Result<Arc<UdpAssociation>, ProxyError> {
+        let outbound = Arc::new(UdpSocket::bind(unspecified_for(mapping.address)).await?);
+        outbound.connect(mapping.address).await?;
+        let candidate = Arc::new(UdpAssociation {
+            client_address,
+            destination: mapping.address,
+            outbound,
+            last_seen: Mutex::new(std::time::Instant::now()),
+        });
+        let mut entries = self.entries.lock().await;
+        if let Some(existing) = entries.get(&tuple) {
+            if existing.destination == mapping.address {
+                return Ok(existing.clone());
+            }
+        }
+        entries.insert(tuple, candidate.clone());
+        spawn_udp_relay(
+            candidate.clone(),
+            self.socket.clone(),
+            self.idle_timeout,
+            self.shutdown.clone(),
+        );
+        Ok(candidate)
+    }
+
+    async fn replace_association(
+        &self,
+        tuple: Tuple,
+        client_address: SocketAddr,
+        mapping: OriginalDestination,
+    ) -> Result<Arc<UdpAssociation>, ProxyError> {
+        self.insert_association(tuple, client_address, mapping)
+            .await
+    }
+
+    async fn report_failure(&self, error: &ProxyError) {
+        let now = std::time::Instant::now();
+        let mut last_failure_log = self.last_failure_log.lock().await;
+        if last_failure_log
+            .map(|last| now.duration_since(last) >= Duration::from_secs(1))
+            .unwrap_or(true)
+        {
+            *last_failure_log = Some(now);
+            tracing::warn!(%error, "UDP forwarding failed");
+        }
     }
 
     async fn shutdown(&self) {
@@ -372,10 +422,7 @@ mod windows_client {
         error::ErrorStack,
         ssl::{Ssl, SslContext, SslContextBuilder, SslMethod, SslVersion},
     };
-    use std::{
-        pin::Pin,
-        task::{Context, Poll},
-    };
+    use std::pin::Pin;
     use tokio_openssl::SslStream;
     use tonic::transport::Endpoint;
     use tower::service_fn;
@@ -460,13 +507,16 @@ mod windows_client {
                     "mapping protocol does not match lookup".into(),
                 ));
             }
-            if address.destination.is_unspecified() {
+            if address.destination.is_unspecified()
+                || address.destination.port() == 0
+                || address.destination.is_ipv4() != tuple.destination.is_ipv4()
+            {
                 return Err(ProxyError::InvalidMapping(
-                    "mapping destination is unspecified".into(),
+                    "mapping destination has an invalid address or port".into(),
                 ));
             }
             Ok(OriginalDestination {
-                address: SocketAddr::new(address.destination, address.destination_port),
+                address: address.destination,
                 protocol: address.protocol,
             })
         }
@@ -543,9 +593,7 @@ mod windows_client {
         let authority = uri.authority().ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "endpoint authority missing")
         })?;
-        let stream = TcpStream::connect(authority.as_str())
-            .await
-            .map_err(|error| io::Error::new(io::ErrorKind::ConnectionRefused, error))?;
+        let stream = TcpStream::connect(authority.as_str()).await?;
         let host = authority.host();
         let ssl = Ssl::new(&context).map_err(openssl_io_error)?;
         let mut ssl = SslStream::new(ssl, stream).map_err(openssl_io_error)?;

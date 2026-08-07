@@ -22,7 +22,6 @@ tls-psk = ["dep:openssl", "dep:tokio-openssl"]
 [dependencies]
 async-trait = "0.1"
 clap = { version = "4.5", features = ["derive", "env"] }
-futures-util = "0.3"
 prost = "0.13"
 http = "1"
 thiserror = "1"

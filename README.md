@@ -72,9 +72,14 @@ Build the default workspace target with:
 cargo build -p shadow-socket-proxy-host
 ```
 
-Windows deployments that provide a PSK-capable OpenSSL installation enable the
-TLS transport with `--features tls-psk`. Configure the listener and control
-service with CLI options; provide the PSK through `--psk-secret`,
+Windows deployments that provide a PSK-capable OpenSSL installation must build
+the runnable proxy with:
+
+```text
+cargo build -p shadow-socket-proxy-host --features tls-psk
+```
+
+Configure the listener and control service with CLI options; provide the PSK through `--psk-secret`,
 `SSP_TLS_PSK_SECRET`, or `--psk-secret-file`. The proxy requires a nonzero
 `--udp-idle-timeout-secs` and never falls back to direct forwarding when a
 mapping lookup fails. The listen address must be a specific local IPv4 or IPv6

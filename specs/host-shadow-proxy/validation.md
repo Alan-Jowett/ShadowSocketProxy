@@ -42,6 +42,8 @@ consumes the existing `GetMapping` contract without modifying it.
 | TC-058 | REQ-010/012 | Mapping changes between UDP associations | Existing association is not reused for another synthetic tuple |
 | TC-059 | REQ-011/012 | Concurrent TCP and UDP flows | Independent flows remain isolated and complete safely |
 | TC-060 | REQ-013/015 | Secret-bearing config/log paths | PSK identity/secret is absent from logs and error text |
+| TC-061 | REQ-010/012 | Multiple datagrams on one UDP association | Every datagram performs `GetMapping`; an unchanged destination reuses only the socket |
+| TC-062 | REQ-012/015 | Persistent UDP forwarding failure | Failure logging is rate-limited and does not emit one warning per datagram |
 
 ## 3. Property and Invariant Checks
 
