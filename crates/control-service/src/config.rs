@@ -239,8 +239,10 @@ mod tests {
 
     #[test]
     fn runtime_caps_cannot_exceed_fixed_elf_maxima() {
-        let mut config = RuntimeConfig::default();
-        config.active_flow_capacity = MapMaxima::default().flow_state + 1;
+        let config = RuntimeConfig {
+            active_flow_capacity: MapMaxima::default().flow_state + 1,
+            ..RuntimeConfig::default()
+        };
         assert!(matches!(
             ConfigStore::new(config),
             Err(ConfigError::InvalidFlowCapacity)
@@ -249,8 +251,10 @@ mod tests {
 
     #[test]
     fn target_pairs_are_atomic() {
-        let mut config = RuntimeConfig::default();
-        config.ipv4_target = Some("192.0.2.10:0".parse().unwrap());
+        let config = RuntimeConfig {
+            ipv4_target: Some("192.0.2.10:0".parse().unwrap()),
+            ..RuntimeConfig::default()
+        };
         assert!(matches!(
             ConfigStore::new(config),
             Err(ConfigError::PartialTarget)

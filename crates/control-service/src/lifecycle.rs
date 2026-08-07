@@ -52,8 +52,10 @@ impl<B: BpfBackend + 'static> ServiceRuntime<B> {
     }
 
     pub fn new_with_listener(backend: B, listener: SocketAddr) -> Self {
-        let mut initial = RuntimeConfig::default();
-        initial.listener = crate::config::ListenerDescriptor::from_socket_addr(listener);
+        let initial = RuntimeConfig {
+            listener: crate::config::ListenerDescriptor::from_socket_addr(listener),
+            ..RuntimeConfig::default()
+        };
         let config = Arc::new(ConfigStore::new(initial).expect("valid listener configuration"));
         let logs = Arc::new(LogRing::new(config.snapshot().log_capacity));
         let stats = Arc::new(MaintenanceStats::default());

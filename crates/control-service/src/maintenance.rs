@@ -218,9 +218,11 @@ mod tests {
                 tcp_state_flags: 0,
             });
         }
-        let mut config = RuntimeConfig::default();
-        config.cleanup_interval = Duration::from_nanos(1);
-        config.idle_ttl = Duration::from_nanos(50);
+        let config = RuntimeConfig {
+            cleanup_interval: Duration::from_nanos(1),
+            idle_ttl: Duration::from_nanos(50),
+            ..RuntimeConfig::default()
+        };
         let config = ConfigStore::new(config).unwrap();
         let stats = MaintenanceStats::default();
         let logs = LogRing::new(10);

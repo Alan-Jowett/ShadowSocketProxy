@@ -90,6 +90,7 @@ fn tuple_to_proto(tuple: &Tuple) -> proto::Tuple {
     }
 }
 
+#[allow(clippy::result_large_err)]
 fn tuple_from_proto(tuple: Option<proto::Tuple>) -> Result<Tuple, Status> {
     let tuple = tuple.ok_or_else(|| Status::invalid_argument("synthetic tuple is required"))?;
     let source = match tuple.family {
@@ -191,6 +192,7 @@ fn config_to_proto(config: Arc<RuntimeConfig>) -> proto::ConfigReply {
     }
 }
 
+#[allow(clippy::result_large_err)]
 fn parse_address(family: u32, bytes: Vec<u8>, label: &str) -> Result<IpAddr, Status> {
     match family {
         4 if bytes.len() == 4 => Ok(IpAddr::V4(Ipv4Addr::from(
@@ -205,6 +207,7 @@ fn parse_address(family: u32, bytes: Vec<u8>, label: &str) -> Result<IpAddr, Sta
     }
 }
 
+#[allow(clippy::result_large_err)]
 fn parse_target(
     family: u32,
     address: Vec<u8>,
@@ -225,6 +228,7 @@ fn parse_target(
     )))
 }
 
+#[allow(clippy::result_large_err)]
 fn runtime_config_from_proto(config: Option<proto::Config>) -> Result<RuntimeConfig, Status> {
     let config = config.ok_or_else(|| Status::invalid_argument("config is required"))?;
     if config.schema_version != RUNTIME_CONFIG_ABI_VERSION as u32 {
