@@ -5,7 +5,7 @@
  * Build with a Linux clang toolchain and the kernel UAPI headers:
  *
  *   clang -O2 -g -target bpf -D__TARGET_ARCH_x86 \
- *     -I/usr/include/$(uname -m)-linux-gnu -c placeholder.bpf.c \
+ *     -I/usr/include/$(uname -m)-linux-gnu -c shadow-socket-proxy.bpf.c \
  *     -o shadow-socket-proxy.bpf.o
  *
  * The program intentionally handles only Ethernet IPv4/IPv6 TCP/UDP first
