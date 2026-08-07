@@ -1,0 +1,30 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 ShadowSocketProxy contributors
+
+use shadow_socket_proxy_control::{bpf::LinuxBpfBackend, lifecycle::ServiceRuntime};
+use std::net::SocketAddr;
+
+#[tokio::main]
+async fn main() {
+    let backend = LinuxBpfBackend::new();
+    let mut runtime = ServiceRuntime::new(backend);
+    if let Err(error) = runtime.start().await {
+        eprintln!("shadow-socket-proxy-control failed to start: {error}");
+        std::process::exit(1);
+    }
+    let address = std::env::var("SSP_LISTEN_ADDR")
+        .unwrap_or_else(|_| "0.0.0.0:50051".into())
+        .parse::<SocketAddr>()
+        .unwrap_or_else(|error| {
+            eprintln!("invalid SSP_LISTEN_ADDR: {error}");
+            std::process::exit(1);
+        });
+    if let Err(error) = runtime.serve(address).await {
+        eprintln!("shadow-socket-proxy-control server failed: {error}");
+        std::process::exit(1);
+    }
+    if let Err(error) = runtime.shutdown().await {
+        eprintln!("shadow-socket-proxy-control shutdown failed: {error}");
+        std::process::exit(1);
+    }
+}

@@ -1,3 +1,6 @@
+<!-- SPDX-License-Identifier: MIT -->
+<!-- Copyright (c) 2026 ShadowSocketProxy contributors -->
+
 # ShadowSocketProxy
 
 ShadowSocketProxy demonstrates a WSL networking model where outbound TCP/UDP flows are intercepted inside the Linux side and transparently proxied through a host‑side process. The container believes it is connecting normally; the host actually owns the external socket.
@@ -36,3 +39,22 @@ WSL’s NAT model breaks VPNs, packet inspection, and tools that rely on owning 
 
 Prototype. Packet rewriting, flow mapping, and proxy bridging are functional. Future work includes QUIC support, better failure semantics, and selective flow interception.
 
+## Container control service
+
+The Linux-targeted Rust control service is in `crates/control-service`, with
+the shared protobuf contract in `crates/proto` and the placeholder BPF program
+in `crates/bpf`:
+
+```text
+cargo build --target x86_64-unknown-linux-gnu
+cargo test
+```
+
+It provides the versioned mapping ABI, replaceable BPF/TC backend, maintenance
+worker, protobuf/gRPC service, configuration snapshots, and bounded log pull.
+On Linux, the production backend uses Aya for ELF loading, versioned
+map/program discovery, TC ingress/egress links, transactional rollback, and
+map operations. The TCP gRPC endpoint uses OpenSSL with TLS 1.2 PSK and h2
+ALPN; invalid credentials or a build without PSK support fail startup rather
+than falling back to plaintext, metadata-only auth, or mTLS. Linux builds
+require an OpenSSL development installation whose build enables PSK.
