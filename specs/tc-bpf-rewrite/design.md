@@ -130,6 +130,29 @@ integration test. The integration test remains a hard failure when enabled:
 missing runner, missing capability, or failed fixture is never treated as a
 skip.
 
+### D-CI-005 — Windows host-proxy workflow job
+
+The existing workflow adds a `windows-latest` job with the same pull-request
+and `main` push triggers as the Linux job. It uses the pinned repository
+actions and Rust 1.96.1, but limits validation to formatting, strict clippy,
+and the Windows host-proxy TLS-PSK build and test gates.
+
+### D-CI-006 — Pinned Windows OpenSSL setup
+
+The Windows job installs `ShiningLight.OpenSSL.Dev` version 4.0.1 with winget
+using the exact package ID and version. It verifies the installed package and
+OpenSSL version, configures the OpenSSL environment expected by the
+`openssl-sys` build, and fails explicitly if the installation or TLS-PSK
+capability is unavailable.
+
+### D-CI-007 — Locked Windows commands
+
+Windows validation runs `cargo fmt --all -- --check`,
+`cargo clippy --locked -p shadow-socket-proxy-host --features tls-psk
+--all-targets -- -D warnings`, `cargo build --locked
+-p shadow-socket-proxy-host --features tls-psk`, and
+`cargo test --locked -p shadow-socket-proxy-host --features tls-psk`.
+
 ## Invariants
 
 | ID | Invariant |
@@ -145,3 +168,4 @@ skip.
 | INV-TC-009 | The listener descriptor is present before attach and immutable through SetConfig. |
 | INV-CI-001 | Every required Rust, BPF-build, and explicitly enabled kernel-fixture gate is executed and failures remain visible. |
 | INV-CI-002 | CI uses the canonical Makefile and generated ELF; it does not alter production runtime behavior or publish artifacts. |
+| INV-CI-003 | Windows TLS-PSK validation requires the pinned PSK-capable OpenSSL installation and never falls back to plaintext or unauthenticated transport. |

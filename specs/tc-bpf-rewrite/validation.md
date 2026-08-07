@@ -48,6 +48,10 @@ RST.
 | TC-CI-004 | REQ-CI-004 | Runner loading and capability failure | The checked-in runner loads the ELF and exits nonzero for missing capabilities, invalid symbols/maps, verifier rejection, or setup failure. |
 | TC-CI-005 | REQ-CI-004 | Ordered kernel fixture sequence | The runner executes target miss, flow creation, forward/reverse rewrite, control bypass, FIN/ACK teardown, and RST; every expected action, packet byte, checksum, and map-state assertion passes. |
 | TC-CI-006 | REQ-CI-005 | No silent skip/artifact publication | Enabled fixture execution cannot be skipped and the workflow publishes no build artifact or changes production behavior. |
+| TC-CI-007 | REQ-CI-006 | Windows OpenSSL installation | The Windows job installs the exact `ShiningLight.OpenSSL.Dev` 4.0.1 package, verifies the package and `openssl version`, and fails on mismatch or missing PSK capability. |
+| TC-CI-008 | REQ-CI-007 | Windows host-proxy build | With TLS-PSK enabled and the pinned OpenSSL environment, formatting, strict clippy, and the locked host-proxy build succeed. |
+| TC-CI-009 | REQ-CI-007 | Windows host-proxy tests | `cargo test --locked -p shadow-socket-proxy-host --features tls-psk` succeeds on `windows-latest`. |
+| TC-CI-010 | REQ-CI-008 | Local Windows reproduction | The pinned OpenSSL installation and the Windows host-proxy validation commands pass locally before the PR is opened. |
 
 ## Impact Map
 
@@ -65,6 +69,9 @@ RST.
 | REQ-CI-003 | D-CI-001, D-CI-002 | TC-CI-003 | Workflow, BPF Makefile |
 | REQ-CI-004 | D-CI-003, D-CI-004 | TC-CI-004..005 | BPF runner, integration test, workflow |
 | REQ-CI-005 | D-CI-001, D-CI-004 | TC-CI-006 | Workflow |
+| REQ-CI-006 | D-CI-005, D-CI-006 | TC-CI-007 | Windows workflow, winget/OpenSSL setup |
+| REQ-CI-007 | D-CI-005, D-CI-007 | TC-CI-008..009 | Windows workflow, host-proxy crate |
+| REQ-CI-008 | D-CI-006, D-CI-007 | TC-CI-010 | Local Windows environment and validation commands |
 
 ## Explicit No-Impact Decisions
 
@@ -76,3 +83,5 @@ RST.
 - No direct-forward fallback is added when a target is unset or a mapping is
   missing.
 - The workflow does not publish artifacts; it only reports validation status.
+- Linux/BPF gates, host-proxy forwarding, control-plane protocol behavior, and
+  TLS/PSK policy are unchanged; this change only adds Windows build coverage.

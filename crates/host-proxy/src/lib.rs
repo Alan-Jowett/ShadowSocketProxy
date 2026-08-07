@@ -418,6 +418,7 @@ impl MappingClient for TlsPskMappingClient {
 #[cfg(all(target_os = "windows", feature = "tls-psk"))]
 mod windows_client {
     use super::*;
+    use hyper_util::rt::TokioIo;
     use openssl::{
         error::ErrorStack,
         ssl::{Ssl, SslContext, SslContextBuilder, SslMethod, SslVersion},
@@ -443,7 +444,7 @@ mod windows_client {
                     "invalid TLS-PSK credentials".into(),
                 ));
             }
-            let uri = endpoint.parse().map_err(|error| {
+            let uri: http::Uri = endpoint.parse().map_err(|error| {
                 ProxyError::InvalidConfiguration(format!("invalid endpoint: {error}"))
             })?;
             let context = build_context(identity, secret)?;
@@ -469,8 +470,8 @@ mod windows_client {
             let request = proto::GetMappingRequest {
                 synthetic: Some(proto::Tuple {
                     family: if tuple.source.is_ipv4() { 4 } else { 6 },
-                    source_address: ip_bytes(tuple.source.ip()),
-                    destination_address: ip_bytes(tuple.destination.ip()),
+                    source_address: ip_bytes(&tuple.source.ip()),
+                    destination_address: ip_bytes(&tuple.destination.ip()),
                     protocol: tuple.protocol as u32,
                     source_port: tuple.source.port() as u32,
                     destination_port: tuple.destination.port() as u32,
@@ -507,7 +508,7 @@ mod windows_client {
                     "mapping protocol does not match lookup".into(),
                 ));
             }
-            if address.destination.is_unspecified()
+            if address.destination.ip().is_unspecified()
                 || address.destination.port() == 0
                 || address.destination.is_ipv4() != tuple.destination.is_ipv4()
             {
@@ -589,20 +590,20 @@ mod windows_client {
     async fn connect_tls(
         uri: http::Uri,
         context: Arc<SslContext>,
-    ) -> Result<SslStream<TcpStream>, io::Error> {
+    ) -> Result<TokioIo<SslStream<TcpStream>>, io::Error> {
         let authority = uri.authority().ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "endpoint authority missing")
         })?;
         let stream = TcpStream::connect(authority.as_str()).await?;
         let host = authority.host();
-        let ssl = Ssl::new(&context).map_err(openssl_io_error)?;
+        let mut ssl = Ssl::new(&context).map_err(openssl_io_error)?;
+        ssl.set_hostname(host).map_err(openssl_io_error)?;
         let mut ssl = SslStream::new(ssl, stream).map_err(openssl_io_error)?;
-        ssl.ssl_mut().set_hostname(host).map_err(openssl_io_error)?;
         Pin::new(&mut ssl)
             .connect()
             .await
             .map_err(openssl_io_error)?;
-        Ok(ssl)
+        Ok(TokioIo::new(ssl))
     }
 
     fn openssl_error(error: ErrorStack) -> ProxyError {
@@ -610,10 +611,10 @@ mod windows_client {
     }
 
     fn openssl_io_error(error: impl std::fmt::Display) -> io::Error {
-        io::Error::new(io::ErrorKind::Other, error.to_string())
+        io::Error::other(error.to_string())
     }
 
-    pub use TlsPskMappingClient as PublicTlsPskMappingClient;
+    pub use self::TlsPskMappingClient as PublicTlsPskMappingClient;
 }
 
 #[cfg(all(target_os = "windows", feature = "tls-psk"))]

@@ -147,6 +147,25 @@ checksum, state, and Rust failures MUST remain visible failures. The workflow
 MUST not alter production behavior, publish artifacts, or introduce a
 direct-forward fallback.
 
+### REQ-CI-006 — Reproducible Windows CI environment
+
+The existing workflow MUST include a Windows job for pull requests and pushes
+to `main`. The job MUST use the pinned repository actions and Rust 1.96.1,
+install `ShiningLight.OpenSSL.Dev` version 4.0.1 through winget, and fail if
+the package or installed OpenSSL version does not match.
+
+### REQ-CI-007 — Windows host-proxy quality gates
+
+The Windows job MUST fail if formatting, strict clippy, or the locked
+`shadow-socket-proxy-host` build or test command with the `tls-psk` feature
+enabled fails.
+
+### REQ-CI-008 — Local Windows validation
+
+Before the change is submitted for review, the same OpenSSL version and
+Windows host-proxy validation commands MUST pass on a Windows development
+environment.
+
 ## Acceptance Criteria
 
 - Valid IPv4/IPv6 TCP and UDP packets rewrite with correct L3/L4 checksums.
@@ -162,6 +181,9 @@ direct-forward fallback.
 - A pull request or push to `main` runs all Rust gates, builds the BPF object,
   and executes every required kernel fixture; any failure is reported as a
   failed workflow.
+- A pull request or push to `main` installs and verifies OpenSSL 4.0.1 on
+  Windows and runs the TLS-PSK host-proxy format, clippy, build, and test
+  gates; any failure is reported as a failed workflow.
 
 ## Non-Goals
 

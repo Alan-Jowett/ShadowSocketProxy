@@ -1128,6 +1128,7 @@ dependencies = [
  "async-trait",
  "clap",
  "http",
+ "hyper-util",
  "openssl",
  "prost",
  "protoc-bin-vendored",
