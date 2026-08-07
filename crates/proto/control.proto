@@ -1,0 +1,116 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 ShadowSocketProxy contributors
+
+syntax = "proto3";
+
+package shadow_socket_proxy.control.v1;
+
+message Empty {}
+
+message InterfaceRequest {
+  string elf_path = 1;
+  repeated string interfaces = 2;
+}
+
+message DetachRequest {
+  repeated string interfaces = 1;
+  bool all = 2;
+}
+
+message OperationReply {
+  bool success = 1;
+  string message = 2;
+  repeated string failures = 3;
+}
+
+message Tuple {
+  uint32 family = 1;
+  bytes source_address = 2;
+  bytes destination_address = 3;
+  uint32 protocol = 4;
+  uint32 source_port = 5;
+  uint32 destination_port = 6;
+}
+
+message Mapping {
+  Tuple synthetic = 1;
+  Tuple original = 2;
+  uint64 last_seen_ns = 3;
+  uint32 protocol_flags = 4;
+  uint32 tcp_state_flags = 5;
+}
+
+message ListMappingsRequest {
+  uint32 limit = 1;
+  bytes page_token = 2;
+}
+
+message ListMappingsReply {
+  repeated Mapping mappings = 1;
+  bytes next_page_token = 2;
+  uint64 skipped_entries = 3;
+}
+
+message GetMappingRequest {
+  Tuple synthetic = 1;
+}
+
+message StatusReply {
+  bool ready = 1;
+  uint32 abi_version = 2;
+  repeated string attachments = 3;
+  uint64 scanned = 4;
+  uint64 retained = 5;
+  uint64 deleted = 6;
+  uint64 errors = 7;
+  string last_error = 8;
+}
+
+message Config {
+  uint64 cleanup_interval_ms = 1;
+  uint64 idle_ttl_ms = 2;
+  uint32 map_scan_batch = 3;
+  uint32 log_capacity = 4;
+}
+
+message ConfigReply {
+  uint64 revision = 1;
+  Config config = 2;
+}
+
+message SetConfigRequest {
+  Config config = 1;
+}
+
+message PullLogsRequest {
+  uint64 cursor = 1;
+  uint32 limit = 2;
+}
+
+message LogRecord {
+  uint64 sequence = 1;
+  string level = 2;
+  string message = 3;
+}
+
+message PullLogsReply {
+  repeated LogRecord records = 1;
+  uint64 next_cursor = 2;
+}
+
+message HealthReply {
+  bool live = 1;
+  bool ready = 2;
+}
+
+service Control {
+  rpc Attach(InterfaceRequest) returns (OperationReply);
+  rpc Detach(DetachRequest) returns (OperationReply);
+  rpc ListMappings(ListMappingsRequest) returns (ListMappingsReply);
+  rpc GetMapping(GetMappingRequest) returns (Mapping);
+  rpc GetStatus(Empty) returns (StatusReply);
+  rpc GetConfig(Empty) returns (ConfigReply);
+  rpc SetConfig(SetConfigRequest) returns (ConfigReply);
+  rpc PullLogs(PullLogsRequest) returns (PullLogsReply);
+  rpc Health(Empty) returns (HealthReply);
+}

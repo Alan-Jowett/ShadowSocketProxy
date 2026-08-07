@@ -1,0 +1,41 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 ShadowSocketProxy contributors
+
+[package]
+name = "shadow-socket-proxy-control"
+version = "0.1.0"
+edition = "2021"
+description = "Linux-targeted container control service for ShadowSocketProxy"
+license = "MIT"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "shadow-socket-proxy-control"
+path = "src/main.rs"
+
+[features]
+default = []
+linux-bpf = []
+tls-psk = []
+
+[dependencies]
+arc-swap = "1.7"
+async-trait = "0.1"
+prost = "0.13"
+thiserror = "1"
+tokio = { version = "1.40", features = ["macros", "rt-multi-thread", "sync", "time", "signal", "net", "io-util"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+tonic = { version = "0.12", features = ["transport"] }
+tracing = "0.1"
+uuid = { version = "1", features = ["v4"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+aya = "0.14.0"
+openssl = "0.10.81"
+tokio-openssl = "0.6.5"
+
+[build-dependencies]
+protoc-bin-vendored = "3"
+tonic-build = "0.12"
