@@ -240,10 +240,12 @@ static __always_inline void increment_counter(__u32 index)
 {
     struct counter_value *counter = bpf_map_lookup_elem(&ssp_tc_counters_v1, &index);
     __u64 current;
+    int attempt;
 
     if (!counter)
         return;
-    for (;;) {
+    #pragma unroll
+    for (attempt = 0; attempt < 8; attempt++) {
         current = __sync_fetch_and_add(&counter->value, 0);
         if (current == ~0ULL ||
             __sync_bool_compare_and_swap(&counter->value, current, current + 1))
