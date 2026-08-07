@@ -14,6 +14,8 @@ use std::{
 };
 
 #[cfg(target_os = "linux")]
+use futures_util::StreamExt as FuturesStreamExt;
+#[cfg(target_os = "linux")]
 use openssl::{
     error::ErrorStack,
     ssl::{select_next_proto, AlpnError, Ssl, SslAcceptor, SslContext, SslMethod, SslVersion},
@@ -22,11 +24,12 @@ use openssl::{
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     net::{TcpListener, TcpStream},
+    time::{timeout, Duration},
 };
 #[cfg(target_os = "linux")]
 use tokio_openssl::SslStream;
 #[cfg(target_os = "linux")]
-use tokio_stream::{wrappers::TcpListenerStream, Stream, StreamExt};
+use tokio_stream::{wrappers::TcpListenerStream, Stream};
 #[cfg(target_os = "linux")]
 use tonic::transport::server::Connected;
 
@@ -93,22 +96,29 @@ impl TlsPskServer {
             .await
             .map_err(|error| TransportError::Bind(error.to_string()))?;
         let context = self.context.clone();
-        Ok(TcpListenerStream::new(listener).then(move |accepted| {
-            let context = context.clone();
-            async move {
-                let stream = accepted?;
-                let peer_addr = stream.peer_addr()?;
-                let ssl = Ssl::new(&context)
-                    .map_err(|_| std::io::Error::other("TLS session initialization failed"))?;
-                let mut stream = SslStream::new(ssl, stream)
-                    .map_err(|_| std::io::Error::other("TLS session initialization failed"))?;
-                Pin::new(&mut stream)
-                    .accept()
-                    .await
-                    .map_err(|_| std::io::Error::other("TLS handshake failed"))?;
-                Ok(TlsConnection { stream, peer_addr })
-            }
-        }))
+        Ok(TcpListenerStream::new(listener)
+            .map(move |accepted| {
+                let context = context.clone();
+                async move {
+                    let stream = accepted?;
+                    let peer_addr = stream.peer_addr()?;
+                    let ssl = Ssl::new(&context)
+                        .map_err(|_| std::io::Error::other("TLS session initialization failed"))?;
+                    let mut stream = SslStream::new(ssl, stream)
+                        .map_err(|_| std::io::Error::other("TLS session initialization failed"))?;
+                    timeout(Duration::from_secs(5), Pin::new(&mut stream).accept())
+                        .await
+                        .map_err(|_| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                "TLS handshake timed out",
+                            )
+                        })?
+                        .map_err(|_| std::io::Error::other("TLS handshake failed"))?;
+                    Ok(TlsConnection { stream, peer_addr })
+                }
+            })
+            .buffered(64))
     }
 }
 
