@@ -86,7 +86,6 @@ impl<B: BpfBackend + 'static> ServiceRuntime<B> {
             self.logs.clone(),
             self.shutdown_rx.clone(),
         ));
-        self.service.set_ready(true);
     }
 
     pub async fn serve(&self, address: std::net::SocketAddr) -> Result<(), RuntimeError> {

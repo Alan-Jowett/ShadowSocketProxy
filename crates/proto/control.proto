@@ -40,6 +40,38 @@ message Mapping {
   uint32 tcp_state_flags = 5;
 }
 
+message DestinationPolicyKey {
+  uint32 family = 1;
+  bytes destination_address = 2;
+  uint32 protocol = 3;
+  uint32 destination_port = 4;
+}
+
+message DestinationPolicy {
+  DestinationPolicyKey key = 1;
+  bytes target_address = 2;
+  uint32 target_port = 3;
+}
+
+message SetDestinationPolicyRequest {
+  DestinationPolicy policy = 1;
+}
+
+message DeleteDestinationPolicyRequest {
+  DestinationPolicyKey key = 1;
+}
+
+message ListDestinationPoliciesRequest {
+  uint32 limit = 1;
+  bytes page_token = 2;
+}
+
+message ListDestinationPoliciesReply {
+  repeated DestinationPolicy policies = 1;
+  bytes next_page_token = 2;
+  uint64 skipped_entries = 3;
+}
+
 message ListMappingsRequest {
   uint32 limit = 1;
   bytes page_token = 2;
@@ -64,6 +96,12 @@ message StatusReply {
   uint64 deleted = 6;
   uint64 errors = 7;
   string last_error = 8;
+  uint64 policy_misses = 9;
+  uint64 flow_insert_failures = 10;
+  uint64 partial_cleanups = 11;
+  uint32 policy_map_max_entries = 12;
+  uint32 flow_index_map_max_entries = 13;
+  uint32 flow_state_map_max_entries = 14;
 }
 
 message Config {
@@ -71,6 +109,9 @@ message Config {
   uint64 idle_ttl_ms = 2;
   uint32 map_scan_batch = 3;
   uint32 log_capacity = 4;
+  uint32 destination_policy_capacity = 5;
+  uint32 active_flow_capacity = 6;
+  uint64 tcp_terminal_grace_ms = 7;
 }
 
 message ConfigReply {
@@ -108,6 +149,9 @@ service Control {
   rpc Detach(DetachRequest) returns (OperationReply);
   rpc ListMappings(ListMappingsRequest) returns (ListMappingsReply);
   rpc GetMapping(GetMappingRequest) returns (Mapping);
+  rpc SetDestinationPolicy(SetDestinationPolicyRequest) returns (DestinationPolicy);
+  rpc DeleteDestinationPolicy(DeleteDestinationPolicyRequest) returns (OperationReply);
+  rpc ListDestinationPolicies(ListDestinationPoliciesRequest) returns (ListDestinationPoliciesReply);
   rpc GetStatus(Empty) returns (StatusReply);
   rpc GetConfig(Empty) returns (ConfigReply);
   rpc SetConfig(SetConfigRequest) returns (ConfigReply);
