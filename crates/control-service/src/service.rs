@@ -55,7 +55,16 @@ impl ControlService {
     }
 
     fn map_backend_error(error: BackendError) -> Status {
-        Status::internal(error.to_string())
+        let message = error.to_string();
+        match error {
+            BackendError::MissingElf(_) | BackendError::InvalidInterface(_) => {
+                Status::invalid_argument(message)
+            }
+            BackendError::AbiMismatch(_)
+            | BackendError::Unsupported
+            | BackendError::NotAttached => Status::failed_precondition(message),
+            BackendError::Operation { .. } => Status::internal(message),
+        }
     }
 }
 
@@ -230,6 +239,8 @@ impl Control for ControlService {
             .list_entries()
             .await
             .map_err(Self::map_backend_error)?;
+        let mut entries = entries;
+        entries.sort_by(|left, right| left.0.cmp(&right.0));
         let mut mappings = Vec::new();
         let mut skipped = 0;
         for (index, (key, value)) in entries.into_iter().enumerate().skip(offset) {

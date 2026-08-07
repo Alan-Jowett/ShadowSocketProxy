@@ -37,7 +37,7 @@
   5-tuple to its original 5-tuple and supports IPv4 and IPv6 addresses,
   transport protocol, source port, and destination port.
 - **Traceability:** `USER-REQUEST: Expose a gRPC interface to read connection
-  mappings (converted 5-tuple -> original 5-tuple) from the BPF programs's BPF
+  mappings (converted 5-tuple -> original 5-tuple) from the BPF program's BPF
   hash table.`
 
 ### CHG-004 — Version the BPF map ABI and lifecycle metadata

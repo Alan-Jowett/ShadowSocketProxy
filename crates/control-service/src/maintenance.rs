@@ -60,6 +60,7 @@ pub async fn run_once<B: BpfBackend + ?Sized>(
     let snapshot = config.snapshot();
     let entries = match backend.list_entries().await {
         Ok(entries) => entries,
+        Err(crate::bpf::BackendError::NotAttached) => return,
         Err(error) => {
             stats.update(|value| value.read_failed += 1);
             stats.error(error.to_string());
@@ -89,8 +90,8 @@ pub async fn run_once<B: BpfBackend + ?Sized>(
             logs.append("WARN", "future mapping timestamp retained");
             continue;
         }
-        let age = now_ns.saturating_sub(mapping.last_seen_ns);
-        if age < snapshot.idle_ttl.as_nanos() as u64 {
+        let age = u128::from(now_ns.saturating_sub(mapping.last_seen_ns));
+        if age < snapshot.idle_ttl.as_nanos() {
             stats.update(|value| value.retained += 1);
             continue;
         }

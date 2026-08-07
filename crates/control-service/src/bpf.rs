@@ -22,6 +22,8 @@ pub enum BackendError {
     Operation { location: String, message: String },
     #[error("backend does not support Linux TC operations")]
     Unsupported,
+    #[error("no ELF has been loaded")]
+    NotAttached,
     #[error("ABI version {0} is not supported")]
     AbiMismatch(u16),
 }
@@ -343,9 +345,7 @@ impl LinuxTcAdapter for AyaLinuxTcAdapter {
 
     async fn attach(&self, interface: &str, direction: Direction) -> Result<(), BackendError> {
         let mut state = self.state.lock().unwrap();
-        let state = state
-            .as_mut()
-            .ok_or_else(|| Self::operation("attach", "no ELF has been loaded"))?;
+        let state = state.as_mut().ok_or(BackendError::NotAttached)?;
         let attachment = Attachment {
             interface: interface.to_owned(),
             direction,
@@ -394,9 +394,7 @@ impl LinuxTcAdapter for AyaLinuxTcAdapter {
 
     async fn detach(&self, interface: &str, direction: Direction) -> Result<(), BackendError> {
         let mut state = self.state.lock().unwrap();
-        let state = state
-            .as_mut()
-            .ok_or_else(|| Self::operation("detach", "no ELF has been loaded"))?;
+        let state = state.as_mut().ok_or(BackendError::NotAttached)?;
         let index = state
             .links
             .iter()
@@ -449,9 +447,7 @@ impl LinuxTcAdapter for AyaLinuxTcAdapter {
 
     async fn list_entries(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, BackendError> {
         let mut state = self.state.lock().unwrap();
-        let state = state
-            .as_mut()
-            .ok_or_else(|| Self::operation("map:list", "no ELF has been loaded"))?;
+        let state = state.as_mut().ok_or(BackendError::NotAttached)?;
         Self::with_map(&mut state.bpf, |map| {
             map.iter()
                 .map(|entry| {
@@ -471,9 +467,7 @@ impl LinuxTcAdapter for AyaLinuxTcAdapter {
             )
         })?;
         let mut state = self.state.lock().unwrap();
-        let state = state
-            .as_mut()
-            .ok_or_else(|| Self::operation("map:get", "no ELF has been loaded"))?;
+        let state = state.as_mut().ok_or(BackendError::NotAttached)?;
         Self::with_map(&mut state.bpf, |map| {
             map.get(&key, 0)
                 .map(|value| Some(value.to_vec()))
@@ -494,9 +488,7 @@ impl LinuxTcAdapter for AyaLinuxTcAdapter {
             )
         })?;
         let mut state = self.state.lock().unwrap();
-        let state = state
-            .as_mut()
-            .ok_or_else(|| Self::operation("map:delete", "no ELF has been loaded"))?;
+        let state = state.as_mut().ok_or(BackendError::NotAttached)?;
         Self::with_map(&mut state.bpf, |map| {
             let existed = map
                 .get(&key, 0)
@@ -518,6 +510,7 @@ impl LinuxTcAdapter for AyaLinuxTcAdapter {
 pub struct LinuxBpfBackend {
     adapter: Arc<dyn LinuxTcAdapter>,
     attachments: Arc<Mutex<Vec<Attachment>>>,
+    operation_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl Default for LinuxBpfBackend {
@@ -542,6 +535,7 @@ impl LinuxBpfBackend {
         Self {
             adapter,
             attachments: Arc::new(Mutex::new(Vec::new())),
+            operation_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 }
@@ -553,6 +547,7 @@ impl BpfBackend for LinuxBpfBackend {
         elf: &Path,
         interfaces: &[String],
     ) -> Result<AttachReport, BackendError> {
+        let _operation_guard = self.operation_lock.lock().await;
         if !elf.exists() {
             return Err(BackendError::MissingElf(elf.to_path_buf()));
         }
@@ -612,6 +607,7 @@ impl BpfBackend for LinuxBpfBackend {
     }
 
     async fn detach(&self, interfaces: Option<&[String]>) -> Result<(), BackendError> {
+        let _operation_guard = self.operation_lock.lock().await;
         let owned = self.attachments();
         let selected = owned
             .into_iter()

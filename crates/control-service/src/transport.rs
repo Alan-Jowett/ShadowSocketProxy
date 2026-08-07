@@ -53,7 +53,6 @@ pub enum TransportError {
 }
 
 pub struct TlsPskServer {
-    pub config: TlsPskConfig,
     #[cfg(target_os = "linux")]
     context: Arc<SslContext>,
 }
@@ -80,7 +79,6 @@ impl TlsPskServer {
 
             let context = build_context(&config)?;
             Ok(Self {
-                config,
                 context: Arc::new(context),
             })
         }
