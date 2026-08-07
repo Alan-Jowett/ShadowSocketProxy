@@ -42,6 +42,12 @@ RST.
 | TC-TC-024 | REQ-TC-006 | Attach/rollback/detach/shutdown | Owned links and runtime state roll back transactionally and report partial cleanup. |
 | TC-TC-025 | REQ-TC-004/006 | Kernel test-run sequence | `bpf_prog_test_run_opts` asserts bytes, action, checksums, flow state, target miss, control bypass, FIN/ACK, and RST. |
 | TC-TC-026 | REQ-TC-006 | Protobuf wire compatibility | Retired policy tags are reserved; active legacy fields retain their original tags; new fields use fresh tags. |
+| TC-CI-001 | REQ-CI-001 | Workflow triggers and platform | Pull requests and pushes to `main` select Ubuntu and use locked repository/toolchain inputs. |
+| TC-CI-002 | REQ-CI-002 | Rust format/lint/build/test gates | Any failure of the four exact workspace commands fails the workflow. |
+| TC-CI-003 | REQ-CI-003 | Canonical BPF build | Required native tools are installed and `make -C crates/bpf clean all` produces the expected ELF; compile failure fails the workflow. |
+| TC-CI-004 | REQ-CI-004 | Runner loading and capability failure | The checked-in runner loads the ELF and exits nonzero for missing capabilities, invalid symbols/maps, verifier rejection, or setup failure. |
+| TC-CI-005 | REQ-CI-004 | Ordered kernel fixture sequence | The runner executes target miss, flow creation, forward/reverse rewrite, control bypass, FIN/ACK teardown, and RST; every expected action, packet byte, checksum, and map-state assertion passes. |
+| TC-CI-006 | REQ-CI-005 | No silent skip/artifact publication | Enabled fixture execution cannot be skipped and the workflow publishes no build artifact or changes production behavior. |
 
 ## Impact Map
 
@@ -54,6 +60,11 @@ RST.
 | REQ-TC-005 | D-TC-002, D-TC-005 | TC-TC-006, TC-TC-018, TC-TC-021 | Runtime config/store/backend |
 | REQ-TC-006 | D-TC-001, D-TC-006, D-TC-008 | TC-TC-001..003, TC-TC-022..024, TC-TC-026 | Loader, attach, protobuf, service |
 | REQ-TC-007 | D-TC-002, D-TC-004, D-TC-007 | TC-TC-009..010, TC-TC-019..020 | Main, lifecycle, config, BPF |
+| REQ-CI-001 | D-CI-001, D-CI-004 | TC-CI-001 | Workflow |
+| REQ-CI-002 | D-CI-001, D-CI-002 | TC-CI-002 | Workflow |
+| REQ-CI-003 | D-CI-001, D-CI-002 | TC-CI-003 | Workflow, BPF Makefile |
+| REQ-CI-004 | D-CI-003, D-CI-004 | TC-CI-004..005 | BPF runner, integration test, workflow |
+| REQ-CI-005 | D-CI-001, D-CI-004 | TC-CI-006 | Workflow |
 
 ## Explicit No-Impact Decisions
 
@@ -64,3 +75,4 @@ RST.
   fields.
 - No direct-forward fallback is added when a target is unset or a mapping is
   missing.
+- The workflow does not publish artifacts; it only reports validation status.

@@ -386,6 +386,9 @@ pub trait LinuxTcAdapter: Send + Sync {
     async fn set_runtime_config(&self, _config: &RuntimeConfig) -> Result<(), BackendError> {
         Err(BackendError::Unsupported)
     }
+    async fn read_counters(&self) -> Result<BpfCounters, BackendError> {
+        Err(BackendError::Unsupported)
+    }
     fn map_maxima(&self) -> MapMaxima {
         MapMaxima::default()
     }
@@ -414,6 +417,9 @@ impl LinuxTcAdapter for UnsupportedLinuxTcAdapter {
         Err(BackendError::Unsupported)
     }
     async fn delete_entry(&self, _key: &[u8]) -> Result<bool, BackendError> {
+        Err(BackendError::Unsupported)
+    }
+    async fn read_counters(&self) -> Result<BpfCounters, BackendError> {
         Err(BackendError::Unsupported)
     }
 }
@@ -762,14 +768,10 @@ impl LinuxTcAdapter for AyaLinuxTcAdapter {
         let mut state = self.state.lock().unwrap();
         let state = state.as_mut().ok_or(BackendError::NotAttached)?;
         let index = Self::with_flow_index_map(&mut state.bpf, |map| {
-            map.get(&key, 0)
-                .map(|value| Some(value))
-                .or_else(|error| match error {
-                    aya::maps::MapError::KeyNotFound | aya::maps::MapError::ElementNotFound => {
-                        Ok(None)
-                    }
-                    error => Err(Self::map_error(error)),
-                })
+            map.get(&key, 0).map(Some).or_else(|error| match error {
+                aya::maps::MapError::KeyNotFound | aya::maps::MapError::ElementNotFound => Ok(None),
+                error => Err(Self::map_error(error)),
+            })
         })?;
         let Some(index) = index else {
             return Ok(None);
@@ -779,7 +781,7 @@ impl LinuxTcAdapter for AyaLinuxTcAdapter {
         let state_key = encode_flow_state_key(index.flow_id, index.generation);
         let flow = Self::with_state_map(&mut state.bpf, |map| {
             map.get(&state_key, 0)
-                .map(|value| Some(value))
+                .map(Some)
                 .or_else(|error| match error {
                     aya::maps::MapError::KeyNotFound | aya::maps::MapError::ElementNotFound => {
                         Ok(None)
@@ -809,14 +811,12 @@ impl LinuxTcAdapter for AyaLinuxTcAdapter {
             let mut guard = self.state.lock().unwrap();
             let state = guard.as_mut().ok_or(BackendError::NotAttached)?;
             Self::with_flow_index_map(&mut state.bpf, |map| {
-                map.get(&key, 0)
-                    .map(|value| Some(value))
-                    .or_else(|error| match error {
-                        aya::maps::MapError::KeyNotFound | aya::maps::MapError::ElementNotFound => {
-                            Ok(None)
-                        }
-                        error => Err(Self::map_error(error)),
-                    })
+                map.get(&key, 0).map(Some).or_else(|error| match error {
+                    aya::maps::MapError::KeyNotFound | aya::maps::MapError::ElementNotFound => {
+                        Ok(None)
+                    }
+                    error => Err(Self::map_error(error)),
+                })
             })?
         };
         let Some(index) = index else {
@@ -856,7 +856,7 @@ impl LinuxTcAdapter for AyaLinuxTcAdapter {
         let state_key = encode_flow_state_key(flow_id, generation);
         let flow = Self::with_state_map(&mut state.bpf, |map| {
             map.get(&state_key, 0)
-                .map(|value| Some(value))
+                .map(Some)
                 .or_else(|error| match error {
                     aya::maps::MapError::KeyNotFound | aya::maps::MapError::ElementNotFound => {
                         Ok(None)
@@ -974,7 +974,7 @@ impl LinuxTcAdapter for AyaLinuxTcAdapter {
         let mut state = self.state.lock().unwrap();
         let state = state.as_mut().ok_or(BackendError::NotAttached)?;
         Self::with_runtime_map(&mut state.bpf, |map| {
-            map.set(0, &value, 0).map_err(Self::map_error)
+            map.set(0, value, 0).map_err(Self::map_error)
         })
     }
 

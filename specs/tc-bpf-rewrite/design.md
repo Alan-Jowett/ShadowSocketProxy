@@ -7,7 +7,9 @@
 
 ```text
 USER-REQUEST -> CHG-001..004 -> REQ-TC-001..007
-             -> D-TC-001..009 -> TC-TC-001..025
+             -> CHG-005 -> REQ-CI-001..005
+             -> D-TC-001..009, D-CI-001..004
+             -> TC-TC-001..026, TC-CI-001..006
              -> BPF, backend, protobuf, service, lifecycle, and test changes
 ```
 
@@ -94,6 +96,40 @@ IPv4/IPv6 pseudo-header checksum, and TCP/UDP port updates use the existing
 helpers. Unsupported, malformed, non-initial, and non-linear packets return
 `TC_ACT_OK` without map or packet mutation.
 
+### D-CI-001 — GitHub Actions workflow
+
+The workflow runs on pull requests and pushes to `main` on `ubuntu-latest`.
+It checks out the repository, installs the pinned lockfile-respecting Rust
+toolchain, installs clang, LLVM, Linux kernel UAPI headers,
+OpenSSL/pkg-config development dependencies, and the build tools needed by the
+workspace. It runs the four Rust gates and then the BPF build and fixture
+execution gates.
+
+### D-CI-002 — Canonical command ownership
+
+Rust validation uses the exact workspace commands in REQ-CI-002. BPF
+compilation uses `make -C crates/bpf clean all`, preserving the repository
+Makefile as the source of compiler flags and output naming. The generated ELF
+path is passed to the integration test through `SSP_TEST_BPF_ELF`.
+
+### D-CI-003 — Checked-in privileged runner
+
+The BPF test runner is a small Linux-only executable built by the BPF
+component. It uses Aya to open/load the generated ELF, resolves the v3 ingress
+and egress classifier programs, initializes runtime and flow maps with fixture
+configuration, and invokes Aya's `SchedClassifier::test_run` wrapper over
+`bpf_prog_test_run_opts` for each named fixture. It owns fixture packet
+construction, expected action/bytes/checksums, and map-state assertions; setup,
+capability, verifier, or assertion failure exits nonzero.
+
+### D-CI-004 — Explicit privilege and no-skip behavior
+
+The workflow invokes the runner with the least privilege supported by the
+hosted Linux runner and exports all three gate variables required by the Rust
+integration test. The integration test remains a hard failure when enabled:
+missing runner, missing capability, or failed fixture is never treated as a
+skip.
+
 ## Invariants
 
 | ID | Invariant |
@@ -107,3 +143,5 @@ helpers. Unsupported, malformed, non-initial, and non-linear packets return
 | INV-TC-007 | TCP terminal grace precedes idle cleanup; RST deletes immediately; UDP remains idle-TTL managed. |
 | INV-TC-008 | Readiness requires the complete v3 artifact and rejects stale/mixed policy artifacts. |
 | INV-TC-009 | The listener descriptor is present before attach and immutable through SetConfig. |
+| INV-CI-001 | Every required Rust, BPF-build, and explicitly enabled kernel-fixture gate is executed and failures remain visible. |
+| INV-CI-002 | CI uses the canonical Makefile and generated ELF; it does not alter production runtime behavior or publish artifacts. |

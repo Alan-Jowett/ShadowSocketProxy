@@ -46,6 +46,26 @@
   or serving. Invalid values fail startup. `SetConfig` cannot change the
   listener descriptor.
 
+### CHG-005 — Add CI/CD validation and an executable BPF fixture runner
+
+- **Before:** No GitHub Actions workflow validates the two Rust crates and BPF
+  artifact together. The `bpf_prog_test_run` integration test delegates to an
+  external runner and can only be executed when one is supplied.
+- **After:** A GitHub Actions workflow runs on `ubuntu-latest` for pull
+  requests and pushes to `main`. It installs required Linux tooling and native
+  dependencies, runs formatting, strict workspace clippy, workspace build,
+  and workspace tests, builds the canonical BPF object through the existing
+  Makefile, and executes the gated BPF fixture sequence. A checked-in Linux
+  runner implements `bpf_prog_test_run_opts`, accepts the generated ELF and
+  required ordered fixtures, and fails for unavailable capabilities, invalid
+  program loading, or unexpected packet/action/checksum/state results. CI
+  validates only and does not publish artifacts.
+- **Retired:** No existing requirement is retired; the environment-gated BPF
+  test becomes executable in CI.
+- **Traceability:** `USER-REQUEST: add a CI/CD pass that runs clippy, format
+  check, build and test for all the components (both the BPF and the two rust
+  crates); follow-up approval to add the missing runner.`
+
 ## Stable Requirements
 
 ### REQ-TC-001 — Family-preserving global DNAT
@@ -94,6 +114,39 @@ wildcard flags, be written before attach, and remain immutable through
 `SetConfig`. Concrete listeners match address and port; wildcard listeners
 match any address in their family on the TCP port.
 
+### REQ-CI-001 — Reproducible CI triggers and platform
+
+The workflow MUST run on Ubuntu for pull requests and pushes to `main`, use a
+lockfile-respecting Rust toolchain, and make all required toolchain and native
+dependencies explicit.
+
+### REQ-CI-002 — Rust quality gates
+
+The workflow MUST fail if `cargo fmt --all -- --check`,
+`cargo clippy --workspace --all-targets --all-features -- -D warnings`,
+`cargo build --workspace`, or `cargo test --workspace` fails.
+
+### REQ-CI-003 — BPF build gate
+
+The workflow MUST install clang and Linux kernel UAPI headers and build the
+canonical BPF object through `crates/bpf/Makefile`. A failed BPF compilation
+MUST fail CI.
+
+### REQ-CI-004 — Kernel fixture execution
+
+The checked-in runner MUST execute `target-miss`, `flow-create`,
+`forward-rewrite`, `reverse-rewrite`, `control-bypass`, `fin-ack-teardown`,
+and `rst` through `bpf_prog_test_run_opts` against the generated BPF ELF.
+Missing capabilities, loader/verifier failures, and any fixture mismatch MUST
+return nonzero. CI MUST enable this gate and MUST NOT silently skip it.
+
+### REQ-CI-005 — Failure visibility and scope
+
+Toolchain, dependency, capability, loader, verifier, packet, action,
+checksum, state, and Rust failures MUST remain visible failures. The workflow
+MUST not alter production behavior, publish artifacts, or introduce a
+direct-forward fallback.
+
 ## Acceptance Criteria
 
 - Valid IPv4/IPv6 TCP and UDP packets rewrite with correct L3/L4 checksums.
@@ -106,9 +159,13 @@ match any address in their family on the TCP port.
 - Flow insertion/full-map failure drops eligible packets and increments its slot.
 - RST, FIN/ACK grace, idle TTL, malformed packets, and unsupported protocols
   preserve existing lifecycle and safety invariants.
+- A pull request or push to `main` runs all Rust gates, builds the BPF object,
+  and executes every required kernel fixture; any failure is reported as a
+  failed workflow.
 
 ## Non-Goals
 
 - Cross-family translation, SNAT, wildcard target matching, or QUIC close state.
 - Rewriting malformed packets, non-initial fragments, or unsupported protocols.
 - Replacing TC, changing host-proxy forwarding, or changing TLS/PSK policy.
+- Publishing CI build artifacts or changing production packet behavior.
