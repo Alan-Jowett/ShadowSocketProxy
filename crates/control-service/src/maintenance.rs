@@ -19,6 +19,9 @@ pub struct MaintenanceSnapshot {
     pub read_failed: u64,
     pub delete_failed: u64,
     pub anomalies: u64,
+    pub partial_cleanups: u64,
+    pub policy_misses: u64,
+    pub flow_insert_failures: u64,
 }
 
 #[derive(Default)]
@@ -58,6 +61,51 @@ pub async fn run_once<B: BpfBackend + ?Sized>(
     now_ns: u64,
 ) {
     let snapshot = config.snapshot();
+    match backend.list_flow_states().await {
+        Ok(states) => {
+            for (index, state) in states.into_iter().enumerate() {
+                if index >= snapshot.map_scan_batch {
+                    break;
+                }
+                stats.update(|value| value.scanned += 1);
+                if !state.should_delete(
+                    now_ns,
+                    snapshot.idle_ttl.as_nanos().min(u64::MAX as u128) as u64,
+                ) {
+                    stats.update(|value| value.retained += 1);
+                    continue;
+                }
+                match backend.delete_flow(state.flow_id, state.generation).await {
+                    Ok(report) if report.partial => {
+                        stats.update(|value| {
+                            value.partial_cleanups += 1;
+                            value.delete_failed += 1;
+                        });
+                        stats.error("flow cleanup was partial");
+                        logs.append("ERROR", "flow cleanup was partial");
+                    }
+                    Ok(report) if report.state_deleted || report.indexes_deleted != 0 => {
+                        stats.update(|value| value.deleted += 1);
+                    }
+                    Ok(_) => stats.update(|value| value.retained += 1),
+                    Err(error) => {
+                        stats.update(|value| value.delete_failed += 1);
+                        stats.error(error.to_string());
+                        logs.append("ERROR", format!("flow cleanup failed: {error}"));
+                    }
+                }
+            }
+            return;
+        }
+        Err(crate::bpf::BackendError::Unsupported) => {}
+        Err(crate::bpf::BackendError::NotAttached) => return,
+        Err(error) => {
+            stats.update(|value| value.read_failed += 1);
+            stats.error(error.to_string());
+            logs.append("ERROR", format!("flow state scan failed: {error}"));
+            return;
+        }
+    }
     let entries = match backend.list_entries().await {
         Ok(entries) => entries,
         Err(crate::bpf::BackendError::NotAttached) => return,

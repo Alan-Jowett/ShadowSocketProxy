@@ -37,13 +37,15 @@ WSL’s NAT model breaks VPNs, packet inspection, and tools that rely on owning 
 
 ## Status
 
-Prototype. Packet rewriting, flow mapping, and proxy bridging are functional. Future work includes QUIC support, better failure semantics, and selective flow interception.
+Prototype. Packet rewriting, destination policy, flow mapping, and proxy
+bridging are implemented. Kernel attachment and packet-path verification remain
+Linux-environment gated.
 
 ## Container control service
 
 The Linux-targeted Rust control service is in `crates/control-service`, with
-the shared protobuf contract in `crates/proto` and the placeholder BPF program
-in `crates/bpf`:
+the shared protobuf contract in `crates/proto` and the Linux TC BPF artifact
+source in `crates/bpf`:
 
 ```text
 cargo build --target x86_64-unknown-linux-gnu

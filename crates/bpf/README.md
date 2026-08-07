@@ -1,22 +1,42 @@
 <!-- SPDX-License-Identifier: MIT -->
 <!-- Copyright (c) 2026 ShadowSocketProxy contributors -->
 
-# Placeholder BPF ELF contract
+# Linux TC BPF artifact
 
-The control service expects a supplied Linux BPF ELF to expose the following
-ABI-v1 symbols:
+`placeholder.bpf.c` is the Linux `SCHED_CLS` artifact source. The historical
+filename is retained so existing packaging references remain valid; it is no
+longer a placeholder. It exports:
 
-- map: `ssp_flow_map_v1`;
-- ingress TC classifier: `ssp_tc_ingress_v1`;
-- egress TC classifier: `ssp_tc_egress_v1`.
+- `ssp_tc_ingress_v2` and `ssp_tc_egress_v2`;
+- `ssp_destination_policy_map_v1`;
+- `ssp_flow_index_v1`;
+- `ssp_flow_state_v1`;
+- `ssp_runtime_config_v1`;
+- `ssp_tc_active_flows_v1`;
+- `ssp_tc_counters_v1`.
 
-The final packet-rewriting program is intentionally not part of this crate.
-The map key and value byte layout is implemented in
-`crates/control-service/src/mapping.rs` and is the contract used by the
-production Aya backend adapter.
+Build on Linux with clang and kernel UAPI headers:
 
-On Linux, `LinuxBpfBackend` uses Aya to load the ELF, validate these symbols,
-attach ingress and egress links, and read or delete map entries. Attach
-operations track service-owned links and roll back links created by a failed
-multi-interface transaction. Non-Linux builds retain an explicit unsupported
-adapter because TC and eBPF are Linux kernel facilities.
+```sh
+clang -O2 -g -target bpf -D__TARGET_ARCH_x86 \
+  -I/usr/include/$(uname -m)-linux-gnu \
+  -c placeholder.bpf.c -o shadow-socket-proxy.bpf.o
+```
+
+The control service validates all required v2 programs and v1 maps before
+attachment. Map `max_entries` values are fixed in the ELF; runtime policy and
+flow capacities are admission caps and do not resize or reattach maps.
+
+The source only rewrites bounds-checkable IPv4/IPv6 TCP/UDP first fragments.
+Malformed, unsupported, non-initial-fragment, or unreadable packets return
+`TC_ACT_OK` unchanged. RST removes a flow immediately; TCP FIN/ACK state is
+retained until terminal grace, while UDP/QUIC activity is idle-TTL managed.
+
+Kernel verifier, TC attachment, and `bpf_prog_test_run` tests are gated by
+`SSP_TEST_BPF_ELF` and Linux kernel capabilities. They must not be used to
+claim readiness on non-Linux hosts.
+
+The Rust integration gate additionally accepts `SSP_TEST_BPF_PROG_RUN=1` and
+`SSP_BPF_PROG_TEST_RUNNER`; the runner receives the ELF path and the ordered
+fixtures `policy-miss`, `flow-create`, `forward-rewrite`, `reverse-rewrite`,
+`fin-ack-teardown`, and `rst`.
