@@ -17,14 +17,13 @@ path = "src/main.rs"
 
 [features]
 default = []
-tls-psk = ["dep:openssl", "dep:tokio-openssl"]
+tls-psk = ["dep:hyper-util", "dep:openssl", "dep:tokio-openssl"]
 
 [dependencies]
 async-trait = "0.1"
 clap = { version = "4.5", features = ["derive", "env"] }
 prost = "0.13"
 http = "1"
-hyper-util = { version = "0.1", features = ["tokio"] }
 thiserror = "1"
 tokio = { version = "1.40", features = ["macros", "rt-multi-thread", "sync", "time", "signal", "net", "io-util"] }
 tonic = { version = "0.12", features = ["transport"] }
@@ -33,6 +32,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
+hyper-util = { version = "0.1", features = ["tokio"], optional = true }
 openssl = { version = "0.10.81", optional = true }
 tokio-openssl = { version = "0.6.5", optional = true }
 

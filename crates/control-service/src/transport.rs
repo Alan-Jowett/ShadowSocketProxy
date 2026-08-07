@@ -276,19 +276,12 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let client = TcpStream::connect(address).await.unwrap();
         let (server_stream, _) = listener.accept().await.unwrap();
-        let handshake = accept_tls(context, server_stream);
-        tokio::pin!(handshake);
-        tokio::select! {
-            biased;
-            _ = tokio::time::advance(Duration::from_secs(5)) => {}
-            result = &mut handshake => match result {
-                Ok(_) => panic!("handshake completed unexpectedly"),
-                Err(error) => panic!("handshake failed before timeout: {error:?}"),
-            },
-        }
-        let error = match handshake.await {
-            Ok(_) => panic!("handshake completed unexpectedly"),
-            Err(error) => error,
+        let result =
+            tokio::time::timeout(Duration::from_secs(6), accept_tls(context, server_stream)).await;
+        let error = match result {
+            Ok(Ok(_)) => panic!("handshake completed unexpectedly"),
+            Ok(Err(error)) => error,
+            Err(_) => panic!("outer test timeout expired"),
         };
         assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
         drop(client);

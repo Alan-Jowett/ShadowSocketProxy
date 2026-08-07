@@ -80,19 +80,19 @@ jobs:
         run: |
           $package = winget list --id ShiningLight.OpenSSL.Dev --exact `
             --accept-source-agreements | Out-String
-          if ($package -notmatch '4\.0\.1') {
+          if ($package -notmatch '(?m)(?<![\d.])4\.0\.1(?![\d.])') {
             throw "Expected ShiningLight.OpenSSL.Dev version 4.0.1. Installed packages: $package"
           }
 
-          $openssl = Get-ChildItem -Path 'C:\Program Files' -Filter openssl.exe `
-            -Recurse -ErrorAction SilentlyContinue |
-            Where-Object { $_.FullName -match '\\OpenSSL[^\\]*\\bin\\openssl\.exe$' } |
+          $openssl = Get-ChildItem -Path 'C:\Program Files' -Directory -Filter 'OpenSSL*' |
+            ForEach-Object { Join-Path $_.FullName 'bin\openssl.exe' } |
+            Where-Object { Test-Path $_ } |
             Select-Object -First 1
           if ($null -eq $openssl) {
             throw "OpenSSL executable was not found under C:\Program Files"
           }
 
-          $version = (& $openssl.FullName version 2>&1 | Out-String).Trim()
+          $version = (& $openssl version 2>&1 | Out-String).Trim()
           Write-Output $version
           if ($version -notmatch 'OpenSSL 4\.0\.1') {
             throw "Expected OpenSSL 4.0.1, got: $version"
@@ -101,7 +101,12 @@ jobs:
             throw "OpenSSL version check failed"
           }
 
-          $opensslRoot = Split-Path (Split-Path $openssl.FullName -Parent) -Parent
+          $pskCiphers = (& $openssl ciphers -v 'PSK-AES256-GCM-SHA384' 2>&1 | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0 -or $pskCiphers -notmatch '(?m)^PSK-AES256-GCM-SHA384\s') {
+            throw "OpenSSL does not expose PSK-AES256-GCM-SHA384: $pskCiphers"
+          }
+
+          $opensslRoot = Split-Path (Split-Path $openssl -Parent) -Parent
           "OPENSSL_DIR=$opensslRoot" >> $env:GITHUB_ENV
           "OPENSSL_LIB_DIR=$opensslRoot\lib\VC\x64\MD" >> $env:GITHUB_ENV
           "OPENSSL_INCLUDE_DIR=$opensslRoot\include" >> $env:GITHUB_ENV
