@@ -58,3 +58,23 @@ map operations. The TCP gRPC endpoint uses OpenSSL with TLS 1.2 PSK and h2
 ALPN; invalid credentials or a build without PSK support fail startup rather
 than falling back to plaintext, metadata-only auth, or mTLS. Linux builds
 require an OpenSSL development installation whose build enables PSK.
+
+## Windows host shadow proxy
+
+The Windows host proxy is in `crates/host-proxy`. It listens for redirected
+TCP and UDP flows, resolves each observed synthetic tuple through the
+authenticated `GetMapping` RPC, connects TCP flows to the original destination,
+and forwards UDP datagrams with response relaying.
+
+Build the default workspace target with:
+
+```text
+cargo build -p shadow-socket-proxy-host
+```
+
+Windows deployments that provide a PSK-capable OpenSSL installation enable the
+TLS transport with `--features tls-psk`. Configure the listener and control
+service with CLI options; provide the PSK through `--psk-secret`,
+`SSP_TLS_PSK_SECRET`, or `--psk-secret-file`. The proxy requires a nonzero
+`--udp-idle-timeout-secs` and never falls back to direct forwarding when a
+mapping lookup fails.
