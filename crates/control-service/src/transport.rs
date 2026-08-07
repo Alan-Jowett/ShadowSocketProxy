@@ -279,8 +279,12 @@ mod tests {
         let handshake = accept_tls(context, server_stream);
         tokio::pin!(handshake);
         tokio::select! {
-            result = &mut handshake => panic!("handshake completed unexpectedly: {}", result.is_ok()),
+            biased;
             _ = tokio::time::advance(Duration::from_secs(5)) => {}
+            result = &mut handshake => match result {
+                Ok(_) => panic!("handshake completed unexpectedly"),
+                Err(error) => panic!("handshake failed before timeout: {error:?}"),
+            },
         }
         let error = match handshake.await {
             Ok(_) => panic!("handshake completed unexpectedly"),
