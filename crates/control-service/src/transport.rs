@@ -14,6 +14,8 @@ use std::{
 };
 
 #[cfg(target_os = "linux")]
+use futures_util::StreamExt as FuturesStreamExt;
+#[cfg(target_os = "linux")]
 use openssl::{
     error::ErrorStack,
     ssl::{select_next_proto, AlpnError, Ssl, SslAcceptor, SslContext, SslMethod, SslVersion},
@@ -22,11 +24,12 @@ use openssl::{
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     net::{TcpListener, TcpStream},
+    time::{timeout, Duration},
 };
 #[cfg(target_os = "linux")]
 use tokio_openssl::SslStream;
 #[cfg(target_os = "linux")]
-use tokio_stream::{wrappers::TcpListenerStream, Stream, StreamExt};
+use tokio_stream::{wrappers::TcpListenerStream, Stream};
 #[cfg(target_os = "linux")]
 use tonic::transport::server::Connected;
 
@@ -93,23 +96,30 @@ impl TlsPskServer {
             .await
             .map_err(|error| TransportError::Bind(error.to_string()))?;
         let context = self.context.clone();
-        Ok(TcpListenerStream::new(listener).then(move |accepted| {
-            let context = context.clone();
-            async move {
-                let stream = accepted?;
-                let peer_addr = stream.peer_addr()?;
-                let ssl = Ssl::new(&context)
-                    .map_err(|_| std::io::Error::other("TLS session initialization failed"))?;
-                let mut stream = SslStream::new(ssl, stream)
-                    .map_err(|_| std::io::Error::other("TLS session initialization failed"))?;
-                Pin::new(&mut stream)
-                    .accept()
-                    .await
-                    .map_err(|_| std::io::Error::other("TLS handshake failed"))?;
-                Ok(TlsConnection { stream, peer_addr })
-            }
-        }))
+        Ok(TcpListenerStream::new(listener)
+            .map(move |accepted| {
+                let context = context.clone();
+                async move { accept_tls(context, accepted?).await }
+            })
+            .buffer_unordered(64))
     }
+}
+
+#[cfg(target_os = "linux")]
+async fn accept_tls(
+    context: Arc<SslContext>,
+    stream: TcpStream,
+) -> Result<TlsConnection, std::io::Error> {
+    let peer_addr = stream.peer_addr()?;
+    let ssl = Ssl::new(&context)
+        .map_err(|_| std::io::Error::other("TLS session initialization failed"))?;
+    let mut stream = SslStream::new(ssl, stream)
+        .map_err(|_| std::io::Error::other("TLS session initialization failed"))?;
+    timeout(Duration::from_secs(5), Pin::new(&mut stream).accept())
+        .await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "TLS handshake timed out"))?
+        .map_err(|_| std::io::Error::other("TLS handshake failed"))?;
+    Ok(TlsConnection { stream, peer_addr })
 }
 
 #[cfg(target_os = "linux")]
@@ -248,5 +258,35 @@ mod tests {
             secret: b"01234567890123456789012345678901".to_vec(),
         });
         assert!(server.is_ok());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(start_paused = true)]
+    async fn stalled_tls_handshake_times_out() {
+        use tokio::net::TcpListener;
+
+        let context = Arc::new(
+            build_context(&TlsPskConfig {
+                identity: "shadow-socket-proxy".into(),
+                secret: b"01234567890123456789012345678901".to_vec(),
+            })
+            .unwrap(),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = TcpStream::connect(address).await.unwrap();
+        let (server_stream, _) = listener.accept().await.unwrap();
+        let handshake = accept_tls(context, server_stream);
+        tokio::pin!(handshake);
+        tokio::select! {
+            result = &mut handshake => panic!("handshake completed unexpectedly: {}", result.is_ok()),
+            _ = tokio::time::advance(Duration::from_secs(5)) => {}
+        }
+        let error = match handshake.await {
+            Ok(_) => panic!("handshake completed unexpectedly"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        drop(client);
     }
 }

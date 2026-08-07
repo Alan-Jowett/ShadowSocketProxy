@@ -23,9 +23,10 @@ tls-psk = []
 [dependencies]
 arc-swap = "1.7"
 async-trait = "0.1"
+futures-util = "0.3"
 prost = "0.13"
 thiserror = "1"
-tokio = { version = "1.40", features = ["macros", "rt-multi-thread", "sync", "time", "signal", "net", "io-util"] }
+tokio = { version = "1.40", features = ["macros", "rt-multi-thread", "sync", "time", "signal", "net", "io-util", "test-util"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 tonic = { version = "0.12", features = ["transport"] }
 tracing = "0.1"
