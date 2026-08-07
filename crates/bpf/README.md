@@ -3,9 +3,8 @@
 
 # Linux TC BPF artifact
 
-`placeholder.bpf.c` is the Linux `SCHED_CLS` artifact source. The historical
-filename is retained so existing packaging references remain valid; it is no
-longer a placeholder. It exports:
+`shadow-socket-proxy.bpf.c` is the Linux `SCHED_CLS` artifact source. It
+exports:
 
 - `ssp_tc_ingress_v3` and `ssp_tc_egress_v3`;
 - `ssp_flow_index_v1`;
