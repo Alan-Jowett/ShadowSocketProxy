@@ -2,6 +2,7 @@
 // Copyright (c) 2026 ShadowSocketProxy contributors
 
 use std::{
+    net::{IpAddr, SocketAddr},
     sync::atomic::{AtomicU64, Ordering},
     time::Duration,
 };
@@ -9,31 +10,62 @@ use std::{
 use arc_swap::ArcSwap;
 use thiserror::Error;
 
-use crate::mapping::MapMaxima;
+use crate::mapping::{MapMaxima, RUNTIME_CONFIG_ABI_VERSION};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListenerDescriptor {
+    pub address: IpAddr,
+    pub port: u16,
+    pub ipv4_wildcard: bool,
+    pub ipv6_wildcard: bool,
+}
+
+impl ListenerDescriptor {
+    pub fn from_socket_addr(address: SocketAddr) -> Self {
+        Self {
+            address: address.ip(),
+            port: address.port(),
+            ipv4_wildcard: address.ip().is_unspecified() && address.is_ipv4(),
+            ipv6_wildcard: address.ip().is_unspecified() && address.is_ipv6(),
+        }
+    }
+
+    pub fn socket_addr(&self) -> SocketAddr {
+        SocketAddr::new(self.address, self.port)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeConfig {
+    pub schema_version: u16,
     pub revision: u64,
     pub cleanup_interval: Duration,
     pub idle_ttl: Duration,
     pub map_scan_batch: usize,
     pub log_capacity: usize,
-    pub destination_policy_capacity: usize,
     pub active_flow_capacity: usize,
     pub tcp_terminal_grace: Duration,
+    pub ipv4_target: Option<SocketAddr>,
+    pub ipv6_target: Option<SocketAddr>,
+    pub listener: ListenerDescriptor,
 }
 
 impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
+            schema_version: RUNTIME_CONFIG_ABI_VERSION,
             revision: 1,
             cleanup_interval: Duration::from_secs(10),
             idle_ttl: Duration::from_secs(60),
             map_scan_batch: 256,
             log_capacity: 1024,
-            destination_policy_capacity: 1024,
             active_flow_capacity: 4096,
             tcp_terminal_grace: Duration::from_secs(30),
+            ipv4_target: None,
+            ipv6_target: None,
+            listener: ListenerDescriptor::from_socket_addr(
+                "0.0.0.0:50051".parse().expect("valid default listener"),
+            ),
         }
     }
 }
@@ -42,6 +74,8 @@ impl Default for RuntimeConfig {
 pub enum ConfigError {
     #[error("cleanup interval must be non-zero")]
     ZeroCleanupInterval,
+    #[error("runtime config schema version is unsupported")]
+    UnsupportedSchemaVersion,
     #[error("idle TTL must be non-zero")]
     ZeroIdleTtl,
     #[error("map scan batch must be between 1 and 100000")]
@@ -50,8 +84,6 @@ pub enum ConfigError {
     InvalidLogCapacity,
     #[error("cleanup interval must not exceed idle TTL")]
     IntervalExceedsTtl,
-    #[error("destination policy capacity must be between 1 and the ELF maximum")]
-    InvalidPolicyCapacity,
     #[error("active flow capacity must be between 1 and the ELF maximum")]
     InvalidFlowCapacity,
     #[error("active flow capacity requires three flow indexes per flow")]
@@ -60,6 +92,16 @@ pub enum ConfigError {
     ZeroTerminalGrace,
     #[error("runtime duration is too large")]
     DurationOverflow,
+    #[error("listener port must be non-zero")]
+    InvalidListenerPort,
+    #[error("listener wildcard flags do not match the listener address")]
+    InvalidListenerWildcard,
+    #[error("target address and port must be set together")]
+    PartialTarget,
+    #[error("target address family does not match its field")]
+    TargetFamilyMismatch,
+    #[error("target address is unspecified")]
+    UnspecifiedTarget,
 }
 
 impl RuntimeConfig {
@@ -68,6 +110,9 @@ impl RuntimeConfig {
     }
 
     pub fn validate_with_maxima(&self, maxima: MapMaxima) -> Result<(), ConfigError> {
+        if self.schema_version != RUNTIME_CONFIG_ABI_VERSION {
+            return Err(ConfigError::UnsupportedSchemaVersion);
+        }
         if self.cleanup_interval.is_zero() {
             return Err(ConfigError::ZeroCleanupInterval);
         }
@@ -83,10 +128,6 @@ impl RuntimeConfig {
         if self.cleanup_interval > self.idle_ttl {
             return Err(ConfigError::IntervalExceedsTtl);
         }
-        if self.destination_policy_capacity == 0 || self.destination_policy_capacity > maxima.policy
-        {
-            return Err(ConfigError::InvalidPolicyCapacity);
-        }
         if self.active_flow_capacity == 0 || self.active_flow_capacity > maxima.flow_state {
             return Err(ConfigError::InvalidFlowCapacity);
         }
@@ -96,6 +137,18 @@ impl RuntimeConfig {
         if self.tcp_terminal_grace.is_zero() {
             return Err(ConfigError::ZeroTerminalGrace);
         }
+        if self.listener.port == 0 {
+            return Err(ConfigError::InvalidListenerPort);
+        }
+        if self.listener.ipv4_wildcard
+            != (self.listener.address.is_unspecified() && self.listener.address.is_ipv4())
+            || self.listener.ipv6_wildcard
+                != (self.listener.address.is_unspecified() && self.listener.address.is_ipv6())
+        {
+            return Err(ConfigError::InvalidListenerWildcard);
+        }
+        validate_target(self.ipv4_target, true)?;
+        validate_target(self.ipv6_target, false)?;
         if self.cleanup_interval.as_secs() > 365 * 24 * 60 * 60
             || self.idle_ttl.as_secs() > 365 * 24 * 60 * 60
             || self.tcp_terminal_grace.as_secs() > 365 * 24 * 60 * 60
@@ -104,6 +157,22 @@ impl RuntimeConfig {
         }
         Ok(())
     }
+}
+
+fn validate_target(target: Option<SocketAddr>, ipv4: bool) -> Result<(), ConfigError> {
+    let Some(target) = target else {
+        return Ok(());
+    };
+    if target.port() == 0 {
+        return Err(ConfigError::PartialTarget);
+    }
+    if target.ip().is_ipv4() != ipv4 {
+        return Err(ConfigError::TargetFamilyMismatch);
+    }
+    if target.ip().is_unspecified() {
+        return Err(ConfigError::UnspecifiedTarget);
+    }
+    Ok(())
 }
 
 pub struct ConfigStore {
@@ -171,10 +240,27 @@ mod tests {
     #[test]
     fn runtime_caps_cannot_exceed_fixed_elf_maxima() {
         let mut config = RuntimeConfig::default();
-        config.destination_policy_capacity = MapMaxima::default().policy + 1;
+        config.active_flow_capacity = MapMaxima::default().flow_state + 1;
         assert!(matches!(
             ConfigStore::new(config),
-            Err(ConfigError::InvalidPolicyCapacity)
+            Err(ConfigError::InvalidFlowCapacity)
         ));
+    }
+
+    #[test]
+    fn target_pairs_are_atomic() {
+        let mut config = RuntimeConfig::default();
+        config.ipv4_target = Some("192.0.2.10:0".parse().unwrap());
+        assert!(matches!(
+            ConfigStore::new(config),
+            Err(ConfigError::PartialTarget)
+        ));
+    }
+
+    #[test]
+    fn listener_descriptor_round_trips_to_socket_address() {
+        let address = "192.0.2.10:50051".parse().unwrap();
+        let descriptor = ListenerDescriptor::from_socket_addr(address);
+        assert_eq!(descriptor.socket_addr(), address);
     }
 }

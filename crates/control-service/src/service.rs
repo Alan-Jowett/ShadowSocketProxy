@@ -14,10 +14,10 @@ use tonic::{Request, Response, Status};
 
 use crate::{
     bpf::{Attachment, BackendError, BpfBackend},
-    config::{ConfigStore, RuntimeConfig},
+    config::{ConfigStore, ListenerDescriptor, RuntimeConfig},
     logs::{LogError, LogRing},
     maintenance::MaintenanceStats,
-    mapping::{DestinationPolicy, Mapping, PolicyKey, Tuple},
+    mapping::{Mapping, Tuple, RUNTIME_CONFIG_ABI_VERSION},
     proto::{self, control_server::Control},
 };
 
@@ -64,9 +64,7 @@ impl ControlService {
             | BackendError::Unsupported
             | BackendError::NotAttached => Status::failed_precondition(message),
             BackendError::Operation { .. } => Status::internal(message),
-            BackendError::PolicyCapacity | BackendError::FlowCapacity => {
-                Status::resource_exhausted(message)
-            }
+            BackendError::FlowCapacity => Status::resource_exhausted(message),
             BackendError::PartialCleanup(_) => Status::aborted(message),
         }
     }
@@ -145,23 +143,6 @@ fn mapping_to_proto(mapping: Mapping) -> proto::Mapping {
     }
 }
 
-fn policy_to_proto(policy: DestinationPolicy) -> proto::DestinationPolicy {
-    proto::DestinationPolicy {
-        key: Some(proto::DestinationPolicyKey {
-            family: if policy.key.destination.is_ipv4() {
-                4
-            } else {
-                6
-            },
-            destination_address: ip_bytes(policy.key.destination),
-            protocol: policy.key.protocol as u32,
-            destination_port: policy.key.destination_port as u32,
-        }),
-        target_address: ip_bytes(policy.target),
-        target_port: policy.target_port as u32,
-    }
-}
-
 fn ip_bytes(address: IpAddr) -> Vec<u8> {
     match address {
         IpAddr::V4(address) => address.octets().to_vec(),
@@ -169,61 +150,12 @@ fn ip_bytes(address: IpAddr) -> Vec<u8> {
     }
 }
 
-fn policy_key_from_proto(key: Option<proto::DestinationPolicyKey>) -> Result<PolicyKey, Status> {
-    let key = key.ok_or_else(|| Status::invalid_argument("policy key is required"))?;
-    let destination = match key.family {
-        4 if key.destination_address.len() == 4 => IpAddr::V4(Ipv4Addr::from(
-            <[u8; 4]>::try_from(key.destination_address).unwrap(),
-        )),
-        6 if key.destination_address.len() == 16 => IpAddr::V6(Ipv6Addr::from(
-            <[u8; 16]>::try_from(key.destination_address).unwrap(),
-        )),
-        _ => return Err(Status::invalid_argument("invalid policy address/family")),
-    };
-    if key.protocol > u8::MAX as u32 || key.destination_port > u16::MAX as u32 {
-        return Err(Status::invalid_argument("policy field is out of range"));
-    }
-    let key = PolicyKey {
-        destination,
-        protocol: key.protocol as u8,
-        destination_port: key.destination_port as u16,
-    };
-    key.validate()
-        .map_err(|error| Status::invalid_argument(error.to_string()))?;
-    Ok(key)
-}
-
-fn policy_from_proto(
-    policy: Option<proto::DestinationPolicy>,
-) -> Result<DestinationPolicy, Status> {
-    let policy = policy.ok_or_else(|| Status::invalid_argument("policy is required"))?;
-    let key = policy_key_from_proto(policy.key)?;
-    let target = match (key.family(), policy.target_address.len()) {
-        (4, 4) => IpAddr::V4(Ipv4Addr::from(
-            <[u8; 4]>::try_from(policy.target_address).unwrap(),
-        )),
-        (6, 16) => IpAddr::V6(Ipv6Addr::from(
-            <[u8; 16]>::try_from(policy.target_address).unwrap(),
-        )),
-        _ => return Err(Status::invalid_argument("invalid target address/family")),
-    };
-    if policy.target_port > u16::MAX as u32 {
-        return Err(Status::invalid_argument("target port is out of range"));
-    }
-    let policy = DestinationPolicy::new(
-        key.destination,
-        key.protocol,
-        key.destination_port,
-        target,
-        policy.target_port as u16,
-    );
-    policy
-        .validate()
-        .map_err(|error| Status::invalid_argument(error.to_string()))?;
-    Ok(policy)
-}
-
 fn config_to_proto(config: Arc<RuntimeConfig>) -> proto::ConfigReply {
+    let listener_family = if config.listener.address.is_ipv4() {
+        4
+    } else {
+        6
+    };
     proto::ConfigReply {
         revision: config.revision,
         config: Some(proto::Config {
@@ -231,32 +163,111 @@ fn config_to_proto(config: Arc<RuntimeConfig>) -> proto::ConfigReply {
             idle_ttl_ms: config.idle_ttl.as_millis() as u64,
             map_scan_batch: config.map_scan_batch as u32,
             log_capacity: config.log_capacity as u32,
-            destination_policy_capacity: config.destination_policy_capacity as u32,
             active_flow_capacity: config.active_flow_capacity as u32,
             tcp_terminal_grace_ms: config.tcp_terminal_grace.as_millis() as u64,
+            schema_version: config.schema_version as u32,
+            ipv4_target_address: config
+                .ipv4_target
+                .map(|target| ip_bytes(target.ip()))
+                .unwrap_or_default(),
+            ipv4_target_port: config
+                .ipv4_target
+                .map(|target| target.port() as u32)
+                .unwrap_or_default(),
+            ipv6_target_address: config
+                .ipv6_target
+                .map(|target| ip_bytes(target.ip()))
+                .unwrap_or_default(),
+            ipv6_target_port: config
+                .ipv6_target
+                .map(|target| target.port() as u32)
+                .unwrap_or_default(),
+            listener_family,
+            listener_address: ip_bytes(config.listener.address),
+            listener_port: config.listener.port as u32,
+            listener_ipv4_wildcard: config.listener.ipv4_wildcard,
+            listener_ipv6_wildcard: config.listener.ipv6_wildcard,
         }),
     }
 }
 
+fn parse_address(family: u32, bytes: Vec<u8>, label: &str) -> Result<IpAddr, Status> {
+    match family {
+        4 if bytes.len() == 4 => Ok(IpAddr::V4(Ipv4Addr::from(
+            <[u8; 4]>::try_from(bytes).unwrap(),
+        ))),
+        6 if bytes.len() == 16 => Ok(IpAddr::V6(Ipv6Addr::from(
+            <[u8; 16]>::try_from(bytes).unwrap(),
+        ))),
+        _ => Err(Status::invalid_argument(format!(
+            "invalid {label} address/family"
+        ))),
+    }
+}
+
+fn parse_target(
+    family: u32,
+    address: Vec<u8>,
+    port: u32,
+    label: &str,
+) -> Result<Option<std::net::SocketAddr>, Status> {
+    if address.is_empty() && port == 0 {
+        return Ok(None);
+    }
+    if address.is_empty() || port == 0 || port > u16::MAX as u32 {
+        return Err(Status::invalid_argument(format!(
+            "{label} address and port must be set together"
+        )));
+    }
+    Ok(Some(std::net::SocketAddr::new(
+        parse_address(family, address, label)?,
+        port as u16,
+    )))
+}
+
 fn runtime_config_from_proto(config: Option<proto::Config>) -> Result<RuntimeConfig, Status> {
     let config = config.ok_or_else(|| Status::invalid_argument("config is required"))?;
+    if config.schema_version != RUNTIME_CONFIG_ABI_VERSION as u32 {
+        return Err(Status::invalid_argument(
+            "unsupported runtime config schema version",
+        ));
+    }
     let map_scan_batch = usize::try_from(config.map_scan_batch)
         .map_err(|_| Status::invalid_argument("map scan batch is out of range"))?;
     let log_capacity = usize::try_from(config.log_capacity)
         .map_err(|_| Status::invalid_argument("log capacity is out of range"))?;
-    let destination_policy_capacity = usize::try_from(config.destination_policy_capacity)
-        .map_err(|_| Status::invalid_argument("policy capacity is out of range"))?;
     let active_flow_capacity = usize::try_from(config.active_flow_capacity)
         .map_err(|_| Status::invalid_argument("flow capacity is out of range"))?;
+    let listener = ListenerDescriptor {
+        address: parse_address(config.listener_family, config.listener_address, "listener")?,
+        port: u16::try_from(config.listener_port)
+            .map_err(|_| Status::invalid_argument("listener port is out of range"))?,
+        ipv4_wildcard: config.listener_ipv4_wildcard,
+        ipv6_wildcard: config.listener_ipv6_wildcard,
+    };
     Ok(RuntimeConfig {
+        schema_version: u16::try_from(config.schema_version)
+            .map_err(|_| Status::invalid_argument("schema version is out of range"))?,
         revision: 0,
         cleanup_interval: std::time::Duration::from_millis(config.cleanup_interval_ms),
         idle_ttl: std::time::Duration::from_millis(config.idle_ttl_ms),
         map_scan_batch,
         log_capacity,
-        destination_policy_capacity,
         active_flow_capacity,
         tcp_terminal_grace: std::time::Duration::from_millis(config.tcp_terminal_grace_ms),
+        ipv4_target: parse_target(
+            4,
+            config.ipv4_target_address,
+            config.ipv4_target_port,
+            "IPv4 target",
+        )?,
+        ipv6_target: parse_target(
+            6,
+            config.ipv6_target_address,
+            config.ipv6_target_port,
+            "IPv6 target",
+        )?,
+        listener,
     })
 }
 
@@ -424,89 +435,6 @@ impl Control for ControlService {
         Ok(Response::new(mapping_to_proto(mapping)))
     }
 
-    async fn set_destination_policy(
-        &self,
-        request: Request<proto::SetDestinationPolicyRequest>,
-    ) -> Result<Response<proto::DestinationPolicy>, Status> {
-        let policy = policy_from_proto(request.into_inner().policy)?;
-        let capacity = self.config.snapshot().destination_policy_capacity;
-        let policy = self
-            .backend
-            .set_policy(&policy, capacity)
-            .await
-            .map_err(Self::map_backend_error)?;
-        Ok(Response::new(policy_to_proto(policy)))
-    }
-
-    async fn delete_destination_policy(
-        &self,
-        request: Request<proto::DeleteDestinationPolicyRequest>,
-    ) -> Result<Response<proto::OperationReply>, Status> {
-        let key = policy_key_from_proto(request.into_inner().key)?;
-        let deleted = self
-            .backend
-            .delete_policy(&key)
-            .await
-            .map_err(Self::map_backend_error)?;
-        Ok(Response::new(proto::OperationReply {
-            success: true,
-            message: if deleted {
-                "policy deleted".into()
-            } else {
-                "policy was already absent".into()
-            },
-            failures: Vec::new(),
-        }))
-    }
-
-    async fn list_destination_policies(
-        &self,
-        request: Request<proto::ListDestinationPoliciesRequest>,
-    ) -> Result<Response<proto::ListDestinationPoliciesReply>, Status> {
-        let request = request.into_inner();
-        let limit = if request.limit == 0 {
-            256
-        } else {
-            request.limit as usize
-        };
-        if limit > 10_000 {
-            return Err(Status::resource_exhausted("policy page limit is too large"));
-        }
-        let offset = if request.page_token.is_empty() {
-            0
-        } else if request.page_token.len() == 8 {
-            usize::try_from(u64::from_be_bytes(
-                request.page_token.as_slice().try_into().unwrap(),
-            ))
-            .map_err(|_| Status::invalid_argument("policy page token is out of range"))?
-        } else {
-            return Err(Status::invalid_argument("invalid policy page token"));
-        };
-        let mut policies = self
-            .backend
-            .list_policies()
-            .await
-            .map_err(Self::map_backend_error)?;
-        policies.sort_by(|left, right| left.key.cmp(&right.key));
-        let mut output = Vec::new();
-        let skipped = 0;
-        for (index, policy) in policies.into_iter().enumerate().skip(offset) {
-            if output.len() >= limit {
-                return Ok(Response::new(proto::ListDestinationPoliciesReply {
-                    policies: output,
-                    next_page_token: (index as u64).to_be_bytes().to_vec(),
-                    skipped_entries: skipped,
-                }));
-            }
-            output.push(policy_to_proto(policy));
-        }
-        Ok(Response::new(proto::ListDestinationPoliciesReply {
-            policies: output,
-            next_page_token: Vec::new(),
-            skipped_entries: skipped,
-        }))
-    }
-
     async fn get_status(
         &self,
         _request: Request<proto::Empty>,
@@ -516,8 +444,9 @@ impl Control for ControlService {
             Ok(counters) => counters,
             Err(crate::bpf::BackendError::Unsupported)
             | Err(crate::bpf::BackendError::NotAttached) => crate::bpf::BpfCounters {
-                policy_misses: stats.policy_misses,
-                flow_insert_failures: stats.flow_insert_failures,
+                target_misses: 0,
+                flow_insert_failures: 0,
+                control_bypasses: 0,
             },
             Err(error) => return Err(Self::map_backend_error(error)),
         };
@@ -540,10 +469,10 @@ impl Control for ControlService {
             deleted: stats.deleted,
             errors: stats.decode_failed + stats.read_failed + stats.delete_failed + stats.anomalies,
             last_error: self.stats.last_error().unwrap_or_default(),
-            policy_misses: counters.policy_misses,
+            target_misses: counters.target_misses,
             flow_insert_failures: counters.flow_insert_failures,
+            control_bypasses: counters.control_bypasses,
             partial_cleanups: stats.partial_cleanups,
-            policy_map_max_entries: self.backend.map_maxima().policy as u32,
             flow_index_map_max_entries: self.backend.map_maxima().flow_index as u32,
             flow_state_map_max_entries: self.backend.map_maxima().flow_state as u32,
         }))
@@ -561,6 +490,11 @@ impl Control for ControlService {
         request: Request<proto::SetConfigRequest>,
     ) -> Result<Response<proto::ConfigReply>, Status> {
         let next = runtime_config_from_proto(request.into_inner().config)?;
+        if next.listener != self.config.snapshot().listener {
+            return Err(Status::failed_precondition(
+                "listener descriptor is immutable",
+            ));
+        }
         next.validate_with_maxima(self.backend.map_maxima())
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
         if let Err(error) = self.backend.set_runtime_config(&next).await {
@@ -639,6 +573,27 @@ mod tests {
         )
     }
 
+    fn proto_config() -> proto::Config {
+        proto::Config {
+            cleanup_interval_ms: 1_000,
+            idle_ttl_ms: 2_000,
+            map_scan_batch: 1,
+            log_capacity: 1,
+            active_flow_capacity: 1,
+            tcp_terminal_grace_ms: 1_000,
+            schema_version: RUNTIME_CONFIG_ABI_VERSION as u32,
+            ipv4_target_address: Vec::new(),
+            ipv4_target_port: 0,
+            ipv6_target_address: Vec::new(),
+            ipv6_target_port: 0,
+            listener_family: 4,
+            listener_address: vec![0, 0, 0, 0],
+            listener_port: 50_051,
+            listener_ipv4_wildcard: true,
+            listener_ipv6_wildcard: false,
+        }
+    }
+
     #[tokio::test]
     async fn mapping_rpc_preserves_tuple_and_not_found_is_distinct() {
         let (backend, service) = service();
@@ -701,9 +656,18 @@ mod tests {
                     idle_ttl_ms: 1,
                     map_scan_batch: 1,
                     log_capacity: 1,
-                    destination_policy_capacity: 1,
                     active_flow_capacity: 1,
                     tcp_terminal_grace_ms: 1,
+                    schema_version: RUNTIME_CONFIG_ABI_VERSION as u32,
+                    ipv4_target_address: Vec::new(),
+                    ipv4_target_port: 0,
+                    ipv6_target_address: Vec::new(),
+                    ipv6_target_port: 0,
+                    listener_family: 4,
+                    listener_address: vec![0, 0, 0, 0],
+                    listener_port: 50_051,
+                    listener_ipv4_wildcard: true,
+                    listener_ipv6_wildcard: false,
                 }),
             }))
             .await
@@ -729,21 +693,14 @@ mod tests {
     async fn config_rpc_validates_against_attached_map_maxima() {
         let (backend, service) = service();
         backend.set_map_maxima(MapMaxima {
-            policy: 1,
             flow_index: 3,
             flow_state: 1,
         });
+        let mut config = proto_config();
+        config.active_flow_capacity = 2;
         let error = service
             .set_config(Request::new(proto::SetConfigRequest {
-                config: Some(proto::Config {
-                    cleanup_interval_ms: 1_000,
-                    idle_ttl_ms: 2_000,
-                    map_scan_batch: 1,
-                    log_capacity: 1,
-                    destination_policy_capacity: 2,
-                    active_flow_capacity: 1,
-                    tcp_terminal_grace_ms: 1_000,
-                }),
+                config: Some(config),
             }))
             .await
             .unwrap_err();
@@ -751,64 +708,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn destination_policy_crud_is_idempotent_and_family_strict() {
-        let (backend, service) = service();
-        let policy = proto::DestinationPolicy {
-            key: Some(proto::DestinationPolicyKey {
-                family: 4,
-                destination_address: vec![198, 51, 100, 20],
-                protocol: 17,
-                destination_port: 443,
-            }),
-            target_address: vec![192, 0, 2, 20],
-            target_port: 8443,
-        };
-        let first = service
-            .set_destination_policy(Request::new(proto::SetDestinationPolicyRequest {
-                policy: Some(policy.clone()),
-            }))
-            .await
-            .unwrap();
-        let second = service
-            .set_destination_policy(Request::new(proto::SetDestinationPolicyRequest {
-                policy: Some(policy),
-            }))
-            .await
-            .unwrap();
-        assert_eq!(first.into_inner(), second.into_inner());
-        assert_eq!(backend.list_policies().await.unwrap().len(), 1);
-        let listed = service
-            .list_destination_policies(Request::new(proto::ListDestinationPoliciesRequest {
-                limit: 10,
-                page_token: Vec::new(),
+    async fn global_targets_round_trip_and_listener_is_immutable() {
+        let (_, service) = service();
+        let mut config = proto_config();
+        config.ipv4_target_address = vec![192, 0, 2, 20];
+        config.ipv4_target_port = 8_443;
+        let response = service
+            .set_config(Request::new(proto::SetConfigRequest {
+                config: Some(config),
             }))
             .await
             .unwrap()
             .into_inner();
-        assert_eq!(listed.policies.len(), 1);
-        let deleted = service
-            .delete_destination_policy(Request::new(proto::DeleteDestinationPolicyRequest {
-                key: listed.policies[0].key.clone(),
-            }))
-            .await
-            .unwrap()
-            .into_inner();
-        assert!(deleted.success);
-        let invalid = service
-            .set_destination_policy(Request::new(proto::SetDestinationPolicyRequest {
-                policy: Some(proto::DestinationPolicy {
-                    key: Some(proto::DestinationPolicyKey {
-                        family: 4,
-                        destination_address: vec![198, 51, 100, 20],
-                        protocol: 17,
-                        destination_port: 443,
-                    }),
-                    target_address: vec![0; 16],
-                    target_port: 1,
-                }),
+        assert_eq!(response.config.unwrap().ipv4_target_port, 8_443);
+
+        let mut changed = proto_config();
+        changed.listener_address = vec![127, 0, 0, 1];
+        changed.listener_ipv4_wildcard = false;
+        let error = service
+            .set_config(Request::new(proto::SetConfigRequest {
+                config: Some(changed),
             }))
             .await
             .unwrap_err();
-        assert_eq!(invalid.code(), tonic::Code::InvalidArgument);
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
     }
 }

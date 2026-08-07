@@ -66,14 +66,12 @@ static __s64 (*bpf_csum_diff)(__be32 *from, __u32 from_size, __be32 *to,
     (void *)BPF_FUNC_csum_diff;
 
 #define MAP_ABI_VERSION 1
-#define POLICY_KEY_LEN 24
-#define POLICY_VALUE_LEN 24
 #define FLOW_INDEX_VALUE_LEN 16
 #define FLOW_STATE_KEY_LEN 16
 #define FLOW_STATE_VALUE_LEN 256
-#define POLICY_MAX_ENTRIES 4096
 #define FLOW_INDEX_MAX_ENTRIES 16384
 #define FLOW_STATE_MAX_ENTRIES 8192
+#define RUNTIME_CONFIG_ABI_VERSION 3
 
 #define FLOW_CREATING 1
 #define FLOW_ACTIVE 2
@@ -86,24 +84,6 @@ static __s64 (*bpf_csum_diff)(__be32 *from, __u32 from_size, __be32 *to,
 #define TCP_FLAG_SYN 0x02
 #define TCP_FLAG_RST 0x04
 #define TCP_FLAG_ACK 0x10
-
-struct policy_key {
-    __be16 version;
-    __u8 family;
-    __u8 protocol;
-    __u8 destination[16];
-    __be16 destination_port;
-    __u16 reserved;
-} __attribute__((packed));
-
-struct policy_value {
-    __be16 version;
-    __u8 family;
-    __u8 reserved;
-    __u8 target[16];
-    __be16 target_port;
-    __u16 reserved2;
-} __attribute__((packed));
 
 struct tuple_key {
     __be16 version;
@@ -151,11 +131,22 @@ struct counter_value {
 };
 
 struct runtime_config_value {
+    __be16 schema_version;
+    __u8 v4_target_set;
+    __u8 v6_target_set;
+    __u8 v4_target[4];
+    __be16 v4_target_port;
+    __u8 v6_target[16];
+    __be16 v6_target_port;
+    __u8 listener_family;
+    __u8 listener_wildcard_flags;
+    __u8 listener_address[16];
+    __be16 listener_port;
     __u64 idle_ttl_ns;
     __u64 terminal_grace_ns;
-    __u32 policy_capacity;
-    __u32 flow_capacity;
-};
+    __u32 active_flow_capacity;
+    __u8 padding[12];
+} __attribute__((packed));
 
 struct packet_info {
     __u32 l3_offset;
@@ -169,13 +160,6 @@ struct packet_info {
     __be16 source_port;
     __be16 destination_port;
 };
-
-struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, POLICY_MAX_ENTRIES);
-    __type(key, struct policy_key);
-    __type(value, struct policy_value);
-} ssp_destination_policy_map_v1 SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
@@ -193,7 +177,7 @@ struct {
 
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(max_entries, 8);
+    __uint(max_entries, 3);
     __type(key, __u32);
     __type(value, struct counter_value);
 } ssp_tc_counters_v1 SEC(".maps");
@@ -203,7 +187,7 @@ struct {
     __uint(max_entries, 1);
     __type(key, __u32);
     __type(value, struct runtime_config_value);
-} ssp_runtime_config_v1 SEC(".maps");
+} ssp_runtime_config_v3 SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
@@ -255,8 +239,16 @@ static __always_inline void ipv4_to_mapped(__u8 *to, const __u8 *from)
 static __always_inline void increment_counter(__u32 index)
 {
     struct counter_value *counter = bpf_map_lookup_elem(&ssp_tc_counters_v1, &index);
-    if (counter)
-        __sync_fetch_and_add(&counter->value, 1);
+    __u64 current;
+
+    if (!counter)
+        return;
+    for (;;) {
+        current = __sync_fetch_and_add(&counter->value, 0);
+        if (current == ~0ULL ||
+            __sync_bool_compare_and_swap(&counter->value, current, current + 1))
+            return;
+    }
 }
 
 static __always_inline int reserve_flow_slot(void)
@@ -264,13 +256,14 @@ static __always_inline int reserve_flow_slot(void)
     __u32 config_key = 0;
     __u64 *count = bpf_map_lookup_elem(&ssp_tc_active_flows_v1, &config_key);
     struct runtime_config_value *config =
-        bpf_map_lookup_elem(&ssp_runtime_config_v1, &config_key);
+        bpf_map_lookup_elem(&ssp_runtime_config_v3, &config_key);
     __u64 previous;
 
     if (!count)
         return 0;
     previous = __sync_fetch_and_add(count, 1);
-    if (config && config->flow_capacity && previous >= config->flow_capacity) {
+    if (config && config->active_flow_capacity &&
+        previous >= config->active_flow_capacity) {
         __sync_fetch_and_sub(count, 1);
         return 0;
     }
@@ -391,17 +384,6 @@ static __always_inline void make_tuple_key(struct tuple_key *key,
     key->destination_port = destination_port;
 }
 
-static __always_inline void make_policy_key(struct policy_key *key,
-                                            const struct packet_info *packet)
-{
-    key->version = bpf_htons(MAP_ABI_VERSION);
-    key->family = packet->family;
-    key->protocol = packet->protocol;
-    copy16(key->destination, packet->destination);
-    key->destination_port = packet->destination_port;
-    key->reserved = 0;
-}
-
 static __always_inline __u64 tuple_hash(const struct tuple_key *key)
 {
     const __u8 *bytes = (const __u8 *)key;
@@ -479,6 +461,81 @@ static __always_inline int rewrite_source(struct __sk_buff *skb,
     return 0;
 }
 
+static __always_inline int target_for_packet(const struct packet_info *packet,
+                                             __u8 *target,
+                                             __be16 *target_port)
+{
+    __u32 config_key = 0;
+    __u32 i;
+    __u8 nonzero;
+    struct runtime_config_value *config =
+        bpf_map_lookup_elem(&ssp_runtime_config_v3, &config_key);
+
+    if (!config ||
+        bpf_ntohs(config->schema_version) != RUNTIME_CONFIG_ABI_VERSION)
+        return 0;
+    if (packet->family == 4) {
+        if (config->v4_target_set != 1 ||
+            bpf_ntohs(config->v4_target_port) == 0)
+            return 0;
+        nonzero = 0;
+        for (i = 0; i < 4; i++)
+            nonzero |= config->v4_target[i];
+        if (!nonzero)
+            return 0;
+        clear16(target);
+        ipv4_to_mapped(target, config->v4_target);
+        *target_port = config->v4_target_port;
+        return 1;
+    }
+    if (config->v6_target_set != 1 ||
+        bpf_ntohs(config->v6_target_port) == 0)
+        return 0;
+    nonzero = 0;
+    for (i = 0; i < 16; i++)
+        nonzero |= config->v6_target[i];
+    if (!nonzero)
+        return 0;
+    copy16(target, config->v6_target);
+    *target_port = config->v6_target_port;
+    return 1;
+}
+
+static __always_inline int is_control_packet(const struct packet_info *packet,
+                                             bool ingress)
+{
+    __u32 config_key = 0;
+    struct runtime_config_value *config =
+        bpf_map_lookup_elem(&ssp_runtime_config_v3, &config_key);
+    const __u8 *endpoint = ingress ? packet->destination : packet->source;
+    __be16 port = ingress ? packet->destination_port : packet->source_port;
+    __u32 i;
+
+    if (!config ||
+        bpf_ntohs(config->schema_version) != RUNTIME_CONFIG_ABI_VERSION ||
+        packet->protocol != IPPROTO_TCP ||
+        port != config->listener_port)
+        return 0;
+    if (packet->family == 4) {
+        if (config->listener_family != 4)
+            return 0;
+        if (config->listener_wildcard_flags & 1)
+            return 1;
+        for (i = 0; i < 4; i++)
+            if (endpoint[12 + i] != config->listener_address[12 + i])
+                return 0;
+        return 1;
+    }
+    if (config->listener_family != 6)
+        return 0;
+    if (config->listener_wildcard_flags & 2)
+        return 1;
+    for (i = 0; i < 16; i++)
+        if (endpoint[i] != config->listener_address[i])
+            return 0;
+    return 1;
+}
+
 static __always_inline void update_tcp_state(struct flow_state_value *state,
                                              __u8 direction,
                                              __u8 flags,
@@ -486,7 +543,7 @@ static __always_inline void update_tcp_state(struct flow_state_value *state,
 {
     __u32 config_key = 0;
     struct runtime_config_value *config =
-        bpf_map_lookup_elem(&ssp_runtime_config_v1, &config_key);
+        bpf_map_lookup_elem(&ssp_runtime_config_v3, &config_key);
     __u64 grace = config && config->terminal_grace_ns
                       ? config->terminal_grace_ns
                       : 30ULL * 1000ULL * 1000ULL * 1000ULL;
@@ -543,18 +600,21 @@ static __always_inline int process_packet(struct __sk_buff *skb, bool ingress)
     struct flow_index_value *index;
     struct flow_state_key state_key = {};
     struct flow_state_value *state;
-    struct policy_key policy_key = {};
-    struct policy_value *policy;
     struct flow_state_value *candidate;
     struct flow_index_value candidate_index = {};
     __u64 now;
     __u64 flow_id;
     __be16 target_port;
+    __u8 target[16];
     __u8 direction;
     __u32 scratch_key = 0;
 
     if (!parse_packet(skb, &packet))
         return TC_ACT_OK;
+    if (is_control_packet(&packet, ingress)) {
+        increment_counter(2);
+        return TC_ACT_OK;
+    }
 
     if (ingress) {
         make_tuple_key(&lookup_key, &packet, packet.source, packet.destination,
@@ -565,9 +625,7 @@ static __always_inline int process_packet(struct __sk_buff *skb, bool ingress)
     }
     index = bpf_map_lookup_elem(&ssp_flow_index_v1, &lookup_key);
     if (!index && ingress) {
-        make_policy_key(&policy_key, &packet);
-        policy = bpf_map_lookup_elem(&ssp_destination_policy_map_v1, &policy_key);
-        if (!policy) {
+        if (!target_for_packet(&packet, target, &target_port)) {
             increment_counter(0);
             return TC_ACT_OK;
         }
@@ -587,11 +645,11 @@ static __always_inline int process_packet(struct __sk_buff *skb, bool ingress)
         candidate->original = lookup_key;
         candidate->target = lookup_key;
         candidate->reverse = lookup_key;
-        copy16(candidate->target.destination, policy->target);
-        candidate->target.destination_port = policy->target_port;
-        copy16(candidate->reverse.source, policy->target);
+        copy16(candidate->target.destination, target);
+        candidate->target.destination_port = target_port;
+        copy16(candidate->reverse.source, target);
         copy16(candidate->reverse.destination, packet.source);
-        candidate->reverse.source_port = policy->target_port;
+        candidate->reverse.source_port = target_port;
         candidate->reverse.destination_port = packet.source_port;
         candidate->flow_id = flow_id;
         candidate->generation = 1;
@@ -673,13 +731,13 @@ static __always_inline int process_packet(struct __sk_buff *skb, bool ingress)
 }
 
 SEC("classifier")
-int ssp_tc_ingress_v2(struct __sk_buff *skb)
+int ssp_tc_ingress_v3(struct __sk_buff *skb)
 {
     return process_packet(skb, true);
 }
 
 SEC("classifier")
-int ssp_tc_egress_v2(struct __sk_buff *skb)
+int ssp_tc_egress_v3(struct __sk_buff *skb)
 {
     return process_packet(skb, false);
 }

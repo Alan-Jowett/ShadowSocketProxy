@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 ShadowSocketProxy contributors
 
-use std::sync::Arc;
+use std::{net::SocketAddr, sync::Arc};
 
 use thiserror::Error;
 use tokio::sync::watch;
@@ -43,7 +43,18 @@ pub struct ServiceRuntime<B: BpfBackend + 'static> {
 
 impl<B: BpfBackend + 'static> ServiceRuntime<B> {
     pub fn new(backend: B) -> Self {
-        let config = Arc::new(ConfigStore::new(RuntimeConfig::default()).expect("default config"));
+        Self::new_with_listener(
+            backend,
+            "0.0.0.0:50051"
+                .parse()
+                .expect("valid default listener address"),
+        )
+    }
+
+    pub fn new_with_listener(backend: B, listener: SocketAddr) -> Self {
+        let mut initial = RuntimeConfig::default();
+        initial.listener = crate::config::ListenerDescriptor::from_socket_addr(listener);
+        let config = Arc::new(ConfigStore::new(initial).expect("valid listener configuration"));
         let logs = Arc::new(LogRing::new(config.snapshot().log_capacity));
         let stats = Arc::new(MaintenanceStats::default());
         let backend = Arc::new(backend);
@@ -88,7 +99,8 @@ impl<B: BpfBackend + 'static> ServiceRuntime<B> {
         ));
     }
 
-    pub async fn serve(&self, address: std::net::SocketAddr) -> Result<(), RuntimeError> {
+    pub async fn serve(&self) -> Result<(), RuntimeError> {
+        let address = self.config.snapshot().listener.socket_addr();
         #[cfg(not(target_os = "linux"))]
         {
             let _ = address;

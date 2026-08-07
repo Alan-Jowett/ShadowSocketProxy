@@ -13,13 +13,11 @@ use thiserror::Error;
 use crate::config::RuntimeConfig;
 #[cfg(target_os = "linux")]
 use crate::mapping::{
-    decode_flow_state, decode_policy_key, decode_policy_value, encode_flow_state_key,
-    encode_policy_key, encode_policy_value, FLOW_INDEX_VALUE_LEN, FLOW_STATE_KEY_LEN,
-    FLOW_STATE_VALUE_LEN, POLICY_KEY_LEN, POLICY_VALUE_LEN, RUNTIME_CONFIG_VALUE_LEN,
+    decode_flow_state, encode_flow_state_key, FLOW_INDEX_VALUE_LEN, FLOW_STATE_KEY_LEN,
+    FLOW_STATE_VALUE_LEN, RUNTIME_CONFIG_VALUE_LEN,
 };
 use crate::mapping::{
-    encode_key, encode_value, DestinationPolicy, FlowIndexValue, FlowState, MapMaxima, Mapping,
-    PolicyKey, ABI_VERSION,
+    encode_key, encode_value, FlowIndexValue, FlowState, MapMaxima, Mapping, ABI_VERSION,
 };
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -36,8 +34,6 @@ pub enum BackendError {
     NotAttached,
     #[error("ABI version {0} is not supported")]
     AbiMismatch(u16),
-    #[error("policy capacity is exhausted")]
-    PolicyCapacity,
     #[error("active-flow capacity is exhausted")]
     FlowCapacity,
     #[error("partial flow cleanup: {0}")]
@@ -72,8 +68,9 @@ pub struct FlowCleanupReport {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct BpfCounters {
-    pub policy_misses: u64,
+    pub target_misses: u64,
     pub flow_insert_failures: u64,
+    pub control_bypasses: u64,
 }
 
 #[async_trait]
@@ -96,25 +93,6 @@ pub trait BpfBackend: Send + Sync {
     async fn list_entries(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, BackendError>;
     async fn get_entry(&self, key: &[u8]) -> Result<Option<Vec<u8>>, BackendError>;
     async fn delete_entry(&self, key: &[u8]) -> Result<bool, BackendError>;
-    async fn list_policies(&self) -> Result<Vec<DestinationPolicy>, BackendError> {
-        Err(BackendError::Unsupported)
-    }
-    async fn get_policy(
-        &self,
-        _key: &PolicyKey,
-    ) -> Result<Option<DestinationPolicy>, BackendError> {
-        Err(BackendError::Unsupported)
-    }
-    async fn set_policy(
-        &self,
-        _policy: &DestinationPolicy,
-        _capacity: usize,
-    ) -> Result<DestinationPolicy, BackendError> {
-        Err(BackendError::Unsupported)
-    }
-    async fn delete_policy(&self, _key: &PolicyKey) -> Result<bool, BackendError> {
-        Err(BackendError::Unsupported)
-    }
     async fn list_flow_states(&self) -> Result<Vec<FlowState>, BackendError> {
         Err(BackendError::Unsupported)
     }
@@ -140,7 +118,6 @@ pub trait BpfBackend: Send + Sync {
 #[derive(Default)]
 struct MemoryState {
     entries: BTreeMap<Vec<u8>, Vec<u8>>,
-    policies: BTreeMap<PolicyKey, DestinationPolicy>,
     flow_states: BTreeMap<(u64, u32), FlowState>,
     flow_indexes: BTreeMap<Vec<u8>, FlowIndexValue>,
     flow_mode: bool,
@@ -179,14 +156,6 @@ impl InMemoryBackend {
 
     pub fn set_map_maxima(&self, maxima: MapMaxima) {
         self.state.lock().unwrap().maxima = maxima;
-    }
-
-    pub fn insert_policy(&self, policy: DestinationPolicy) {
-        self.state
-            .lock()
-            .unwrap()
-            .policies
-            .insert(policy.key.clone(), policy);
     }
 
     pub fn insert_flow_state(&self, state: FlowState) {
@@ -353,42 +322,6 @@ impl BpfBackend for InMemoryBackend {
             .is_some())
     }
 
-    async fn list_policies(&self) -> Result<Vec<DestinationPolicy>, BackendError> {
-        Ok(self
-            .state
-            .lock()
-            .unwrap()
-            .policies
-            .values()
-            .cloned()
-            .collect())
-    }
-
-    async fn get_policy(&self, key: &PolicyKey) -> Result<Option<DestinationPolicy>, BackendError> {
-        Ok(self.state.lock().unwrap().policies.get(key).cloned())
-    }
-
-    async fn set_policy(
-        &self,
-        policy: &DestinationPolicy,
-        capacity: usize,
-    ) -> Result<DestinationPolicy, BackendError> {
-        policy.validate().map_err(|error| BackendError::Operation {
-            location: "policy:validate".into(),
-            message: error.to_string(),
-        })?;
-        let mut state = self.state.lock().unwrap();
-        if !state.policies.contains_key(&policy.key) && state.policies.len() >= capacity {
-            return Err(BackendError::PolicyCapacity);
-        }
-        state.policies.insert(policy.key.clone(), policy.clone());
-        Ok(policy.clone())
-    }
-
-    async fn delete_policy(&self, key: &PolicyKey) -> Result<bool, BackendError> {
-        Ok(self.state.lock().unwrap().policies.remove(key).is_some())
-    }
-
     async fn list_flow_states(&self) -> Result<Vec<FlowState>, BackendError> {
         let state = self.state.lock().unwrap();
         if !state.flow_mode {
@@ -440,24 +373,6 @@ pub trait LinuxTcAdapter: Send + Sync {
     async fn list_entries(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, BackendError>;
     async fn get_entry(&self, key: &[u8]) -> Result<Option<Vec<u8>>, BackendError>;
     async fn delete_entry(&self, key: &[u8]) -> Result<bool, BackendError>;
-    async fn list_policies(&self) -> Result<Vec<DestinationPolicy>, BackendError> {
-        Err(BackendError::Unsupported)
-    }
-    async fn get_policy(
-        &self,
-        _key: &PolicyKey,
-    ) -> Result<Option<DestinationPolicy>, BackendError> {
-        Err(BackendError::Unsupported)
-    }
-    async fn set_policy(
-        &self,
-        _policy: &DestinationPolicy,
-    ) -> Result<DestinationPolicy, BackendError> {
-        Err(BackendError::Unsupported)
-    }
-    async fn delete_policy(&self, _key: &PolicyKey) -> Result<bool, BackendError> {
-        Err(BackendError::Unsupported)
-    }
     async fn list_flow_states(&self) -> Result<Vec<FlowState>, BackendError> {
         Err(BackendError::Unsupported)
     }
@@ -503,15 +418,15 @@ impl LinuxTcAdapter for UnsupportedLinuxTcAdapter {
     }
 }
 
-pub const POLICY_MAP_NAME_V1: &str = "ssp_destination_policy_map_v1";
 pub const FLOW_INDEX_MAP_NAME_V1: &str = "ssp_flow_index_v1";
 pub const FLOW_STATE_MAP_NAME_V1: &str = "ssp_flow_state_v1";
-pub const RUNTIME_CONFIG_MAP_NAME_V1: &str = "ssp_runtime_config_v1";
-pub const INGRESS_PROGRAM_NAME_V2: &str = "ssp_tc_ingress_v2";
-pub const EGRESS_PROGRAM_NAME_V2: &str = "ssp_tc_egress_v2";
+pub const RUNTIME_CONFIG_MAP_NAME_V3: &str = "ssp_runtime_config_v3";
+pub const COUNTERS_MAP_NAME_V1: &str = "ssp_tc_counters_v1";
+pub const INGRESS_PROGRAM_NAME_V3: &str = "ssp_tc_ingress_v3";
+pub const EGRESS_PROGRAM_NAME_V3: &str = "ssp_tc_egress_v3";
 pub const MAP_NAME_V1: &str = FLOW_INDEX_MAP_NAME_V1;
-pub const INGRESS_PROGRAM_NAME_V1: &str = INGRESS_PROGRAM_NAME_V2;
-pub const EGRESS_PROGRAM_NAME_V1: &str = EGRESS_PROGRAM_NAME_V2;
+pub const INGRESS_PROGRAM_NAME_V1: &str = INGRESS_PROGRAM_NAME_V3;
+pub const EGRESS_PROGRAM_NAME_V1: &str = EGRESS_PROGRAM_NAME_V3;
 
 #[cfg(target_os = "linux")]
 struct AyaLink {
@@ -588,23 +503,6 @@ impl AyaLinuxTcAdapter {
         operation(&mut map)
     }
 
-    fn with_policy_map<T>(
-        bpf: &mut aya::Ebpf,
-        operation: impl FnOnce(
-            &mut aya::maps::HashMap<
-                &mut aya::maps::MapData,
-                [u8; POLICY_KEY_LEN],
-                [u8; POLICY_VALUE_LEN],
-            >,
-        ) -> Result<T, BackendError>,
-    ) -> Result<T, BackendError> {
-        let map = bpf
-            .map_mut(POLICY_MAP_NAME_V1)
-            .ok_or_else(|| Self::operation("map", "versioned policy map is missing"))?;
-        let mut map = aya::maps::HashMap::try_from(map).map_err(Self::map_error)?;
-        operation(&mut map)
-    }
-
     fn with_state_map<T>(
         bpf: &mut aya::Ebpf,
         operation: impl FnOnce(
@@ -629,7 +527,7 @@ impl AyaLinuxTcAdapter {
         ) -> Result<T, BackendError>,
     ) -> Result<T, BackendError> {
         let map = bpf
-            .map_mut(RUNTIME_CONFIG_MAP_NAME_V1)
+            .map_mut(RUNTIME_CONFIG_MAP_NAME_V3)
             .ok_or_else(|| Self::operation("map", "versioned runtime config map is missing"))?;
         let mut map = aya::maps::Array::try_from(map).map_err(Self::map_error)?;
         operation(&mut map)
@@ -642,7 +540,7 @@ impl AyaLinuxTcAdapter {
         ) -> Result<T, BackendError>,
     ) -> Result<T, BackendError> {
         let map = bpf
-            .map_mut("ssp_tc_counters_v1")
+            .map_mut(COUNTERS_MAP_NAME_V1)
             .ok_or_else(|| Self::operation("map", "BPF counters map is missing"))?;
         let mut map = aya::maps::Array::try_from(map).map_err(Self::map_error)?;
         operation(&mut map)
@@ -672,9 +570,18 @@ impl LinuxTcAdapter for AyaLinuxTcAdapter {
 
         let mut bpf = aya::Ebpf::load_file(elf)
             .map_err(|error| Self::operation("load", format!("ELF load failed: {error}")))?;
+        if bpf.program_mut("ssp_tc_ingress_v2").is_some()
+            || bpf.program_mut("ssp_tc_egress_v2").is_some()
+            || bpf.map_mut("ssp_destination_policy_map_v1").is_some()
+            || bpf.map_mut("ssp_runtime_config_v1").is_some()
+        {
+            return Err(Self::operation(
+                "load",
+                "stale v2 or destination-policy ABI artifact is present",
+            ));
+        }
         let mut maxima = MapMaxima::default();
         for (name, slot) in [
-            (POLICY_MAP_NAME_V1, &mut maxima.policy),
             (FLOW_INDEX_MAP_NAME_V1, &mut maxima.flow_index),
             (FLOW_STATE_MAP_NAME_V1, &mut maxima.flow_state),
         ] {
@@ -683,17 +590,27 @@ impl LinuxTcAdapter for AyaLinuxTcAdapter {
                 .ok_or_else(|| Self::operation("map", format!("required map {name} is missing")))?;
             *slot = Self::map_max_entries(map)?;
         }
-        if bpf.map_mut(RUNTIME_CONFIG_MAP_NAME_V1).is_none() {
+        if bpf.map_mut(RUNTIME_CONFIG_MAP_NAME_V3).is_none() {
             return Err(Self::operation(
                 "map",
-                format!("required map {RUNTIME_CONFIG_MAP_NAME_V1} is missing"),
+                format!("required map {RUNTIME_CONFIG_MAP_NAME_V3} is missing"),
+            ));
+        }
+        let counters = bpf
+            .map_mut(COUNTERS_MAP_NAME_V1)
+            .ok_or_else(|| Self::operation("map", "BPF counters map is missing"))?;
+        if Self::map_max_entries(counters)? < 3 {
+            return Err(Self::operation(
+                "map",
+                "BPF counters map does not expose all v3 counter slots",
             ));
         }
         Self::with_flow_index_map(&mut bpf, |_| Ok(()))?;
-        Self::with_policy_map(&mut bpf, |_| Ok(()))?;
         Self::with_state_map(&mut bpf, |_| Ok(()))?;
+        Self::with_runtime_map(&mut bpf, |_| Ok(()))?;
+        Self::with_counters_map(&mut bpf, |_| Ok(()))?;
 
-        for program_name in [INGRESS_PROGRAM_NAME_V2, EGRESS_PROGRAM_NAME_V2] {
+        for program_name in [INGRESS_PROGRAM_NAME_V3, EGRESS_PROGRAM_NAME_V3] {
             let program = bpf.program_mut(program_name).ok_or_else(|| {
                 Self::operation(
                     format!("program:{program_name}"),
@@ -740,10 +657,10 @@ impl LinuxTcAdapter for AyaLinuxTcAdapter {
 
         let (program_name, attach_type) = match direction {
             Direction::Ingress => (
-                INGRESS_PROGRAM_NAME_V2,
+                INGRESS_PROGRAM_NAME_V3,
                 aya::programs::TcAttachType::Ingress,
             ),
-            Direction::Egress => (EGRESS_PROGRAM_NAME_V2, aya::programs::TcAttachType::Egress),
+            Direction::Egress => (EGRESS_PROGRAM_NAME_V3, aya::programs::TcAttachType::Egress),
         };
         let link_id = {
             let program = state.bpf.program_mut(program_name).ok_or_else(|| {
@@ -785,8 +702,8 @@ impl LinuxTcAdapter for AyaLinuxTcAdapter {
         let link_id = tracked.id;
         let attachment = tracked.attachment;
         let program_name = match direction {
-            Direction::Ingress => INGRESS_PROGRAM_NAME_V2,
-            Direction::Egress => EGRESS_PROGRAM_NAME_V2,
+            Direction::Ingress => INGRESS_PROGRAM_NAME_V3,
+            Direction::Egress => EGRESS_PROGRAM_NAME_V3,
         };
         let result = {
             let program = state.bpf.program_mut(program_name).ok_or_else(|| {
@@ -911,82 +828,6 @@ impl LinuxTcAdapter for AyaLinuxTcAdapter {
         Ok(report.state_deleted || report.indexes_deleted != 0)
     }
 
-    async fn list_policies(&self) -> Result<Vec<DestinationPolicy>, BackendError> {
-        let mut state = self.state.lock().unwrap();
-        let state = state.as_mut().ok_or(BackendError::NotAttached)?;
-        Self::with_policy_map(&mut state.bpf, |map| {
-            map.iter()
-                .map(|entry| {
-                    let (key, value) = entry.map_err(Self::map_error)?;
-                    let key = decode_policy_key(&key)
-                        .map_err(|error| Self::operation("policy:key", error))?;
-                    decode_policy_value(&key, &value)
-                        .map_err(|error| Self::operation("policy:value", error))
-                })
-                .collect()
-        })
-    }
-
-    async fn get_policy(&self, key: &PolicyKey) -> Result<Option<DestinationPolicy>, BackendError> {
-        let encoded = encode_policy_key(key);
-        let mut state = self.state.lock().unwrap();
-        let state = state.as_mut().ok_or(BackendError::NotAttached)?;
-        let value = Self::with_policy_map(&mut state.bpf, |map| {
-            map.get(&encoded, 0)
-                .map(|value| Some(value))
-                .or_else(|error| match error {
-                    aya::maps::MapError::KeyNotFound | aya::maps::MapError::ElementNotFound => {
-                        Ok(None)
-                    }
-                    error => Err(Self::map_error(error)),
-                })
-        })?;
-        value
-            .map(|value| {
-                decode_policy_value(key, &value)
-                    .map_err(|error| Self::operation("policy:value", error))
-            })
-            .transpose()
-    }
-
-    async fn set_policy(
-        &self,
-        policy: &DestinationPolicy,
-    ) -> Result<DestinationPolicy, BackendError> {
-        policy
-            .validate()
-            .map_err(|error| Self::operation("policy:validate", error))?;
-        let key = encode_policy_key(&policy.key);
-        let value = encode_policy_value(policy);
-        let mut state = self.state.lock().unwrap();
-        let state = state.as_mut().ok_or(BackendError::NotAttached)?;
-        Self::with_policy_map(&mut state.bpf, |map| {
-            map.insert(&key, &value, 0).map_err(Self::map_error)
-        })?;
-        Ok(policy.clone())
-    }
-
-    async fn delete_policy(&self, key: &PolicyKey) -> Result<bool, BackendError> {
-        let encoded = encode_policy_key(key);
-        let mut state = self.state.lock().unwrap();
-        let state = state.as_mut().ok_or(BackendError::NotAttached)?;
-        Self::with_policy_map(&mut state.bpf, |map| {
-            let existed = map
-                .get(&encoded, 0)
-                .map(|_| true)
-                .or_else(|error| match error {
-                    aya::maps::MapError::KeyNotFound | aya::maps::MapError::ElementNotFound => {
-                        Ok(false)
-                    }
-                    error => Err(Self::map_error(error)),
-                })?;
-            if existed {
-                map.remove(&encoded).map_err(Self::map_error)?;
-            }
-            Ok(existed)
-        })
-    }
-
     async fn list_flow_states(&self) -> Result<Vec<FlowState>, BackendError> {
         let mut state = self.state.lock().unwrap();
         let state = state.as_mut().ok_or(BackendError::NotAttached)?;
@@ -1092,14 +933,44 @@ impl LinuxTcAdapter for AyaLinuxTcAdapter {
 
     async fn set_runtime_config(&self, config: &RuntimeConfig) -> Result<(), BackendError> {
         let mut value = [0_u8; RUNTIME_CONFIG_VALUE_LEN];
-        value[0..8].copy_from_slice(
+        value[0..2].copy_from_slice(&config.schema_version.to_be_bytes());
+        if let Some(target) = config.ipv4_target {
+            if let std::net::IpAddr::V4(address) = target.ip() {
+                value[2] = 1;
+                value[4..8].copy_from_slice(&address.octets());
+                value[8..10].copy_from_slice(&target.port().to_be_bytes());
+            }
+        }
+        if let Some(target) = config.ipv6_target {
+            if let std::net::IpAddr::V6(address) = target.ip() {
+                value[3] = 1;
+                value[10..26].copy_from_slice(&address.octets());
+                value[26..28].copy_from_slice(&target.port().to_be_bytes());
+            }
+        }
+        value[28] = if config.listener.address.is_ipv4() {
+            4
+        } else {
+            6
+        };
+        value[29] =
+            (config.listener.ipv4_wildcard as u8) | ((config.listener.ipv6_wildcard as u8) << 1);
+        match config.listener.address {
+            std::net::IpAddr::V4(address) => {
+                value[42..46].copy_from_slice(&address.octets());
+            }
+            std::net::IpAddr::V6(address) => {
+                value[30..46].copy_from_slice(&address.octets());
+            }
+        }
+        value[46..48].copy_from_slice(&config.listener.port.to_be_bytes());
+        value[48..56].copy_from_slice(
             &(config.idle_ttl.as_nanos().min(u64::MAX as u128) as u64).to_le_bytes(),
         );
-        value[8..16].copy_from_slice(
+        value[56..64].copy_from_slice(
             &(config.tcp_terminal_grace.as_nanos().min(u64::MAX as u128) as u64).to_le_bytes(),
         );
-        value[16..20].copy_from_slice(&(config.destination_policy_capacity as u32).to_le_bytes());
-        value[20..24].copy_from_slice(&(config.active_flow_capacity as u32).to_le_bytes());
+        value[64..68].copy_from_slice(&(config.active_flow_capacity as u32).to_le_bytes());
         let mut state = self.state.lock().unwrap();
         let state = state.as_mut().ok_or(BackendError::NotAttached)?;
         Self::with_runtime_map(&mut state.bpf, |map| {
@@ -1111,11 +982,13 @@ impl LinuxTcAdapter for AyaLinuxTcAdapter {
         let mut state = self.state.lock().unwrap();
         let state = state.as_mut().ok_or(BackendError::NotAttached)?;
         Self::with_counters_map(&mut state.bpf, |map| {
-            let policy_misses = map.get(&0, 0).map_err(Self::map_error)?;
+            let target_misses = map.get(&0, 0).map_err(Self::map_error)?;
             let flow_insert_failures = map.get(&1, 0).map_err(Self::map_error)?;
+            let control_bypasses = map.get(&2, 0).map_err(Self::map_error)?;
             Ok(BpfCounters {
-                policy_misses: u64::from_le_bytes(policy_misses),
+                target_misses: u64::from_le_bytes(target_misses),
                 flow_insert_failures: u64::from_le_bytes(flow_insert_failures),
+                control_bypasses: u64::from_le_bytes(control_bypasses),
             })
         })
     }
@@ -1314,33 +1187,6 @@ impl BpfBackend for LinuxBpfBackend {
         self.adapter.delete_entry(key).await
     }
 
-    async fn list_policies(&self) -> Result<Vec<DestinationPolicy>, BackendError> {
-        self.adapter.list_policies().await
-    }
-
-    async fn get_policy(&self, key: &PolicyKey) -> Result<Option<DestinationPolicy>, BackendError> {
-        self.adapter.get_policy(key).await
-    }
-
-    async fn set_policy(
-        &self,
-        policy: &DestinationPolicy,
-        capacity: usize,
-    ) -> Result<DestinationPolicy, BackendError> {
-        let _operation_guard = self.operation_lock.lock().await;
-        if self.list_policies().await?.len() >= capacity
-            && self.get_policy(&policy.key).await?.is_none()
-        {
-            return Err(BackendError::PolicyCapacity);
-        }
-        self.adapter.set_policy(policy).await
-    }
-
-    async fn delete_policy(&self, key: &PolicyKey) -> Result<bool, BackendError> {
-        let _operation_guard = self.operation_lock.lock().await;
-        self.adapter.delete_policy(key).await
-    }
-
     async fn list_flow_states(&self) -> Result<Vec<FlowState>, BackendError> {
         self.adapter.list_flow_states().await
     }
@@ -1371,8 +1217,8 @@ impl BpfBackend for LinuxBpfBackend {
 mod tests {
     use super::*;
     use crate::mapping::{
-        DestinationPolicy, FlowLifecycle, FlowState, Mapping, PolicyKey, Tuple, PROTOCOL_FLAG_TCP,
-        PROTOCOL_FLAG_UDP, PROTOCOL_TCP, PROTOCOL_UDP,
+        FlowLifecycle, FlowState, Mapping, Tuple, PROTOCOL_FLAG_TCP, PROTOCOL_FLAG_UDP,
+        PROTOCOL_TCP, PROTOCOL_UDP,
     };
     #[cfg(target_os = "linux")]
     use std::env;
@@ -1416,35 +1262,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn policy_capacity_and_flow_cleanup_are_atomic() {
+    async fn flow_cleanup_removes_all_indexes() {
         let backend = InMemoryBackend::default();
-        let policy = DestinationPolicy::new(
-            "198.51.100.10".parse().unwrap(),
-            PROTOCOL_UDP,
-            443,
-            "192.0.2.10".parse().unwrap(),
-            8443,
-        );
-        backend
-            .set_policy(&policy, 1)
-            .await
-            .expect("first policy fits");
-        assert!(matches!(
-            backend
-                .set_policy(
-                    &DestinationPolicy::new(
-                        "198.51.100.11".parse().unwrap(),
-                        PROTOCOL_UDP,
-                        443,
-                        "192.0.2.11".parse().unwrap(),
-                        8443,
-                    ),
-                    1,
-                )
-                .await,
-            Err(BackendError::PolicyCapacity)
-        ));
-
         let original = Tuple {
             source: "192.0.2.1".parse().unwrap(),
             destination: "198.51.100.10".parse().unwrap(),
@@ -1488,15 +1307,6 @@ mod tests {
         let report = backend.delete_flow(9, 1).await.unwrap();
         assert_eq!(report.indexes_deleted, 3);
         assert!(backend.list_flow_states().await.unwrap().is_empty());
-        assert!(backend
-            .get_policy(&PolicyKey {
-                destination: "198.51.100.10".parse().unwrap(),
-                protocol: PROTOCOL_UDP,
-                destination_port: 443,
-            })
-            .await
-            .unwrap()
-            .is_some());
     }
 
     #[cfg(target_os = "linux")]
@@ -1510,7 +1320,7 @@ mod tests {
         adapter
             .load_elf(Path::new(&path), ABI_VERSION)
             .await
-            .expect("SSP_TEST_BPF_ELF must be a loadable ABI-v1 ELF");
+            .expect("SSP_TEST_BPF_ELF must be a loadable ABI-v3 ELF");
         assert!(adapter.list_entries().await.is_ok());
     }
 }

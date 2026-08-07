@@ -37,8 +37,8 @@ WSL’s NAT model breaks VPNs, packet inspection, and tools that rely on owning 
 
 ## Status
 
-Prototype. Packet rewriting, destination policy, flow mapping, and proxy
-bridging are implemented. Kernel attachment and packet-path verification remain
+Prototype. Global TCP/UDP packet rewriting, flow mapping, and proxy bridging
+are implemented. Kernel attachment and packet-path verification remain
 Linux-environment gated.
 
 ## Container control service
