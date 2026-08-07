@@ -17,7 +17,7 @@ path = "src/main.rs"
 
 [features]
 default = []
-tls-psk = ["dep:openssl", "dep:tokio-openssl"]
+tls-psk = ["dep:hyper-util", "dep:openssl", "dep:tokio-openssl"]
 
 [dependencies]
 async-trait = "0.1"
@@ -32,6 +32,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
+hyper-util = { version = "0.1", features = ["tokio"], optional = true }
 openssl = { version = "0.10.81", optional = true }
 tokio-openssl = { version = "0.6.5", optional = true }
 
