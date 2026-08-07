@@ -600,10 +600,12 @@ static __always_inline int process_packet(struct __sk_buff *skb, bool ingress)
     struct packet_info packet = {};
     struct tuple_key lookup_key = {};
     struct flow_index_value *index;
+    struct flow_index_value resolved_index = {};
     struct flow_state_key state_key = {};
     struct flow_state_value *state;
     struct flow_state_value *candidate;
     struct flow_index_value candidate_index = {};
+    __u8 have_index = 0;
     __u64 now;
     __u64 flow_id;
     __be16 target_port;
@@ -626,7 +628,11 @@ static __always_inline int process_packet(struct __sk_buff *skb, bool ingress)
                        packet.source_port, packet.destination_port);
     }
     index = bpf_map_lookup_elem(&ssp_flow_index_v1, &lookup_key);
-    if (!index && ingress) {
+    if (index) {
+        resolved_index = *index;
+        have_index = 1;
+    }
+    if (!have_index && ingress) {
         if (!target_for_packet(&packet, target, &target_port)) {
             increment_counter(0);
             return TC_ACT_OK;
@@ -670,6 +676,8 @@ static __always_inline int process_packet(struct __sk_buff *skb, bool ingress)
                 increment_counter(1);
                 return TC_ACT_SHOT;
             }
+            resolved_index = *index;
+            have_index = 1;
         } else if (bpf_map_update_elem(&ssp_flow_index_v1, &lookup_key,
                                        &candidate_index, BPF_NOEXIST) != 0 ||
                    bpf_map_update_elem(&ssp_flow_index_v1, &candidate->target,
@@ -686,6 +694,8 @@ static __always_inline int process_packet(struct __sk_buff *skb, bool ingress)
                 increment_counter(1);
                 return TC_ACT_SHOT;
             }
+            resolved_index = *index;
+            have_index = 1;
         } else {
             candidate->lifecycle = FLOW_ACTIVE;
             if (bpf_map_update_elem(&ssp_flow_state_v1, &state_key, candidate,
@@ -698,14 +708,15 @@ static __always_inline int process_packet(struct __sk_buff *skb, bool ingress)
                 increment_counter(1);
                 return TC_ACT_SHOT;
             }
-            index = &candidate_index;
+            resolved_index = candidate_index;
+            have_index = 1;
         }
     }
-    if (!index)
+    if (!have_index)
         return TC_ACT_OK;
     state_key.version = bpf_htons(MAP_ABI_VERSION);
-    state_key.flow_id = index->flow_id;
-    state_key.generation = index->generation;
+    state_key.flow_id = resolved_index.flow_id;
+    state_key.generation = resolved_index.generation;
     state = bpf_map_lookup_elem(&ssp_flow_state_v1, &state_key);
     if (!state || state->lifecycle != FLOW_ACTIVE)
         return TC_ACT_OK;
