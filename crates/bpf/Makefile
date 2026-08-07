@@ -21,8 +21,8 @@ $(OUTPUT): $(SOURCE)
 	$(CLANG) -O2 -g -target bpf -D__TARGET_ARCH_$(ARCH) \
 		-I$(KERNEL_UAPI) -c $< -o $@
 
-$(RUNNER_OUTPUT): $(RUNNER_MANIFEST) $(RUNNER_SOURCES)
-	$(CARGO) build --manifest-path $(RUNNER_MANIFEST) --bin $(RUNNER_OUTPUT)
+$(RUNNER_OUTPUT): $(RUNNER_MANIFEST) $(RUNNER_SOURCES) $(WORKSPACE_ROOT)/Cargo.lock
+	$(CARGO) build --locked --manifest-path $(RUNNER_MANIFEST) --bin $(RUNNER_OUTPUT)
 	cp $(RUNNER_ARTIFACT) $@
 
 clean:

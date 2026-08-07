@@ -261,14 +261,14 @@ mod linux {
 
         fn seed_maps(&mut self, config: &RuntimeConfigValue) -> RunnerResult {
             self.with_runtime_map(|map| {
-                map.set(0, config, 0).map_err(|error| {
+                map.set(0, *config, 0).map_err(|error| {
                     eprintln!("failed to seed runtime config map: {error}");
                 })?;
                 Ok(())
             })?;
 
             self.with_counters_map(|map| {
-                let zero = 0u64.to_ne_bytes();
+                let zero = 0u64.to_le_bytes();
                 for slot in 0..3 {
                     map.set(slot, zero, 0).map_err(|error| {
                         eprintln!("failed to zero counter slot {slot}: {error}");
@@ -278,7 +278,7 @@ mod linux {
             })?;
 
             self.with_active_flows_map(|map| {
-                let zero = 0u64.to_ne_bytes();
+                let zero = 0u64.to_le_bytes();
                 map.set(0, zero, 0).map_err(|error| {
                     eprintln!("failed to zero active-flow counter: {error}");
                 })?;
@@ -338,7 +338,7 @@ mod linux {
 
         fn read_counter(&mut self, slot: u32) -> RunnerResult<u64> {
             self.with_counters_map(|map| {
-                map.get(&slot, 0).map(u64::from_ne_bytes).map_err(|error| {
+                map.get(&slot, 0).map(u64::from_le_bytes).map_err(|error| {
                     eprintln!("failed to read counter slot {slot}: {error}");
                 })
             })
@@ -346,7 +346,7 @@ mod linux {
 
         fn read_active_flows(&mut self) -> RunnerResult<u64> {
             self.with_active_flows_map(|map| {
-                map.get(&0, 0).map(u64::from_ne_bytes).map_err(|error| {
+                map.get(&0, 0).map(u64::from_le_bytes).map_err(|error| {
                     eprintln!("failed to read active-flow count: {error}");
                 })
             })
@@ -842,9 +842,9 @@ mod linux {
         config[28] = 4;
         config[29] = 1;
         config[46..48].copy_from_slice(&LISTENER_PORT.to_be_bytes());
-        config[48..56].copy_from_slice(&DEFAULT_IDLE_TTL_NS.to_ne_bytes());
-        config[56..64].copy_from_slice(&DEFAULT_TERMINAL_GRACE_NS.to_ne_bytes());
-        config[64..68].copy_from_slice(&DEFAULT_ACTIVE_FLOW_CAPACITY.to_ne_bytes());
+        config[48..56].copy_from_slice(&DEFAULT_IDLE_TTL_NS.to_le_bytes());
+        config[56..64].copy_from_slice(&DEFAULT_TERMINAL_GRACE_NS.to_le_bytes());
+        config[64..68].copy_from_slice(&DEFAULT_ACTIVE_FLOW_CAPACITY.to_le_bytes());
         config
     }
 

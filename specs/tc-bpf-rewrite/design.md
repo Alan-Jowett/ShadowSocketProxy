@@ -99,11 +99,11 @@ helpers. Unsupported, malformed, non-initial, and non-linear packets return
 ### D-CI-001 — GitHub Actions workflow
 
 The workflow runs on pull requests and pushes to `main` on `ubuntu-latest`.
-It checks out the repository, installs a stable lockfile-respecting Rust
-toolchain, installs clang, LLVM, Linux kernel UAPI headers, libbpf development
-headers, OpenSSL/pkg-config development dependencies, and the build tools
-needed by the workspace. It runs the four Rust gates and then the BPF build
-and fixture execution gates.
+It checks out the repository, installs the pinned lockfile-respecting Rust
+toolchain, installs clang, LLVM, Linux kernel UAPI headers,
+OpenSSL/pkg-config development dependencies, and the build tools needed by the
+workspace. It runs the four Rust gates and then the BPF build and fixture
+execution gates.
 
 ### D-CI-002 — Canonical command ownership
 
@@ -115,12 +115,12 @@ path is passed to the integration test through `SSP_TEST_BPF_ELF`.
 ### D-CI-003 — Checked-in privileged runner
 
 The BPF test runner is a small Linux-only executable built by the BPF
-component. It uses libbpf to open/load the generated ELF, resolves the v3
-ingress and egress classifier programs, initializes runtime and flow maps with
-fixture configuration, and invokes `bpf_prog_test_run_opts` for each named
-fixture. It owns fixture packet construction, expected action/bytes/checksums,
-and map-state assertions; setup, capability, verifier, or assertion failure
-exits nonzero.
+component. It uses Aya to open/load the generated ELF, resolves the v3 ingress
+and egress classifier programs, initializes runtime and flow maps with fixture
+configuration, and invokes Aya's `SchedClassifier::test_run` wrapper over
+`bpf_prog_test_run_opts` for each named fixture. It owns fixture packet
+construction, expected action/bytes/checksums, and map-state assertions; setup,
+capability, verifier, or assertion failure exits nonzero.
 
 ### D-CI-004 — Explicit privilege and no-skip behavior
 
