@@ -6,10 +6,11 @@
 use std::{env, process::Command};
 
 const REQUIRED_SEQUENCE: &[&str] = &[
-    "policy-miss",
+    "target-miss",
     "flow-create",
     "forward-rewrite",
     "reverse-rewrite",
+    "control-bypass",
     "fin-ack-teardown",
     "rst",
 ];

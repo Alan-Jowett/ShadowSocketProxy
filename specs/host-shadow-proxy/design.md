@@ -11,9 +11,9 @@ This design implements REQ-009 through REQ-015 from `requirements.md`.
 USER-REQUEST -> REQ-* -> D-* -> TC-* -> implementation/test artifacts
 ```
 
-The existing BPF ABI, control-service RPC schema, Linux TC lifecycle, and
-control-service implementation remain unchanged. The new proxy consumes the
-existing `GetMapping` RPC.
+The flow-map ABI, Linux TC lifecycle, and `GetMapping` RPC remain compatible.
+The control service now has a v3 packet-program/runtime configuration surface,
+but the proxy continues to consume only the existing mapping contract.
 
 ## 2. Component Architecture
 
@@ -137,9 +137,9 @@ runtime target is Windows.
 
 ## 5. Explicit No-Impact Decisions
 
-- The BPF packet-rewriting logic is unchanged.
-- The versioned mapping ABI is unchanged.
+- The BPF packet-rewriting target selection may change independently of the
+  proxy; the versioned flow-mapping ABI remains unchanged.
 - The `GetMapping` protobuf RPC is reused without schema changes.
-- Linux control-service behavior and existing tests are unchanged.
+- Linux control-service target/listener configuration is outside the proxy.
 - The proxy does not bind original source addresses.
 - QUIC receives UDP forwarding treatment and no TCP-state interpretation.

@@ -6,8 +6,9 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use thiserror::Error;
 
 pub const MAP_ABI_VERSION: u16 = 1;
-pub const PROGRAM_ABI_VERSION: u16 = 2;
+pub const PROGRAM_ABI_VERSION: u16 = 3;
 pub const ABI_VERSION: u16 = PROGRAM_ABI_VERSION;
+pub const RUNTIME_CONFIG_ABI_VERSION: u16 = 3;
 
 pub const PROTOCOL_TCP: u8 = 6;
 pub const PROTOCOL_UDP: u8 = 17;
@@ -23,20 +24,16 @@ pub const TCP_RST: u32 = 1 << 4;
 
 pub const KEY_LEN: usize = 40;
 pub const VALUE_LEN: usize = KEY_LEN + 16;
-pub const POLICY_KEY_LEN: usize = 24;
-pub const POLICY_VALUE_LEN: usize = 24;
 pub const FLOW_INDEX_VALUE_LEN: usize = 16;
 pub const FLOW_STATE_KEY_LEN: usize = 16;
 pub const FLOW_STATE_VALUE_LEN: usize = 256;
-pub const RUNTIME_CONFIG_VALUE_LEN: usize = 24;
+pub const RUNTIME_CONFIG_VALUE_LEN: usize = 80;
 
-pub const ELF_POLICY_MAX_ENTRIES: usize = 4096;
 pub const ELF_FLOW_INDEX_MAX_ENTRIES: usize = 16384;
 pub const ELF_FLOW_STATE_MAX_ENTRIES: usize = 8192;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MapMaxima {
-    pub policy: usize,
     pub flow_index: usize,
     pub flow_state: usize,
 }
@@ -44,7 +41,6 @@ pub struct MapMaxima {
 impl Default for MapMaxima {
     fn default() -> Self {
         Self {
-            policy: ELF_POLICY_MAX_ENTRIES,
             flow_index: ELF_FLOW_INDEX_MAX_ENTRIES,
             flow_state: ELF_FLOW_STATE_MAX_ENTRIES,
         }
@@ -97,75 +93,6 @@ impl Tuple {
             return Err(AbiError::ZeroPort);
         }
         if self.source.is_unspecified() || self.destination.is_unspecified() {
-            return Err(AbiError::UnspecifiedAddress);
-        }
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct PolicyKey {
-    pub destination: IpAddr,
-    pub protocol: u8,
-    pub destination_port: u16,
-}
-
-impl PolicyKey {
-    pub fn family(&self) -> u8 {
-        if self.destination.is_ipv4() {
-            4
-        } else {
-            6
-        }
-    }
-
-    pub fn validate(&self) -> Result<(), AbiError> {
-        validate_protocol(self.protocol)?;
-        if self.destination_port == 0 {
-            return Err(AbiError::ZeroPort);
-        }
-        if self.destination.is_unspecified() {
-            return Err(AbiError::UnspecifiedAddress);
-        }
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct DestinationPolicy {
-    pub key: PolicyKey,
-    pub target: IpAddr,
-    pub target_port: u16,
-}
-
-impl DestinationPolicy {
-    pub fn new(
-        destination: IpAddr,
-        protocol: u8,
-        destination_port: u16,
-        target: IpAddr,
-        target_port: u16,
-    ) -> Self {
-        Self {
-            key: PolicyKey {
-                destination,
-                protocol,
-                destination_port,
-            },
-            target,
-            target_port,
-        }
-    }
-
-    pub fn validate(&self) -> Result<(), AbiError> {
-        self.key.validate()?;
-        if self.target_port == 0 {
-            return Err(AbiError::ZeroPort);
-        }
-        if self.key.destination.is_ipv4() != self.target.is_ipv4() {
-            return Err(AbiError::FamilyMismatch);
-        }
-        if self.target.is_unspecified() {
             return Err(AbiError::UnspecifiedAddress);
         }
         Ok(())
@@ -394,78 +321,6 @@ pub fn decode_value(key: &[u8], value: &[u8]) -> Result<Mapping, AbiError> {
     })
 }
 
-pub fn encode_policy_key(key: &PolicyKey) -> [u8; POLICY_KEY_LEN] {
-    let mut output = [0; POLICY_KEY_LEN];
-    output[0..2].copy_from_slice(&MAP_ABI_VERSION.to_be_bytes());
-    output[2] = key.family();
-    output[3] = key.protocol;
-    output[4..20].copy_from_slice(&address_bytes(key.destination));
-    output[20..22].copy_from_slice(&key.destination_port.to_be_bytes());
-    output
-}
-
-pub fn decode_policy_key(bytes: &[u8]) -> Result<PolicyKey, AbiError> {
-    if bytes.len() != POLICY_KEY_LEN {
-        return Err(AbiError::InvalidLength {
-            expected: POLICY_KEY_LEN,
-            actual: bytes.len(),
-        });
-    }
-    let version = u16::from_be_bytes([bytes[0], bytes[1]]);
-    if version != MAP_ABI_VERSION {
-        return Err(AbiError::UnsupportedVersion(version));
-    }
-    let key = PolicyKey {
-        destination: parse_address(bytes[2], &bytes[4..20])?,
-        protocol: bytes[3],
-        destination_port: u16::from_be_bytes([bytes[20], bytes[21]]),
-    };
-    key.validate()?;
-    Ok(key)
-}
-
-pub fn encode_policy_value(policy: &DestinationPolicy) -> [u8; POLICY_VALUE_LEN] {
-    let mut output = [0; POLICY_VALUE_LEN];
-    output[0..2].copy_from_slice(&MAP_ABI_VERSION.to_be_bytes());
-    output[2] = policy.target_family();
-    output[4..20].copy_from_slice(&address_bytes(policy.target));
-    output[20..22].copy_from_slice(&policy.target_port.to_be_bytes());
-    output
-}
-
-pub fn decode_policy_value(key: &PolicyKey, bytes: &[u8]) -> Result<DestinationPolicy, AbiError> {
-    if bytes.len() != POLICY_VALUE_LEN {
-        return Err(AbiError::InvalidLength {
-            expected: POLICY_VALUE_LEN,
-            actual: bytes.len(),
-        });
-    }
-    let version = u16::from_be_bytes([bytes[0], bytes[1]]);
-    if version != MAP_ABI_VERSION {
-        return Err(AbiError::UnsupportedVersion(version));
-    }
-    let target = parse_address(bytes[2], &bytes[4..20])?;
-    let policy = DestinationPolicy::new(
-        key.destination,
-        key.protocol,
-        key.destination_port,
-        target,
-        u16::from_be_bytes([bytes[20], bytes[21]]),
-    );
-    policy.validate()?;
-    Ok(policy)
-}
-
-impl DestinationPolicy {
-    fn target_family(&self) -> u8 {
-        if self.target.is_ipv4() {
-            4
-        } else {
-            6
-        }
-    }
-}
-
 pub fn encode_flow_index(value: &FlowIndexValue) -> [u8; FLOW_INDEX_VALUE_LEN] {
     let mut output = [0; FLOW_INDEX_VALUE_LEN];
     output[0..2].copy_from_slice(&MAP_ABI_VERSION.to_be_bytes());
@@ -550,16 +405,6 @@ pub fn decode_flow_state(bytes: &[u8]) -> Result<FlowState, AbiError> {
 mod tests {
     use super::*;
 
-    fn policy() -> DestinationPolicy {
-        DestinationPolicy::new(
-            "198.51.100.20".parse().unwrap(),
-            PROTOCOL_TCP,
-            443,
-            "192.0.2.20".parse().unwrap(),
-            8443,
-        )
-    }
-
     fn flow() -> FlowState {
         let original = Tuple {
             source: "192.0.2.10".parse().unwrap(),
@@ -625,14 +470,7 @@ mod tests {
     }
 
     #[test]
-    fn policy_and_flow_abis_round_trip() {
-        let policy = policy();
-        let key = decode_policy_key(&encode_policy_key(&policy.key)).unwrap();
-        assert_eq!(
-            decode_policy_value(&key, &encode_policy_value(&policy)).unwrap(),
-            policy
-        );
-
+    fn flow_abi_round_trips() {
         let state = flow();
         let key = encode_flow_state_key(state.flow_id, state.generation);
         assert_eq!(decode_flow_state_key(&key).unwrap().flow_id, state.flow_id);

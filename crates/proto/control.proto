@@ -40,38 +40,6 @@ message Mapping {
   uint32 tcp_state_flags = 5;
 }
 
-message DestinationPolicyKey {
-  uint32 family = 1;
-  bytes destination_address = 2;
-  uint32 protocol = 3;
-  uint32 destination_port = 4;
-}
-
-message DestinationPolicy {
-  DestinationPolicyKey key = 1;
-  bytes target_address = 2;
-  uint32 target_port = 3;
-}
-
-message SetDestinationPolicyRequest {
-  DestinationPolicy policy = 1;
-}
-
-message DeleteDestinationPolicyRequest {
-  DestinationPolicyKey key = 1;
-}
-
-message ListDestinationPoliciesRequest {
-  uint32 limit = 1;
-  bytes page_token = 2;
-}
-
-message ListDestinationPoliciesReply {
-  repeated DestinationPolicy policies = 1;
-  bytes next_page_token = 2;
-  uint64 skipped_entries = 3;
-}
-
 message ListMappingsRequest {
   uint32 limit = 1;
   bytes page_token = 2;
@@ -96,12 +64,14 @@ message StatusReply {
   uint64 deleted = 6;
   uint64 errors = 7;
   string last_error = 8;
-  uint64 policy_misses = 9;
+  reserved 9, 12;
+  reserved "policy_misses", "policy_map_max_entries";
   uint64 flow_insert_failures = 10;
   uint64 partial_cleanups = 11;
-  uint32 policy_map_max_entries = 12;
   uint32 flow_index_map_max_entries = 13;
   uint32 flow_state_map_max_entries = 14;
+  uint64 target_misses = 15;
+  uint64 control_bypasses = 16;
 }
 
 message Config {
@@ -109,9 +79,20 @@ message Config {
   uint64 idle_ttl_ms = 2;
   uint32 map_scan_batch = 3;
   uint32 log_capacity = 4;
-  uint32 destination_policy_capacity = 5;
+  reserved 5;
+  reserved "destination_policy_capacity";
   uint32 active_flow_capacity = 6;
   uint64 tcp_terminal_grace_ms = 7;
+  uint32 schema_version = 8;
+  bytes ipv4_target_address = 9;
+  uint32 ipv4_target_port = 10;
+  bytes ipv6_target_address = 11;
+  uint32 ipv6_target_port = 12;
+  uint32 listener_family = 13;
+  bytes listener_address = 14;
+  uint32 listener_port = 15;
+  bool listener_ipv4_wildcard = 16;
+  bool listener_ipv6_wildcard = 17;
 }
 
 message ConfigReply {
@@ -149,9 +130,6 @@ service Control {
   rpc Detach(DetachRequest) returns (OperationReply);
   rpc ListMappings(ListMappingsRequest) returns (ListMappingsReply);
   rpc GetMapping(GetMappingRequest) returns (Mapping);
-  rpc SetDestinationPolicy(SetDestinationPolicyRequest) returns (DestinationPolicy);
-  rpc DeleteDestinationPolicy(DeleteDestinationPolicyRequest) returns (OperationReply);
-  rpc ListDestinationPolicies(ListDestinationPoliciesRequest) returns (ListDestinationPoliciesReply);
   rpc GetStatus(Empty) returns (StatusReply);
   rpc GetConfig(Empty) returns (ConfigReply);
   rpc SetConfig(SetConfigRequest) returns (ConfigReply);

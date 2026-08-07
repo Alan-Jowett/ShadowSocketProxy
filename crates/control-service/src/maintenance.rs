@@ -20,8 +20,6 @@ pub struct MaintenanceSnapshot {
     pub delete_failed: u64,
     pub anomalies: u64,
     pub partial_cleanups: u64,
-    pub policy_misses: u64,
-    pub flow_insert_failures: u64,
 }
 
 #[derive(Default)]

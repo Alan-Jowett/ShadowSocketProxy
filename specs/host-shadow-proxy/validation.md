@@ -10,8 +10,9 @@ Unit tests use mocked `GetMapping` responses and loopback TCP/UDP sockets.
 Windows-specific OpenSSL/tonic integration tests are target- and
 environment-gated and report missing PSK-capable prerequisites explicitly.
 
-Existing control-service validation remains unchanged because the new proxy
-consumes the existing `GetMapping` contract without modifying it.
+The proxy validation continues to use the existing `GetMapping` contract.
+Control-service v3 target/listener validation is covered by the TC-BPF
+validation specification and is not duplicated here.
 
 ## 2. Test Cases
 
