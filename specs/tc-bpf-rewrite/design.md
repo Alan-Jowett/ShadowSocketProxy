@@ -84,7 +84,8 @@ TCP updates SYN, SYN/ACK, ACK, FIN, and RST bits for both directions. RST
 removes both directional index entries and canonical state immediately. FIN
 records direction-specific FIN and required ACK observations; after both
 directions complete FIN/ACK, state remains until the configured terminal grace
-deadline and is then removed.
+deadline and is then removed. If teardown never completes, idle-TTL
+maintenance reclaims the flow.
 
 UDP and QUIC-over-UDP update last-used/protocol activity only and are removed
 by idle-TTL maintenance. They never synthesize TCP state.
@@ -168,5 +169,5 @@ current policy matches.
 | INV-TC-004 | Existing flows retain their snapped target across policy updates. |
 | INV-TC-005 | Missing policy passes unchanged; map-capacity/insertion failure drops and is observable. |
 | INV-TC-006 | No malformed, non-initial, or unsupported packet causes unsafe access or partial rewrite. |
-| INV-TC-007 | TCP terminal cleanup removes all owned indexes/state; UDP/QUIC use idle TTL only. |
+| INV-TC-007 | TCP terminal cleanup removes all owned indexes/state; incomplete TCP, UDP, and QUIC use idle TTL when no terminal deadline is active. |
 | INV-TC-008 | Readiness requires all v2 programs and v1 policy/index/state maps. |

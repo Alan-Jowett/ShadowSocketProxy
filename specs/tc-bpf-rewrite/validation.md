@@ -37,7 +37,7 @@ absent rather than report false readiness.
 | TC-TC-012 | REQ-TC-003 | Flow-map full/insertion failure | Eligible packet drops and bounded failure telemetry is visible. |
 | TC-TC-013 | REQ-TC-003 | Policy update with active flow | Existing flow uses snapped target; a new flow uses the replacement target. |
 | TC-TC-014 | REQ-TC-004 | TCP state progression | SYN, SYN/ACK, ACK, one-sided FIN, bidirectional FIN/ACK, and RST state encode/decode correctly. |
-| TC-TC-015 | REQ-TC-004 | TCP teardown | RST deletes immediately; completed FIN/ACK deletes after grace; incomplete FIN remains. |
+| TC-TC-015 | REQ-TC-004 | TCP teardown | RST deletes immediately; completed FIN/ACK deletes after grace; incomplete or abandoned TCP expires by idle TTL. |
 | TC-TC-016 | REQ-TC-004 | UDP/QUIC lifecycle | Last-used updates; no TCP flags; cleanup occurs only after idle TTL. |
 | TC-TC-017 | REQ-TC-006 | Runtime limits | Policy/flow capacities and terminal grace update atomically; invalid or oversized values retain the prior revision. |
 | TC-TC-018 | REQ-TC-006 | Maintenance partial cleanup | Idle/terminal deletion, index races, decode failures, and backend errors are counted and never reported as full success. |

@@ -561,7 +561,7 @@ impl Control for ControlService {
         request: Request<proto::SetConfigRequest>,
     ) -> Result<Response<proto::ConfigReply>, Status> {
         let next = runtime_config_from_proto(request.into_inner().config)?;
-        next.validate_with_maxima(self.config.maxima())
+        next.validate_with_maxima(self.backend.map_maxima())
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
         if let Err(error) = self.backend.set_runtime_config(&next).await {
             if !matches!(error, BackendError::NotAttached | BackendError::Unsupported) {
@@ -624,7 +624,7 @@ mod tests {
     use crate::{
         bpf::InMemoryBackend,
         config::RuntimeConfig,
-        mapping::{Mapping, PROTOCOL_FLAG_UDP, PROTOCOL_UDP},
+        mapping::{MapMaxima, Mapping, PROTOCOL_FLAG_UDP, PROTOCOL_UDP},
     };
     use std::time::Duration;
 
@@ -723,6 +723,31 @@ mod tests {
             service.config.snapshot().cleanup_interval,
             Duration::from_secs(10)
         );
+    }
+
+    #[tokio::test]
+    async fn config_rpc_validates_against_attached_map_maxima() {
+        let (backend, service) = service();
+        backend.set_map_maxima(MapMaxima {
+            policy: 1,
+            flow_index: 3,
+            flow_state: 1,
+        });
+        let error = service
+            .set_config(Request::new(proto::SetConfigRequest {
+                config: Some(proto::Config {
+                    cleanup_interval_ms: 1_000,
+                    idle_ttl_ms: 2_000,
+                    map_scan_batch: 1,
+                    log_capacity: 1,
+                    destination_policy_capacity: 2,
+                    active_flow_capacity: 1,
+                    tcp_terminal_grace_ms: 1_000,
+                }),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
     }
 
     #[tokio::test]

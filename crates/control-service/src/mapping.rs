@@ -261,7 +261,7 @@ impl FlowState {
         if flags & TCP_SYN != 0 {
             self.tcp_state_flags |= if direction == 0 { TCP_SYN } else { TCP_SYN_ACK };
         }
-        if flags & TCP_ACK != 0 {
+        if flags & TCP_ACK != 0 && self.fin_seen_mask & (1 << (direction ^ 1)) != 0 {
             self.tcp_state_flags |= TCP_ACK;
             self.fin_ack_seen_mask |= 1 << direction;
         }
@@ -288,7 +288,11 @@ impl FlowState {
             return true;
         }
         if self.original.protocol == PROTOCOL_TCP {
-            self.terminal_deadline_ns != 0 && now_ns >= self.terminal_deadline_ns
+            if self.terminal_deadline_ns != 0 {
+                now_ns >= self.terminal_deadline_ns
+            } else {
+                now_ns.saturating_sub(self.last_used_ns) >= idle_ttl_ns
+            }
         } else {
             now_ns.saturating_sub(self.last_used_ns) >= idle_ttl_ns
         }
@@ -641,10 +645,19 @@ mod tests {
     #[test]
     fn tcp_terminal_deadline_beats_idle_ttl() {
         let mut state = flow();
-        state.observe_tcp(0, TCP_FIN | TCP_ACK, 100, 50);
+        state.observe_tcp(0, TCP_FIN, 100, 50);
         state.observe_tcp(1, TCP_FIN | TCP_ACK, 110, 50);
+        state.observe_tcp(0, TCP_ACK, 120, 50);
         assert!(!state.should_delete(120, 1));
-        assert!(state.should_delete(160, 1));
+        assert!(state.should_delete(180, 1));
+    }
+
+    #[test]
+    fn incomplete_tcp_flow_expires_by_idle_ttl() {
+        let mut state = flow();
+        state.observe_tcp(0, TCP_SYN, 100, 50);
+        assert!(!state.should_delete(150, 60));
+        assert!(state.should_delete(161, 60));
     }
 
     #[test]

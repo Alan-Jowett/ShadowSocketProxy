@@ -281,8 +281,18 @@ static __always_inline void release_flow_slot(void)
 {
     __u32 config_key = 0;
     __u64 *count = bpf_map_lookup_elem(&ssp_tc_active_flows_v1, &config_key);
-    if (count && *count)
-        __sync_fetch_and_sub(count, 1);
+    __u64 current;
+    int attempt;
+
+    if (!count)
+        return;
+    for (attempt = 0; attempt < 8; attempt++) {
+        current = __sync_fetch_and_add(count, 0);
+        if (!current)
+            return;
+        if (__sync_bool_compare_and_swap(count, current, current - 1))
+            return;
+    }
 }
 
 static __always_inline int parse_packet(struct __sk_buff *skb, struct packet_info *packet)
@@ -485,7 +495,8 @@ static __always_inline void update_tcp_state(struct flow_state_value *state,
     state->last_used_ns = now;
     if (flags & TCP_FLAG_SYN)
         state->tcp_state_flags |= direction ? TCP_SYN_ACK_BIT : TCP_SYN_BIT;
-    if (flags & TCP_FLAG_ACK) {
+    if ((flags & TCP_FLAG_ACK) &&
+        (state->fin_seen_mask & (1U << (direction ^ 1)))) {
         state->tcp_state_flags |= TCP_ACK_BIT;
         state->fin_ack_seen_mask |= 1U << direction;
     }

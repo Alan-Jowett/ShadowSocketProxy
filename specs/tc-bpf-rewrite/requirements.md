@@ -80,14 +80,17 @@ unparseable or unsupported packets MUST pass unchanged.
 TCP state MUST record SYN, SYN/ACK, ACK, FIN, and RST observations for both
 directions. RST MUST delete the canonical flow immediately. FIN MUST retain
 state until both directions complete FIN/ACK teardown, then delete after a
-configurable bounded terminal grace period. UDP and QUIC-over-UDP MUST have no
-TCP state and MUST expire only through idle-TTL maintenance.
+configurable bounded terminal grace period. A TCP flow that never completes
+teardown MUST still expire through idle-TTL maintenance. UDP and
+QUIC-over-UDP MUST have no TCP state and MUST expire only through idle-TTL
+maintenance.
 
 **Acceptance criteria**
 
 - TCP state transitions round-trip through the ABI.
 - One-sided FIN is retained.
 - Completed bidirectional FIN/ACK is deleted after grace.
+- Incomplete or abandoned TCP flows expire by idle TTL.
 - RST deletes immediately.
 - UDP/QUIC remain idle-TTL managed.
 
