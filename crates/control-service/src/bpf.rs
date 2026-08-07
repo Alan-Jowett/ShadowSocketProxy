@@ -409,7 +409,9 @@ impl LinuxTcAdapter for AyaLinuxTcAdapter {
                     "owned link is missing",
                 )
             })?;
-        let link_id = state.links[index].id;
+        let tracked = state.links.remove(index);
+        let link_id = tracked.id;
+        let attachment = tracked.attachment;
         let program_name = match direction {
             Direction::Ingress => INGRESS_PROGRAM_NAME_V1,
             Direction::Egress => EGRESS_PROGRAM_NAME_V1,
@@ -424,11 +426,25 @@ impl LinuxTcAdapter for AyaLinuxTcAdapter {
             let classifier: &mut aya::programs::SchedClassifier = program
                 .try_into()
                 .map_err(|error| Self::operation(format!("program:{program_name}"), error))?;
-            classifier.detach(link_id)
+            let link = classifier
+                .take_link(link_id)
+                .map_err(|error| Self::operation(format!("{interface}:{direction:?}"), error))?;
+            let restored_id = aya::programs::Link::id(&link);
+            match aya::programs::Link::detach(link) {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    state.links.insert(
+                        index,
+                        AyaLink {
+                            attachment: attachment.clone(),
+                            id: restored_id,
+                        },
+                    );
+                    Err(Self::operation(format!("{interface}:{direction:?}"), error))
+                }
+            }
         };
-        result.map_err(|error| Self::operation(format!("{interface}:{direction:?}"), error))?;
-        state.links.remove(index);
-        Ok(())
+        result
     }
 
     async fn list_entries(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, BackendError> {
