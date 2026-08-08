@@ -40,7 +40,7 @@ jobs:
       - name: Generate Rust documentation
         env:
           RUSTDOCFLAGS: -D warnings
-        run: cargo doc --workspace --no-deps --document-private-items
+        run: cargo doc --locked --workspace --no-deps --document-private-items
 
       - name: Generate BPF documentation
         run: |
@@ -80,7 +80,7 @@ jobs:
           RUSTDOCFLAGS: -D warnings
         run: |
           python scripts/check-rustdoc.py
-          cargo doc --workspace --no-deps --document-private-items
+          cargo doc --locked --workspace --no-deps --document-private-items
           rm -rf docs/.generated site
           doxygen docs/Doxyfile
           python scripts/assemble-docs.py --site-dir site

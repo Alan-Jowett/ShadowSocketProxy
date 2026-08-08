@@ -95,7 +95,9 @@ canonical BPF source. From a clean checkout with Rust 1.96.1 and Doxygen:
 
 ```text
 python scripts/check-rustdoc.py
-cargo doc --workspace --no-deps --document-private-items
+set RUSTDOCFLAGS=-D warnings
+cargo doc --locked --workspace --no-deps --document-private-items
+python -c "import shutil; shutil.rmtree('docs/.generated', ignore_errors=True); shutil.rmtree('site', ignore_errors=True)"
 doxygen docs/Doxyfile
 python scripts/assemble-docs.py --site-dir site
 ```

@@ -21,7 +21,7 @@ The workflow runs rustdoc for all workspace crates with private items enabled,
 without compiling test-only documentation targets:
 
 ```text
-cargo doc --workspace --no-deps --document-private-items
+cargo doc --locked --workspace --no-deps --document-private-items
 ```
 
 The generated workspace site is copied into the combined site under

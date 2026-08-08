@@ -8,7 +8,7 @@
 | ID | Requirement | Scenario | Expected result |
 | --- | --- | --- | --- |
 | TC-DOC-001 | REQ-DOC-001 | Rust coverage scan | Every in-scope function and required code element has rustdoc; test files/modules are excluded. |
-| TC-DOC-002 | REQ-DOC-001 | Workspace rustdoc generation | `cargo doc --workspace --no-deps --document-private-items` succeeds with warnings denied. |
+| TC-DOC-002 | REQ-DOC-001 | Workspace rustdoc generation | `RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --no-deps --document-private-items` succeeds. |
 | TC-DOC-003 | REQ-DOC-002 | BPF Doxygen generation | Doxygen generates the BPF HTML site and fails for undocumented required elements or warnings. |
 | TC-DOC-004 | REQ-DOC-003 | Combined site assembly | Clean staging contains `index.html`, `rustdoc/`, and `bpf/` with working links and no test artifacts. |
 | TC-DOC-005 | REQ-DOC-004 | Pull-request workflow | Documentation generation and assembly run; no branch push or Pages publication occurs. |
@@ -23,7 +23,8 @@ The repository documents commands equivalent to the CI steps:
 
 ```text
 python scripts/check-rustdoc.py
-RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --document-private-items
+RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --no-deps --document-private-items
+rm -rf docs/.generated site
 doxygen docs/Doxyfile
 ```
 
@@ -51,4 +52,3 @@ staging directory and is not required in the source branch.
 | REQ-DOC-003 | D-DOC-004 | TC-DOC-004 | Site is derived output only. |
 | REQ-DOC-004 | D-DOC-005 | TC-DOC-005..006 | Existing product CI gates retain their behavior. |
 | REQ-DOC-005 | D-DOC-006 | TC-DOC-007..009 | Only `gh-pages` publication state changes. |
-
