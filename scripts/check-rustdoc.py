@@ -49,7 +49,7 @@ def _brace_delta(line: str) -> int:
 
 
 def excluded_test_lines(lines: list[str]) -> set[int]:
-    """Return line numbers belonging to cfg(test) items or modules."""
+    """Return zero-based line indices belonging to cfg(test) items or modules."""
     excluded: set[int] = set()
     pending = False
     depth = 0
@@ -97,7 +97,7 @@ def has_rustdoc(lines: list[str], index: int) -> bool:
         if stripped.startswith("#["):
             cursor -= 1
             continue
-        return stripped.startswith("///") or stripped.startswith("//!")
+        return stripped.startswith("///")
     return False
 
 

@@ -14,7 +14,9 @@ from pathlib import Path
 def copy_tree(source: Path, destination: Path) -> None:
     if not source.is_dir():
         raise RuntimeError(f"missing generated documentation directory: {source}")
-    shutil.copytree(source, destination)
+    if any(path.is_symlink() for path in source.rglob("*")):
+        raise RuntimeError(f"generated documentation contains a symlink: {source}")
+    shutil.copytree(source, destination, symlinks=True)
 
 
 def main() -> int:
