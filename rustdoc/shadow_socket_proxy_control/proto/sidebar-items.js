@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"mod":["control_client","control_server"],"struct":["Config","ConfigReply","DetachRequest","Empty","GetMappingRequest","HealthReply","InterfaceRequest","ListMappingsReply","ListMappingsRequest","LogRecord","Mapping","OperationReply","PullLogsReply","PullLogsRequest","SetConfigRequest","StatusReply","Tuple"]};
