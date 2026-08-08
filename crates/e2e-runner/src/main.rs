@@ -127,7 +127,19 @@ mod windows {
                 "python3",
                 "-c",
                 &format!(
-                    "import socket; s=socket.create_connection(('{}', {}), 10); print('TUPLE=' + s.getsockname()[0] + ':' + str(s.getsockname()[1])); s.sendall(b'{}\\n'); print(s.recv(4096).decode(), end=''); s.close()",
+                    concat!(
+                        "import socket\n",
+                        "s=socket.create_connection(('{}', {}), 10)\n",
+                        "print('TUPLE=' + s.getsockname()[0] + ':' + str(s.getsockname()[1]))\n",
+                        "s.sendall(b'{}\\n')\n",
+                        "response=b''\n",
+                        "while b'\\n' not in response:\n",
+                        "    chunk=s.recv(4096)\n",
+                        "    assert chunk, 'marker server closed before newline'\n",
+                        "    response+=chunk\n",
+                        "print('RESPONSE=' + response.split(b'\\n', 1)[0].decode())\n",
+                        "s.close()",
+                    ),
                     args.target.ip(),
                     args.target.port(),
                     args.marker
@@ -145,15 +157,19 @@ mod windows {
             ));
         }
         let response = String::from_utf8_lossy(&output.stdout);
-        if !response.contains(&args.marker) {
-            return Err(format!("marker missing from WSL response: {response}"));
-        }
         let client_tuple = response
             .lines()
             .find_map(|line| line.strip_prefix("TUPLE="))
             .ok_or_else(|| "WSL client did not report its synthetic source tuple".to_string())?
             .parse::<SocketAddr>()
             .map_err(|error| format!("invalid WSL client tuple: {error}"))?;
+        let returned_marker = response
+            .lines()
+            .find_map(|line| line.strip_prefix("RESPONSE="))
+            .ok_or_else(|| "WSL client did not report a marker response".to_string())?;
+        if returned_marker != args.marker {
+            return Err(format!("unexpected marker response: {returned_marker}"));
+        }
 
         let mut mapping = None;
         for _ in 0..50 {

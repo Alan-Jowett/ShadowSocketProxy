@@ -562,6 +562,8 @@ struct AyaState {
 pub struct AyaLinuxTcAdapter {
     /// Optional loaded object; `None` means no ELF is attached.
     state: Mutex<Option<AyaState>>,
+    /// Selects the physical hook pairing needed by WSL-originated traffic.
+    wsl_hooks: bool,
 }
 
 #[cfg(target_os = "linux")]
@@ -570,12 +572,22 @@ impl Default for AyaLinuxTcAdapter {
     fn default() -> Self {
         Self {
             state: Mutex::new(None),
+            wsl_hooks: false,
         }
     }
 }
 
 #[cfg(target_os = "linux")]
 impl AyaLinuxTcAdapter {
+    /// Creates an adapter that binds logical forward processing to physical
+    /// egress and logical reverse processing to physical ingress for WSL.
+    pub fn with_wsl_hooks() -> Self {
+        Self {
+            state: Mutex::new(None),
+            wsl_hooks: true,
+        }
+    }
+
     /// Wraps an arbitrary adapter failure with its logical location.
     fn operation(location: impl Into<String>, error: impl std::fmt::Display) -> BackendError {
         BackendError::Operation {
@@ -775,7 +787,9 @@ impl LinuxTcAdapter for AyaLinuxTcAdapter {
         match aya::programs::tc::qdisc_add_clsact(interface) {
             Ok(()) | Err(aya::programs::tc::TcError::AlreadyAttached) => {}
             Err(error) => {
-                if !format!("{error:?}").contains("Exclusivity flag on, cannot modify") {
+                if !self.wsl_hooks
+                    || !format!("{error:?}").contains("Exclusivity flag on, cannot modify")
+                {
                     return Err(Self::operation(
                         format!("{interface}:{direction:?}"),
                         format!("clsact setup failed: {error}"),
@@ -784,12 +798,22 @@ impl LinuxTcAdapter for AyaLinuxTcAdapter {
             }
         }
 
-        // WSL-originated flows leave through the physical egress hook, so the
-        // logical forward program must be attached there; responses arrive on
-        // physical ingress and use the logical reverse program.
-        let (program_name, attach_type) = match direction {
-            Direction::Ingress => (EGRESS_PROGRAM_NAME_V3, aya::programs::TcAttachType::Ingress),
-            Direction::Egress => (INGRESS_PROGRAM_NAME_V3, aya::programs::TcAttachType::Egress),
+        let (program_name, attach_type) = match (self.wsl_hooks, direction) {
+            (false, Direction::Ingress) => (
+                INGRESS_PROGRAM_NAME_V3,
+                aya::programs::TcAttachType::Ingress,
+            ),
+            (false, Direction::Egress) => {
+                (EGRESS_PROGRAM_NAME_V3, aya::programs::TcAttachType::Egress)
+            }
+            // WSL-originated flows leave through physical egress; responses
+            // arrive through physical ingress.
+            (true, Direction::Ingress) => {
+                (EGRESS_PROGRAM_NAME_V3, aya::programs::TcAttachType::Ingress)
+            }
+            (true, Direction::Egress) => {
+                (INGRESS_PROGRAM_NAME_V3, aya::programs::TcAttachType::Egress)
+            }
         };
         let link_id = {
             let program = state.bpf.program_mut(program_name).ok_or_else(|| {
@@ -831,9 +855,11 @@ impl LinuxTcAdapter for AyaLinuxTcAdapter {
         let tracked = state.links.remove(index);
         let link_id = tracked.id;
         let attachment = tracked.attachment;
-        let program_name = match direction {
-            Direction::Ingress => EGRESS_PROGRAM_NAME_V3,
-            Direction::Egress => INGRESS_PROGRAM_NAME_V3,
+        let program_name = match (self.wsl_hooks, direction) {
+            (false, Direction::Ingress) => INGRESS_PROGRAM_NAME_V3,
+            (false, Direction::Egress) => EGRESS_PROGRAM_NAME_V3,
+            (true, Direction::Ingress) => EGRESS_PROGRAM_NAME_V3,
+            (true, Direction::Egress) => INGRESS_PROGRAM_NAME_V3,
         };
         let result = {
             let program = state.bpf.program_mut(program_name).ok_or_else(|| {
@@ -1162,6 +1188,19 @@ impl LinuxBpfBackend {
         #[cfg(not(target_os = "linux"))]
         {
             Self::with_adapter(Arc::new(UnsupportedLinuxTcAdapter))
+        }
+    }
+
+    /// Creates a backend that binds the logical forward/reverse programs to
+    /// WSL's physical egress/ingress hooks respectively.
+    pub fn new_with_wsl_hooks() -> Self {
+        #[cfg(target_os = "linux")]
+        {
+            Self::with_adapter(Arc::new(AyaLinuxTcAdapter::with_wsl_hooks()))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Self::new()
         }
     }
 

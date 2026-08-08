@@ -20,7 +20,18 @@ async fn main() {
         eprintln!("invalid SSP_LISTEN_ADDR: listener port must be non-zero");
         std::process::exit(1);
     }
-    let backend = LinuxBpfBackend::new();
+    let backend = match std::env::var("SSP_TC_HOOK_LAYOUT") {
+        Ok(value) if value == "wsl" => LinuxBpfBackend::new_with_wsl_hooks(),
+        Ok(value) => {
+            eprintln!("invalid SSP_TC_HOOK_LAYOUT: expected wsl, got {value}");
+            std::process::exit(1);
+        }
+        Err(std::env::VarError::NotPresent) => LinuxBpfBackend::new(),
+        Err(error) => {
+            eprintln!("invalid SSP_TC_HOOK_LAYOUT: {error}");
+            std::process::exit(1);
+        }
+    };
     let mut runtime = ServiceRuntime::new_with_listener(backend, address);
     if let Err(error) = runtime.start().await {
         eprintln!("shadow-socket-proxy-control failed to start: {error}");

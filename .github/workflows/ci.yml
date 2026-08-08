@@ -142,6 +142,33 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
+      - name: Install and initialize WSL distribution
+        shell: pwsh
+        run: |
+          $distribution = "Ubuntu-22.04"
+          if (-not (Get-Command wsl.exe -ErrorAction SilentlyContinue)) {
+            throw "wsl.exe is required for Windows/WSL E2E validation"
+          }
+          $installed = @(
+            & wsl.exe --list --quiet 2>$null |
+              ForEach-Object { ($_ -replace "`0", "").Trim() } |
+              Where-Object { $_ }
+          )
+          if ($installed -notcontains $distribution) {
+            & wsl.exe --install --distribution $distribution --no-launch
+            if ($LASTEXITCODE -ne 0) {
+              throw "WSL distribution installation failed"
+            }
+          }
+          & wsl.exe --set-default $distribution
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unable to select WSL distribution $distribution"
+          }
+          & wsl.exe -d $distribution -u root -- uname -a
+          if ($LASTEXITCODE -ne 0) {
+            throw "WSL distribution $distribution did not initialize"
+          }
+
       - name: Download BPF artifact
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:

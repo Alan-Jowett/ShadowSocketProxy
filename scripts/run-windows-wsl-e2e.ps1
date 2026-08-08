@@ -107,6 +107,7 @@ $proxyAddress = "${hostGateway}:$proxyPort"
 $serverProcess = $null
 $controlProcess = $null
 $proxyProcess = $null
+$qdiscPrepared = $false
 $controlStdout = Join-Path $WorkDirectory "control.stdout.log"
 $controlStderr = Join-Path $WorkDirectory "control.stderr.log"
 $proxyStdout = Join-Path $WorkDirectory "host-proxy.stdout.log"
@@ -117,13 +118,15 @@ try {
         "if command -v dnf >/dev/null; then dnf install -y iproute iproute-tc python3 openssl-libs ca-certificates; elif command -v apt-get >/dev/null; then apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends iproute2 python3 libssl3 ca-certificates; else echo 'unsupported WSL package manager' >&2; exit 1; fi")
     Invoke-WslRoot $Distribution @("chmod", "+x", $bpfWsl, $controlWsl)
     Invoke-WslRoot $Distribution @("sh", "-c",
-        "command -v tc >/dev/null || { echo 'tc is required but unavailable' >&2; exit 1; }; tc qdisc del dev $Interface clsact 2>/dev/null || true; tc qdisc add dev $Interface clsact 2>/dev/null || true")
+        "command -v tc >/dev/null || { echo 'tc is required but unavailable' >&2; exit 1; }; tc qdisc del dev $Interface clsact 2>/dev/null || true; tc qdisc add dev $Interface clsact")
+    $qdiscPrepared = $true
 
     $controlProcess = Start-Process wsl.exe -PassThru -WindowStyle Hidden `
         -RedirectStandardOutput $controlStdout -RedirectStandardError $controlStderr `
         -ArgumentList @(
             "-d", $Distribution, "-u", "root", "--", "env",
             "SSP_LISTEN_ADDR=0.0.0.0:$controlPort",
+            "SSP_TC_HOOK_LAYOUT=wsl",
             "SSP_TLS_PSK_IDENTITY=$identity",
             "SSP_TLS_PSK_SECRET=$secret",
             $controlWsl
@@ -171,7 +174,9 @@ finally {
         }
     }
     try {
-        Invoke-WslRoot $Distribution @("sh", "-c", "tc qdisc del dev $Interface clsact 2>/dev/null || true")
+        if ($qdiscPrepared) {
+            Invoke-WslRoot $Distribution @("tc", "qdisc", "del", "dev", $Interface, "clsact")
+        }
         & wsl.exe --terminate $Distribution
         if ($LASTEXITCODE -ne 0) {
             throw "WSL distribution termination failed"
