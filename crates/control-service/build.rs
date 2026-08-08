@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 ShadowSocketProxy contributors
+//! Generates tonic client/server bindings and detects Linux OpenSSL PSK support.
 
 use std::{
     env,
@@ -7,6 +8,7 @@ use std::{
     process::{Command, Stdio},
 };
 
+/// Compiles the shared protobuf and emits the platform cfg used by TLS-PSK code.
 fn main() {
     let protoc = protoc_bin_vendored::protoc_bin_path().expect("protoc is available");
     std::env::set_var("PROTOC", protoc);
@@ -22,6 +24,8 @@ fn main() {
     }
 }
 
+/// Preprocesses OpenSSL headers and disables TLS-PSK code when `OPENSSL_NO_PSK`
+/// is defined by the selected Linux OpenSSL build.
 fn detect_openssl_psk() {
     let compiler = env::var("CC").unwrap_or_else(|_| "cc".into());
     let mut command = Command::new(compiler);

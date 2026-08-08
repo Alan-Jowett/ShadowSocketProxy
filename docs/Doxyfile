@@ -1,0 +1,27 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 ShadowSocketProxy contributors
+
+PROJECT_NAME           = ShadowSocketProxy BPF
+PROJECT_BRIEF          = Doxygen reference for the canonical TC BPF packet path
+OUTPUT_DIRECTORY       = docs/.generated
+CREATE_SUBDIRS         = NO
+INPUT                  = crates/bpf/shadow-socket-proxy.bpf.c
+FILE_PATTERNS          = *.c
+RECURSIVE              = NO
+EXCLUDE                = crates/bpf/fixture-runner
+EXTRACT_ALL            = YES
+EXTRACT_PRIVATE        = YES
+EXTRACT_STATIC         = YES
+WARN_IF_UNDOCUMENTED   = YES
+WARN_NO_PARAMDOC       = NO
+WARN_AS_ERROR          = YES
+QUIET                  = NO
+GENERATE_HTML          = YES
+HTML_OUTPUT            = bpf
+GENERATE_LATEX         = NO
+GENERATE_XML           = NO
+FULL_PATH_NAMES        = NO
+SOURCE_BROWSER         = NO
+INLINE_SOURCES         = NO
+STRIP_FROM_PATH        = .
+CASE_SENSE_NAMES       = YES

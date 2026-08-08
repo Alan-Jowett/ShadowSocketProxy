@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 ShadowSocketProxy contributors
+//! Parses host-proxy options, loads the PSK, and runs TCP/UDP forwarding.
 
 use std::{fs, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
@@ -9,21 +10,29 @@ use tokio::sync::watch;
 
 #[derive(Debug, Parser)]
 #[command(name = "shadow-socket-proxy-host")]
+/// Command-line settings for the host proxy and its control client.
 struct Args {
     #[arg(long, default_value = "127.0.0.1:15000")]
+    /// Specific local TCP/UDP listener address.
     listen: SocketAddr,
     #[arg(long, default_value = "https://127.0.0.1:50051")]
+    /// TLS-PSK control-service endpoint.
     control_endpoint: String,
     #[arg(long)]
+    /// Identity sent during control-service authentication.
     psk_identity: String,
     #[arg(long, env = "SSP_TLS_PSK_SECRET")]
+    /// Inline PSK secret, mutually exclusive with `psk_secret_file`.
     psk_secret: Option<String>,
     #[arg(long)]
+    /// File containing the PSK secret when inline credentials are omitted.
     psk_secret_file: Option<PathBuf>,
     #[arg(long, default_value_t = 60)]
+    /// Seconds of UDP inactivity before an association is discarded.
     udp_idle_timeout_secs: u64,
 }
 
+/// Selects the inline secret or reads and trims the configured secret file.
 fn load_secret(args: &Args) -> Result<Vec<u8>, String> {
     match (&args.psk_secret, &args.psk_secret_file) {
         (Some(_), Some(_)) => Err("provide only one PSK secret source".into()),
@@ -34,6 +43,8 @@ fn load_secret(args: &Args) -> Result<Vec<u8>, String> {
 }
 
 #[tokio::main]
+/// Validates options, connects the platform mapping client, and runs until the
+/// shutdown watch is triggered or forwarding fails.
 async fn main() {
     tracing_subscriber::fmt::init();
     let args = Args::parse();

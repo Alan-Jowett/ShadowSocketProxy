@@ -1,44 +1,73 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 ShadowSocketProxy contributors
+//! Shared tuple and flow-state model plus fixed-width, network-byte-order
+//! encoders and decoders for the control service/BPF map boundary.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use thiserror::Error;
 
+/// Version stored in every map key and value header.
 pub const MAP_ABI_VERSION: u16 = 1;
+/// Version of the flow-state program ABI consumed by userspace.
 pub const PROGRAM_ABI_VERSION: u16 = 3;
+/// Compatibility alias for the current program ABI version.
 pub const ABI_VERSION: u16 = PROGRAM_ABI_VERSION;
+/// Version of the runtime configuration payload written to the BPF map.
 pub const RUNTIME_CONFIG_ABI_VERSION: u16 = 3;
 
+/// IP protocol number for TCP.
 pub const PROTOCOL_TCP: u8 = 6;
+/// IP protocol number for UDP.
 pub const PROTOCOL_UDP: u8 = 17;
+/// Flow-state bit indicating that the flow carries TCP.
 pub const PROTOCOL_FLAG_TCP: u32 = 1 << 0;
+/// Flow-state bit indicating that the flow carries UDP.
 pub const PROTOCOL_FLAG_UDP: u32 = 1 << 1;
+/// Reserved flow-state bit for QUIC metadata; the current packet path does not
+/// classify QUIC separately from UDP.
 pub const PROTOCOL_FLAG_QUIC: u32 = 1 << 2;
 
+/// Observed TCP SYN bit in `FlowState::tcp_state_flags`.
 pub const TCP_SYN: u32 = 1 << 0;
+/// Observed TCP SYN/ACK bit in `FlowState::tcp_state_flags`.
 pub const TCP_SYN_ACK: u32 = 1 << 1;
+/// Observed TCP ACK-after-FIN bit in `FlowState::tcp_state_flags`.
 pub const TCP_ACK: u32 = 1 << 2;
+/// Observed TCP FIN bit in `FlowState::tcp_state_flags`.
 pub const TCP_FIN: u32 = 1 << 3;
+/// Observed TCP RST bit; a flow with this bit is immediately removable.
 pub const TCP_RST: u32 = 1 << 4;
 
+/// Encoded length, in bytes, of a tuple map key.
 pub const KEY_LEN: usize = 40;
+/// Encoded length, in bytes, of a legacy mapping value.
 pub const VALUE_LEN: usize = KEY_LEN + 16;
+/// Encoded length of a flow-index value containing an id and generation.
 pub const FLOW_INDEX_VALUE_LEN: usize = 16;
+/// Encoded length of a flow-state map key.
 pub const FLOW_STATE_KEY_LEN: usize = 16;
+/// Encoded length of a flow-state value, including reserved padding.
 pub const FLOW_STATE_VALUE_LEN: usize = 256;
+/// Encoded length of the runtime configuration map value.
 pub const RUNTIME_CONFIG_VALUE_LEN: usize = 80;
 
+/// Compile-time maximum number of tuple indexes in the BPF ELF.
 pub const ELF_FLOW_INDEX_MAX_ENTRIES: usize = 16384;
+/// Compile-time maximum number of active flow states in the BPF ELF.
 pub const ELF_FLOW_STATE_MAX_ENTRIES: usize = 8192;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Runtime map capacities reported by the loaded BPF object.
 pub struct MapMaxima {
+    /// Maximum number of tuple-to-flow index entries accepted by validation.
     pub flow_index: usize,
+    /// Maximum number of flow-state records accepted by validation.
     pub flow_state: usize,
 }
 
 impl Default for MapMaxima {
+    /// Returns the capacities compiled into the shipped BPF object.
     fn default() -> Self {
         Self {
             flow_index: ELF_FLOW_INDEX_MAX_ENTRIES,
@@ -48,35 +77,51 @@ impl Default for MapMaxima {
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
+/// Failure while validating or decoding the fixed BPF map ABI.
 pub enum AbiError {
     #[error("unsupported ABI version {0}")]
+    /// The encoded version is not supported by this service.
     UnsupportedVersion(u16),
     #[error("malformed ABI length: expected {expected}, got {actual}")]
+    /// The byte slice is not exactly the size required by the ABI record.
     InvalidLength { expected: usize, actual: usize },
     #[error("invalid address family {0}")]
+    /// The address-family discriminator is neither 4 nor 6.
     InvalidFamily(u8),
     #[error("unsupported protocol {0}")]
+    /// The tuple uses a protocol other than TCP or UDP.
     UnsupportedProtocol(u8),
     #[error("address families do not match")]
+    /// Source and destination addresses are from different IP families.
     FamilyMismatch,
     #[error("port must be non-zero")]
+    /// A tuple contains a zero source or destination port.
     ZeroPort,
     #[error("unspecified address is not supported")]
+    /// A tuple contains an unspecified source or destination address.
     UnspecifiedAddress,
     #[error("invalid lifecycle value {0}")]
+    /// The encoded lifecycle is unknown or has an invalid deadline invariant.
     InvalidLifecycle(u8),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+/// Five-tuple used as a BPF map index.
 pub struct Tuple {
+    /// Original packet source address.
     pub source: IpAddr,
+    /// Packet destination address before or after redirection, depending on use.
     pub destination: IpAddr,
+    /// IP protocol number; only TCP and UDP are accepted.
     pub protocol: u8,
+    /// Source transport port in host byte order.
     pub source_port: u16,
+    /// Destination transport port in host byte order.
     pub destination_port: u16,
 }
 
 impl Tuple {
+    /// Returns the shared address-family discriminator (4 or 6).
     pub fn family(&self) -> u8 {
         match self.source {
             IpAddr::V4(_) => 4,
@@ -84,6 +129,7 @@ impl Tuple {
         }
     }
 
+    /// Checks family, protocol, port, and address invariants required by the ABI.
     pub fn validate(&self) -> Result<(), AbiError> {
         if self.source.is_ipv4() != self.destination.is_ipv4() {
             return Err(AbiError::FamilyMismatch);
@@ -100,24 +146,35 @@ impl Tuple {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Legacy map entry exposed to clients as a synthetic-to-original mapping.
 pub struct Mapping {
+    /// Tuple presented by the redirected packet path and used as the map key.
     pub synthetic: Tuple,
+    /// Original destination tuple restored by the host proxy.
     pub original: Tuple,
+    /// Monotonic timestamp of the last packet observed for this mapping.
     pub last_seen_ns: u64,
+    /// Bitmask describing the protocols recorded for the flow.
     pub protocol_flags: u32,
+    /// Bitmask of TCP handshake/termination events observed for the flow.
     pub tcp_state_flags: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
+/// Lifecycle states encoded in a flow-state value.
 pub enum FlowLifecycle {
+    /// A flow was allocated but has not completed its initial activation.
     Creating = 1,
+    /// A flow is eligible for normal packet rewriting and idle cleanup.
     Active = 2,
 }
 
 impl TryFrom<u8> for FlowLifecycle {
+    /// Decoding an unknown numeric lifecycle yields an ABI error.
     type Error = AbiError;
 
+    /// Decodes the wire value and rejects states outside the ABI.
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
             1 => Ok(Self::Creating),
@@ -128,28 +185,45 @@ impl TryFrom<u8> for FlowLifecycle {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Flow id and generation stored for each tuple index.
 pub struct FlowIndexValue {
+    /// Identifies the shared flow-state record.
     pub flow_id: u64,
+    /// Prevents a stale tuple index from referring to a reused flow id.
     pub generation: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Complete bidirectional state for one redirected TCP or UDP flow.
 pub struct FlowState {
+    /// Stable identifier used by all tuple indexes for this flow.
     pub flow_id: u64,
+    /// Generation paired with `flow_id` for stale-entry detection.
     pub generation: u32,
+    /// Ingress tuple captured before destination rewriting.
     pub original: Tuple,
+    /// Tuple sent from ingress to the configured host listener.
     pub target: Tuple,
+    /// Egress tuple that identifies replies from the host listener.
     pub reverse: Tuple,
+    /// Monotonic timestamp used for idle expiration.
     pub last_used_ns: u64,
+    /// Protocol bits accumulated while the flow is active.
     pub protocol_flags: u32,
+    /// TCP handshake and termination bits accumulated by packet direction.
     pub tcp_state_flags: u32,
+    /// One bit per direction indicating that FIN was observed.
     pub fin_seen_mask: u8,
+    /// One bit per direction indicating that the peer's FIN was acknowledged.
     pub fin_ack_seen_mask: u8,
+    /// Current flow lifecycle encoded in the state map.
     pub lifecycle: FlowLifecycle,
+    /// Deadline after both FINs and their acknowledgements; zero until terminal.
     pub terminal_deadline_ns: u64,
 }
 
 impl FlowState {
+    /// Verifies tuple compatibility and the creating-state deadline invariant.
     pub fn validate(&self) -> Result<(), AbiError> {
         self.original.validate()?;
         self.target.validate()?;
@@ -170,6 +244,7 @@ impl FlowState {
         Ok(())
     }
 
+    /// Projects active flow state into the legacy mapping response shape.
     pub fn mapping(&self) -> Mapping {
         Mapping {
             synthetic: self.target.clone(),
@@ -180,6 +255,8 @@ impl FlowState {
         }
     }
 
+    /// Records directional TCP flags and starts terminal grace after both FIN
+    /// exchanges are observed.
     pub fn observe_tcp(&mut self, direction: u8, flags: u32, now_ns: u64, grace_ns: u64) {
         if self.original.protocol != PROTOCOL_TCP || direction > 1 {
             return;
@@ -207,6 +284,8 @@ impl FlowState {
         }
     }
 
+    /// Returns whether the flow is expired by creation failure, RST, terminal
+    /// grace, or protocol-specific idle time.
     pub fn should_delete(&self, now_ns: u64, idle_ttl_ns: u64) -> bool {
         if self.lifecycle == FlowLifecycle::Creating {
             return true;
@@ -226,6 +305,7 @@ impl FlowState {
     }
 }
 
+/// Rejects protocols that the packet rewriter and ABI do not support.
 fn validate_protocol(protocol: u8) -> Result<(), AbiError> {
     match protocol {
         PROTOCOL_TCP | PROTOCOL_UDP => Ok(()),
@@ -233,6 +313,7 @@ fn validate_protocol(protocol: u8) -> Result<(), AbiError> {
     }
 }
 
+/// Encodes IPv4 as an IPv4-mapped 16-byte address and leaves IPv6 unchanged.
 fn address_bytes(address: IpAddr) -> [u8; 16] {
     match address {
         IpAddr::V4(address) => {
@@ -246,6 +327,7 @@ fn address_bytes(address: IpAddr) -> [u8; 16] {
     }
 }
 
+/// Decodes one 16-byte address using the supplied ABI family discriminator.
 fn parse_address(family: u8, bytes: &[u8]) -> Result<IpAddr, AbiError> {
     let value: [u8; 16] = bytes.try_into().map_err(|_| AbiError::InvalidLength {
         expected: 16,
@@ -260,6 +342,7 @@ fn parse_address(family: u8, bytes: &[u8]) -> Result<IpAddr, AbiError> {
     }
 }
 
+/// Serializes a validated tuple into the map's versioned, network-order key.
 pub fn encode_key(tuple: &Tuple) -> [u8; KEY_LEN] {
     let mut output = [0; KEY_LEN];
     output[0..2].copy_from_slice(&MAP_ABI_VERSION.to_be_bytes());
@@ -272,6 +355,7 @@ pub fn encode_key(tuple: &Tuple) -> [u8; KEY_LEN] {
     output
 }
 
+/// Parses and validates an exact-size tuple key, including its ABI version.
 pub fn decode_key(bytes: &[u8]) -> Result<Tuple, AbiError> {
     if bytes.len() != KEY_LEN {
         return Err(AbiError::InvalidLength {
@@ -296,6 +380,7 @@ pub fn decode_key(bytes: &[u8]) -> Result<Tuple, AbiError> {
     Ok(tuple)
 }
 
+/// Serializes a legacy mapping value using the supplied synthetic tuple as key.
 pub fn encode_value(mapping: &Mapping) -> [u8; VALUE_LEN] {
     let mut output = [0; VALUE_LEN];
     output[..KEY_LEN].copy_from_slice(&encode_key(&mapping.original));
@@ -305,6 +390,7 @@ pub fn encode_value(mapping: &Mapping) -> [u8; VALUE_LEN] {
     output
 }
 
+/// Decodes a legacy mapping key/value pair and rejects malformed tuple data.
 pub fn decode_value(key: &[u8], value: &[u8]) -> Result<Mapping, AbiError> {
     if value.len() != VALUE_LEN {
         return Err(AbiError::InvalidLength {
@@ -321,6 +407,7 @@ pub fn decode_value(key: &[u8], value: &[u8]) -> Result<Mapping, AbiError> {
     })
 }
 
+/// Serializes a flow-index id and generation with the current ABI version.
 pub fn encode_flow_index(value: &FlowIndexValue) -> [u8; FLOW_INDEX_VALUE_LEN] {
     let mut output = [0; FLOW_INDEX_VALUE_LEN];
     output[0..2].copy_from_slice(&MAP_ABI_VERSION.to_be_bytes());
@@ -329,6 +416,7 @@ pub fn encode_flow_index(value: &FlowIndexValue) -> [u8; FLOW_INDEX_VALUE_LEN] {
     output
 }
 
+/// Decodes an exact-size flow-index value and checks its ABI version.
 pub fn decode_flow_index(bytes: &[u8]) -> Result<FlowIndexValue, AbiError> {
     if bytes.len() != FLOW_INDEX_VALUE_LEN {
         return Err(AbiError::InvalidLength {
@@ -346,6 +434,7 @@ pub fn decode_flow_index(bytes: &[u8]) -> Result<FlowIndexValue, AbiError> {
     })
 }
 
+/// Serializes the flow id and generation used to address a state record.
 pub fn encode_flow_state_key(flow_id: u64, generation: u32) -> [u8; FLOW_STATE_KEY_LEN] {
     let mut output = [0; FLOW_STATE_KEY_LEN];
     output[0..2].copy_from_slice(&MAP_ABI_VERSION.to_be_bytes());
@@ -354,11 +443,14 @@ pub fn encode_flow_state_key(flow_id: u64, generation: u32) -> [u8; FLOW_STATE_K
     output
 }
 
+/// Decodes a state key using the same layout as a flow-index value.
 pub fn decode_flow_state_key(bytes: &[u8]) -> Result<FlowIndexValue, AbiError> {
     let value = decode_flow_index(bytes)?;
     Ok(value)
 }
 
+/// Serializes all flow tuples, lifecycle counters, timestamps, and identifiers
+/// into the fixed 256-byte state-map value.
 pub fn encode_flow_state(state: &FlowState) -> [u8; FLOW_STATE_VALUE_LEN] {
     let mut output = [0; FLOW_STATE_VALUE_LEN];
     output[..KEY_LEN].copy_from_slice(&encode_key(&state.original));
@@ -376,6 +468,7 @@ pub fn encode_flow_state(state: &FlowState) -> [u8; FLOW_STATE_VALUE_LEN] {
     output
 }
 
+/// Decodes and validates a complete fixed-size flow-state value.
 pub fn decode_flow_state(bytes: &[u8]) -> Result<FlowState, AbiError> {
     if bytes.len() != FLOW_STATE_VALUE_LEN {
         return Err(AbiError::InvalidLength {

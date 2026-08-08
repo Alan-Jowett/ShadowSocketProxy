@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 ShadowSocketProxy contributors
+//! Provides a mutex-protected bounded log ring with monotonic cursors.
 
 use std::collections::VecDeque;
 use std::sync::Mutex;
@@ -7,29 +8,42 @@ use std::sync::Mutex;
 use thiserror::Error;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// One retained service log entry.
 pub struct LogRecord {
+    /// Monotonic cursor returned by `append`.
     pub sequence: u64,
+    /// Caller-supplied severity label such as `INFO` or `ERROR`.
     pub level: String,
+    /// Human-readable event text.
     pub message: String,
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
+/// Errors returned when a log cursor can no longer be served.
 pub enum LogError {
     #[error("log cursor {cursor} is older than retained sequence {oldest}")]
+    /// The requested cursor predates the oldest retained record.
     CursorExpired { cursor: u64, oldest: u64 },
 }
 
+/// Mutable ring state protected by `LogRing::state`.
 struct State {
+    /// Maximum number of records retained; always at least one after updates.
     capacity: usize,
+    /// Sequence assigned to the next appended record.
     next_sequence: u64,
+    /// Oldest-to-newest retained records.
     records: VecDeque<LogRecord>,
 }
 
+/// Thread-safe bounded log storage with cursor-based reads.
 pub struct LogRing {
+    /// Synchronizes appends, retention changes, and pulls.
     state: Mutex<State>,
 }
 
 impl LogRing {
+    /// Creates an empty ring; zero capacity is rejected.
     pub fn new(capacity: usize) -> Self {
         assert!(capacity > 0);
         Self {
@@ -41,6 +55,8 @@ impl LogRing {
         }
     }
 
+    /// Appends a record, evicts oldest entries over capacity, and returns its
+    /// monotonic sequence number.
     pub fn append(&self, level: impl Into<String>, message: impl Into<String>) -> u64 {
         let mut state = self.state.lock().unwrap();
         let sequence = state.next_sequence;
@@ -56,6 +72,8 @@ impl LogRing {
         sequence
     }
 
+    /// Changes retention capacity, clamping zero to one and evicting excess
+    /// oldest records immediately.
     pub fn set_capacity(&self, capacity: usize) {
         let mut state = self.state.lock().unwrap();
         state.capacity = capacity.max(1);
@@ -64,6 +82,8 @@ impl LogRing {
         }
     }
 
+    /// Returns records newer than `cursor` up to `limit` and the cursor of the
+    /// last returned record; stale cursors fail with `CursorExpired`.
     pub fn pull(&self, cursor: u64, limit: usize) -> Result<(Vec<LogRecord>, u64), LogError> {
         let state = self.state.lock().unwrap();
         if let Some(oldest) = state.records.front().map(|record| record.sequence) {

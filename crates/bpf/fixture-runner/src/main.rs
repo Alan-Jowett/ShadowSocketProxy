@@ -1,13 +1,17 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 ShadowSocketProxy contributors
+//! Loads the TC BPF ELF and executes deterministic packet/map fixtures through
+//! Aya's test-run API.
 
 #[cfg(not(target_os = "linux"))]
+/// Reports unsupported-platform status when the runner is built off Linux.
 fn main() -> std::process::ExitCode {
     eprintln!("ssp-bpf-fixture-runner is only supported on Linux");
     std::process::ExitCode::FAILURE
 }
 
 #[cfg(target_os = "linux")]
+/// Linux fixture implementation; it requires Aya, libc memlock, and BPF test-run.
 mod linux {
     use aya::{
         maps::{Array, HashMap, MapData, MapError},
@@ -22,76 +26,137 @@ mod linux {
         process::ExitCode,
     };
 
+    /// Map key/value ABI version expected by the fixture encoders.
     const MAP_ABI_VERSION: u16 = 1;
+    /// Runtime-config schema version seeded into the BPF map.
     const RUNTIME_CONFIG_ABI_VERSION: u16 = 3;
+    /// Encoded lifecycle value for an active flow.
     const FLOW_ACTIVE: u8 = 2;
+    /// TCP protocol number used in fixture tuples.
     const PROTOCOL_TCP: u8 = 6;
+    /// UDP protocol number used in fixture tuples.
     const PROTOCOL_UDP: u8 = 17;
+    /// Flow-state protocol bit for TCP.
     const PROTOCOL_FLAG_TCP: u32 = 1;
+    /// Flow-state protocol bit for UDP.
     const PROTOCOL_FLAG_UDP: u32 = 2;
+    /// State bit set after observing a client SYN.
     const TCP_SYN_BIT: u32 = 1 << 0;
+    /// State bit set after observing a server SYN/ACK.
     const TCP_SYN_ACK_BIT: u32 = 1 << 1;
+    /// State bit set after FIN acknowledgement.
     const TCP_ACK_BIT: u32 = 1 << 2;
+    /// State bit set after observing FIN.
     const TCP_FIN_BIT: u32 = 1 << 3;
+    /// Wire TCP FIN flag.
     const TCP_FLAG_FIN: u8 = 0x01;
+    /// Wire TCP SYN flag.
     const TCP_FLAG_SYN: u8 = 0x02;
+    /// Wire TCP RST flag.
     const TCP_FLAG_RST: u8 = 0x04;
+    /// Wire TCP ACK flag.
     const TCP_FLAG_ACK: u8 = 0x10;
+    /// Ethernet header length expected by the packet builders.
     const ETH_HEADER_LEN: usize = 14;
+    /// Fixed IPv4 header length emitted by the fixtures.
     const IPV4_HEADER_LEN: usize = 20;
+    /// Fixed IPv6 header length emitted by the fixtures.
     const IPV6_HEADER_LEN: usize = 40;
+    /// Minimum TCP header length emitted by the fixtures.
     const TCP_HEADER_LEN: usize = 20;
+    /// UDP header length emitted by the fixtures.
     const UDP_HEADER_LEN: usize = 8;
+    /// Idle TTL seeded into the runtime configuration fixture.
     const DEFAULT_IDLE_TTL_NS: u64 = 60 * 1_000 * 1_000 * 1_000;
+    /// TCP terminal grace seeded into the runtime configuration fixture.
     const DEFAULT_TERMINAL_GRACE_NS: u64 = 30 * 1_000 * 1_000 * 1_000;
+    /// Active-flow capacity seeded into the runtime configuration fixture.
     const DEFAULT_ACTIVE_FLOW_CAPACITY: u32 = 128;
+    /// Control listener port excluded by the control-bypass fixture.
     const LISTENER_PORT: u16 = 50051;
+    /// IPv4 packet-rewrite target port.
     const TARGET_PORT_V4: u16 = 8443;
+    /// IPv6 packet-rewrite target port.
     const TARGET_PORT_V6: u16 = 5353;
+    /// Counter index for packets with no family target.
     const COUNTER_TARGET_MISS: u32 = 0;
+    /// Counter index for flow allocation failures.
     const COUNTER_FLOW_INSERT_FAILURE: u32 = 1;
+    /// Counter index for control-listener bypasses.
     const COUNTER_CONTROL_BYPASS: u32 = 2;
+    /// Ethernet type for IPv4.
     const ETH_P_IP: u16 = 0x0800;
+    /// Ethernet type for IPv6.
     const ETH_P_IPV6: u16 = 0x86dd;
+    /// Expected classifier return value for pass-through packets.
     const TC_ACT_OK: u32 = 0;
+    /// Upper bound used when validating fixture selection.
     const MAX_FIXTURES: usize = 64;
+    /// ELF program name for ingress rewriting.
     const INGRESS_PROGRAM_NAME: &str = "ssp_tc_ingress_v3";
+    /// ELF program name for egress restoration.
     const EGRESS_PROGRAM_NAME: &str = "ssp_tc_egress_v3";
+    /// ELF map containing tuple-to-flow indexes.
     const FLOW_INDEX_MAP_NAME: &str = "ssp_flow_index_v1";
+    /// ELF map containing native flow state.
     const FLOW_STATE_MAP_NAME: &str = "ssp_flow_state_v1";
+    /// ELF map containing runtime targets and timeouts.
     const RUNTIME_CONFIG_MAP_NAME: &str = "ssp_runtime_config_v3";
+    /// ELF map containing packet-path counters.
     const COUNTERS_MAP_NAME: &str = "ssp_tc_counters_v1";
+    /// ELF map tracking active-flow slot usage.
     const ACTIVE_FLOWS_MAP_NAME: &str = "ssp_tc_active_flows_v1";
 
+    /// Maximum packet bytes stored by a fixture buffer.
     const PACKET_CAPACITY: usize = 256;
+    /// Encoded tuple-key length.
     const TUPLE_KEY_LEN: usize = 40;
+    /// Encoded tuple-index value length.
     const FLOW_INDEX_VALUE_LEN: usize = 16;
+    /// Encoded flow-state key length.
     const FLOW_STATE_KEY_LEN: usize = 16;
+    /// Encoded flow-state value length.
     const FLOW_STATE_VALUE_LEN: usize = 256;
+    /// Encoded runtime-config value length.
     const RUNTIME_CONFIG_VALUE_LEN: usize = 80;
+    /// Native counter word size used by the fixture maps.
     const WORD_LEN: usize = 8;
 
+    /// Fixture operations return unit on failure after printing diagnostics.
     type RunnerResult<T = ()> = Result<T, ()>;
+    /// Fixed-width encoded tuple key passed to Aya maps.
     type TupleKey = [u8; TUPLE_KEY_LEN];
+    /// Fixed-width tuple-index value passed to Aya maps.
     type FlowIndexValue = [u8; FLOW_INDEX_VALUE_LEN];
+    /// Fixed-width native flow-state key passed to Aya maps.
     type FlowStateKey = [u8; FLOW_STATE_KEY_LEN];
+    /// Fixed-width native flow-state value passed to Aya maps.
     type FlowStateValue = [u8; FLOW_STATE_VALUE_LEN];
+    /// Fixed-width runtime configuration value passed to Aya maps.
     type RuntimeConfigValue = [u8; RUNTIME_CONFIG_VALUE_LEN];
+    /// Fixed-width native-endian counter slot.
     type CounterWord = [u8; WORD_LEN];
 
     #[derive(Clone, Copy)]
+    /// Address family and its 16-byte ABI representation.
     struct IpAddrBytes {
+        /// ABI family discriminator, 4 or 6.
         family: u8,
+        /// IPv4-mapped or native IPv6 bytes.
         bytes: [u8; 16],
     }
 
     #[derive(Clone)]
+    /// Zero-filled packet storage with an explicit valid prefix length.
     struct PacketBuffer {
+        /// Backing storage supplied to Aya test runs.
         bytes: [u8; PACKET_CAPACITY],
+        /// Number of initialized bytes in `bytes`.
         len: usize,
     }
 
     impl Default for PacketBuffer {
+        /// Creates an empty zero-filled packet buffer.
         fn default() -> Self {
             Self {
                 bytes: [0; PACKET_CAPACITY],
@@ -101,20 +166,27 @@ mod linux {
     }
 
     impl PacketBuffer {
+        /// Borrows only the initialized packet prefix.
         fn as_slice(&self) -> &[u8] {
             &self.bytes[..self.len]
         }
     }
 
+    /// Loaded BPF object retained while a fixture executes.
     struct BpfFixture {
+        /// Aya object containing programs and seeded maps.
         bpf: Ebpf,
     }
 
+    /// Named command-line fixture and its runner function.
     struct FixtureDef {
+        /// Stable fixture selector shown in usage and diagnostics.
         name: &'static str,
+        /// Function that runs the fixture against an ELF path.
         run: fn(&Path) -> RunnerResult,
     }
 
+    /// Registry of packet rewrite, lifecycle, bypass, and failure fixtures.
     static FIXTURES: &[FixtureDef] = &[
         FixtureDef {
             name: "target-miss",
@@ -146,6 +218,8 @@ mod linux {
         },
     ];
 
+    /// Parses fixture selection, configures memlock, runs requested fixtures,
+    /// and returns a shell-friendly exit code.
     pub fn main() -> ExitCode {
         let args: Vec<_> = std::env::args_os().collect();
         if args.len() < 4 {
@@ -199,6 +273,7 @@ mod linux {
     }
 
     impl BpfFixture {
+        /// Loads the ELF and retains its programs/maps for one fixture run.
         fn open(elf_path: &Path) -> RunnerResult<Self> {
             let mut bpf = match Ebpf::load_file(elf_path) {
                 Ok(bpf) => bpf,
@@ -227,6 +302,7 @@ mod linux {
             Ok(Self { bpf })
         }
 
+        /// Loads and verifies one TC classifier by its ELF program name.
         fn load_program(bpf: &mut Ebpf, elf_path: &Path, program_name: &str) -> RunnerResult {
             let program = match bpf.program_mut(program_name) {
                 Some(program) => program,
@@ -259,6 +335,7 @@ mod linux {
             Ok(())
         }
 
+        /// Initializes runtime config and clears fixture-observed map state.
         fn seed_maps(&mut self, config: &RuntimeConfigValue) -> RunnerResult {
             self.with_runtime_map(|map| {
                 map.set(0, *config, 0).map_err(|error| {
@@ -286,6 +363,7 @@ mod linux {
             })
         }
 
+        /// Executes a classifier against one packet and returns its TC action.
         fn run_program(
             &mut self,
             label: &str,
@@ -336,6 +414,7 @@ mod linux {
             require_packet_equal(label, expected, &output[..result.data_size_out as usize])
         }
 
+        /// Reads one native-endian counter slot from the counters map.
         fn read_counter(&mut self, slot: u32) -> RunnerResult<u64> {
             self.with_counters_map(|map| {
                 map.get(&slot, 0).map(u64::from_le_bytes).map_err(|error| {
@@ -344,6 +423,7 @@ mod linux {
             })
         }
 
+        /// Reads the active-flow slot counter used by capacity assertions.
         fn read_active_flows(&mut self) -> RunnerResult<u64> {
             self.with_active_flows_map(|map| {
                 map.get(&0, 0).map(u64::from_le_bytes).map_err(|error| {
@@ -352,20 +432,24 @@ mod linux {
             })
         }
 
+        /// Counts tuple indexes currently owned by the flow-index map.
         fn count_flow_index_entries(&mut self) -> RunnerResult<usize> {
             self.with_flow_index_map(count_hash_entries)
         }
 
+        /// Counts native flow-state records currently stored in the state map.
         fn count_flow_state_entries(&mut self) -> RunnerResult<usize> {
             self.with_flow_state_map(count_hash_entries)
         }
 
+        /// Looks up a tuple index and decodes its flow id/generation bytes.
         fn lookup_flow_index(&mut self, key: &TupleKey) -> RunnerResult<Option<FlowIndexValue>> {
             self.with_flow_index_map(|map| {
                 optional_lookup(map, key, "failed to read flow index entry")
             })
         }
 
+        /// Looks up a native flow-state value by id and generation.
         fn lookup_flow_state(
             &mut self,
             key: &FlowStateKey,
@@ -375,6 +459,7 @@ mod linux {
             })
         }
 
+        /// Borrows the flow-index map for one fallible closure.
         fn with_flow_index_map<T>(
             &mut self,
             operation: impl FnOnce(
@@ -394,6 +479,7 @@ mod linux {
             operation(&mut map)
         }
 
+        /// Borrows the flow-state map for one fallible closure.
         fn with_flow_state_map<T>(
             &mut self,
             operation: impl FnOnce(
@@ -413,6 +499,7 @@ mod linux {
             operation(&mut map)
         }
 
+        /// Borrows the runtime-config map for one fallible closure.
         fn with_runtime_map<T>(
             &mut self,
             operation: impl FnOnce(&mut Array<&mut MapData, RuntimeConfigValue>) -> RunnerResult<T>,
@@ -430,6 +517,7 @@ mod linux {
             operation(&mut map)
         }
 
+        /// Borrows the counters map for one fallible closure.
         fn with_counters_map<T>(
             &mut self,
             operation: impl FnOnce(&mut Array<&mut MapData, CounterWord>) -> RunnerResult<T>,
@@ -447,6 +535,7 @@ mod linux {
             operation(&mut map)
         }
 
+        /// Borrows the active-flow array for one fallible closure.
         fn with_active_flows_map<T>(
             &mut self,
             operation: impl FnOnce(&mut Array<&mut MapData, CounterWord>) -> RunnerResult<T>,
@@ -465,6 +554,7 @@ mod linux {
         }
     }
 
+    /// Returns a map value when present and converts missing values to `None`.
     fn optional_lookup<K, V>(
         map: &mut HashMap<&mut MapData, K, V>,
         key: &K,
@@ -484,6 +574,7 @@ mod linux {
         }
     }
 
+    /// Counts entries in a hash map without mutating it.
     fn count_hash_entries<K, V>(map: &mut HashMap<&mut MapData, K, V>) -> RunnerResult<usize>
     where
         K: aya::Pod,
@@ -499,6 +590,7 @@ mod linux {
         Ok(count)
     }
 
+    /// Prints command usage and the registered fixture names.
     fn usage(argv0: Option<&OsStr>) {
         let program = argv0
             .map(|value| value.to_string_lossy())
@@ -509,6 +601,7 @@ mod linux {
         );
     }
 
+    /// Raises RLIMIT_MEMLOCK so the kernel can load the fixture maps.
     fn set_memlock_limit() -> RunnerResult {
         let limit = rlimit {
             rlim_cur: RLIM_INFINITY,
@@ -525,6 +618,7 @@ mod linux {
         Ok(())
     }
 
+    /// Parses an IPv4/IPv6 literal into the fixture ABI representation.
     fn parse_ip(text: &str) -> RunnerResult<IpAddrBytes> {
         let mut bytes = [0u8; 16];
         if let Ok(address) = text.parse::<Ipv4Addr>() {
@@ -539,6 +633,7 @@ mod linux {
         Err(())
     }
 
+    /// Produces the 16-byte IPv4-mapped or native IPv6 representation.
     fn mapped_ip_bytes(address: &IpAddrBytes) -> [u8; 16] {
         if address.family == 4 {
             let mut output = [0u8; 16];
@@ -551,14 +646,17 @@ mod linux {
         }
     }
 
+    /// Writes a big-endian 16-bit field into a packet buffer.
     fn write_be16(target: &mut [u8], value: u16) {
         target[..2].copy_from_slice(&value.to_be_bytes());
     }
 
+    /// Writes a big-endian 32-bit field into a packet buffer.
     fn write_be32(target: &mut [u8], value: u32) {
         target[..4].copy_from_slice(&value.to_be_bytes());
     }
 
+    /// Adds a one-complement word to a packet checksum accumulator.
     fn checksum_add(mut sum: u32, data: &[u8]) -> u32 {
         let mut chunks = data.chunks_exact(2);
         for chunk in &mut chunks {
@@ -570,6 +668,7 @@ mod linux {
         sum
     }
 
+    /// Folds a checksum accumulator and returns its network-order checksum.
     fn checksum_finish(mut sum: u32) -> u16 {
         while (sum >> 16) != 0 {
             sum = (sum & 0xffff) + (sum >> 16);
@@ -577,10 +676,12 @@ mod linux {
         !(sum as u16)
     }
 
+    /// Computes the checksum for an IPv4 header in the supplied packet.
     fn ipv4_header_checksum(header: &[u8]) -> u16 {
         checksum_finish(checksum_add(0, &header[..IPV4_HEADER_LEN]))
     }
 
+    /// Computes a TCP/UDP checksum over an IPv4 pseudo-header and payload.
     fn ipv4_transport_checksum(
         source: &IpAddrBytes,
         destination: &IpAddrBytes,
@@ -596,6 +697,7 @@ mod linux {
         checksum_finish(sum)
     }
 
+    /// Computes a TCP/UDP checksum over an IPv6 pseudo-header and payload.
     fn ipv6_transport_checksum(
         source: &IpAddrBytes,
         destination: &IpAddrBytes,
@@ -612,6 +714,7 @@ mod linux {
         checksum_finish(sum)
     }
 
+    /// Writes the fixed Ethernet header used by all packet fixtures.
     fn fill_ethernet_header(frame: &mut [u8], ether_type: u16) {
         const DESTINATION: [u8; 6] = [0x02, 0x10, 0x20, 0x30, 0x40, 0x50];
         const SOURCE: [u8; 6] = [0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee];
@@ -622,6 +725,7 @@ mod linux {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// Builds an Ethernet/IPv4/TCP packet with valid checksums and flags.
     fn build_ipv4_tcp_packet(
         packet: &mut PacketBuffer,
         source: &IpAddrBytes,
@@ -664,6 +768,7 @@ mod linux {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// Builds an Ethernet/IPv6/TCP packet with valid checksums and flags.
     fn build_ipv6_tcp_packet(
         packet: &mut PacketBuffer,
         source: &IpAddrBytes,
@@ -700,6 +805,7 @@ mod linux {
         write_be16(&mut tcp[16..18], checksum);
     }
 
+    /// Builds an Ethernet/IPv4/UDP packet with a valid checksum.
     fn build_ipv4_udp_packet(
         packet: &mut PacketBuffer,
         source: &IpAddrBytes,
@@ -740,6 +846,7 @@ mod linux {
         write_be16(&mut udp[6..8], checksum);
     }
 
+    /// Builds an Ethernet/IPv6/UDP packet with a valid checksum.
     fn build_ipv6_udp_packet(
         packet: &mut PacketBuffer,
         source: &IpAddrBytes,
@@ -775,6 +882,7 @@ mod linux {
         write_be16(&mut udp[6..8], checksum);
     }
 
+    /// Prints a compact packet dump for fixture failure diagnostics.
     fn dump_packet(label: &str, packet: &[u8]) {
         eprintln!("{label} ({} bytes):", packet.len());
         for (index, byte) in packet.iter().enumerate() {
@@ -788,6 +896,7 @@ mod linux {
         }
     }
 
+    /// Fails the fixture with a byte-level diff when packets differ.
     fn require_packet_equal(label: &str, expected: &PacketBuffer, actual: &[u8]) -> RunnerResult {
         if actual != expected.as_slice() {
             eprintln!("{label} packet mismatch");
@@ -798,6 +907,7 @@ mod linux {
         Ok(())
     }
 
+    /// Encodes a fixture tuple into the BPF tuple-index layout.
     fn make_tuple_key(
         source: &IpAddrBytes,
         destination: &IpAddrBytes,
@@ -816,6 +926,7 @@ mod linux {
         key
     }
 
+    /// Encodes a flow id/generation pair into the state-map key layout.
     fn make_flow_state_key(flow_id: u64, generation: u32) -> FlowStateKey {
         let mut key = [0u8; FLOW_STATE_KEY_LEN];
         key[0..2].copy_from_slice(&MAP_ABI_VERSION.to_be_bytes());
@@ -824,6 +935,7 @@ mod linux {
         key
     }
 
+    /// Computes the same stable tuple hash used for fixture map keys.
     fn tuple_hash(key: &TupleKey) -> u64 {
         let mut hash = 1_469_598_103_934_665_603u64;
         for byte in key {
@@ -836,6 +948,7 @@ mod linux {
         }
     }
 
+    /// Creates runtime config bytes with both family targets disabled.
     fn init_runtime_config() -> RuntimeConfigValue {
         let mut config = [0u8; RUNTIME_CONFIG_VALUE_LEN];
         config[0..2].copy_from_slice(&RUNTIME_CONFIG_ABI_VERSION.to_be_bytes());
@@ -848,30 +961,36 @@ mod linux {
         config
     }
 
+    /// Enables and writes the IPv4 target address and port fields.
     fn set_ipv4_target(config: &mut RuntimeConfigValue, address: &IpAddrBytes) {
         config[2] = 1;
         config[4..8].copy_from_slice(&address.bytes[12..16]);
         config[8..10].copy_from_slice(&TARGET_PORT_V4.to_be_bytes());
     }
 
+    /// Enables and writes the IPv6 target address and port fields.
     fn set_ipv6_target(config: &mut RuntimeConfigValue, address: &IpAddrBytes) {
         config[3] = 1;
         config[10..26].copy_from_slice(&address.bytes);
         config[26..28].copy_from_slice(&TARGET_PORT_V6.to_be_bytes());
     }
 
+    /// Reads a big-endian 16-bit field from fixture bytes.
     fn read_u16_be(bytes: &[u8], start: usize) -> u16 {
         u16::from_be_bytes(bytes[start..start + 2].try_into().unwrap())
     }
 
+    /// Reads a native-endian 32-bit field from fixture bytes.
     fn read_u32_ne(bytes: &[u8], start: usize) -> u32 {
         u32::from_ne_bytes(bytes[start..start + 4].try_into().unwrap())
     }
 
+    /// Reads a native-endian 64-bit field from fixture bytes.
     fn read_u64_ne(bytes: &[u8], start: usize) -> u64 {
         u64::from_ne_bytes(bytes[start..start + 8].try_into().unwrap())
     }
 
+    /// Asserts an observed counter/value equals the expected number.
     fn expect_equal_u64(label: &str, actual: u64, expected: u64) -> RunnerResult {
         if actual != expected {
             eprintln!("{label} mismatch: expected {expected}, got {actual}");
@@ -880,6 +999,7 @@ mod linux {
         Ok(())
     }
 
+    /// Asserts a fixture predicate and prints a diagnostic on failure.
     fn expect_true(label: &str, condition: bool) -> RunnerResult {
         if !condition {
             eprintln!("{label} failed");
@@ -888,6 +1008,7 @@ mod linux {
         Ok(())
     }
 
+    /// Asserts that encoded tuple fields match the expected tuple.
     fn expect_tuple_equal(label: &str, actual: &TupleKey, expected: &TupleKey) -> RunnerResult {
         if actual != expected {
             eprintln!("{label} tuple mismatch");
@@ -896,6 +1017,7 @@ mod linux {
         Ok(())
     }
 
+    /// Asserts that a tuple index points at the expected flow generation.
     fn expect_index_owner(
         label: &str,
         index_value: &FlowIndexValue,
@@ -917,10 +1039,12 @@ mod linux {
         Ok(())
     }
 
+    /// Extracts one encoded tuple from a native flow-state value.
     fn flow_state_tuple(value: &FlowStateValue, start: usize) -> TupleKey {
         value[start..start + TUPLE_KEY_LEN].try_into().unwrap()
     }
 
+    /// Verifies that all packet counters and flow counts start at zero.
     fn assert_zero_counts(fixture: &mut BpfFixture) -> RunnerResult {
         expect_equal_u64(
             "flow-index count",
@@ -935,6 +1059,7 @@ mod linux {
         expect_equal_u64("active-flow count", fixture.read_active_flows()?, 0)
     }
 
+    /// Verifies the three packet counters after a fixture action.
     fn assert_counter_values(
         fixture: &mut BpfFixture,
         target_misses: u64,
@@ -958,12 +1083,14 @@ mod linux {
         )
     }
 
+    /// Loads an ELF and seeds its maps for one isolated fixture.
     fn create_fixture(elf_path: &Path, config: &RuntimeConfigValue) -> RunnerResult<BpfFixture> {
         let mut fixture = BpfFixture::open(elf_path)?;
         fixture.seed_maps(config)?;
         Ok(fixture)
     }
 
+    /// Verifies missing family targets pass through and increment target-miss.
     fn run_target_miss_fixture(elf_path: &Path) -> RunnerResult {
         let mut config = init_runtime_config();
         let ipv4_target = parse_ip("192.0.2.200")?;
@@ -988,6 +1115,7 @@ mod linux {
         assert_zero_counts(&mut fixture)
     }
 
+    /// Verifies the first eligible packet creates flow state and indexes.
     fn run_flow_create_fixture(elf_path: &Path) -> RunnerResult {
         let mut config = init_runtime_config();
         let client = parse_ip("192.0.2.10")?;
@@ -1100,6 +1228,7 @@ mod linux {
         )
     }
 
+    /// Verifies ingress destination/port rewriting and checksum updates.
     fn run_forward_rewrite_fixture(elf_path: &Path) -> RunnerResult {
         const PAYLOAD: &[u8] = b"SSP6";
 
@@ -1180,6 +1309,7 @@ mod linux {
         expect_equal_u64("udp terminal deadline", read_u64_ne(&state_value, 140), 0)
     }
 
+    /// Verifies egress reverse lookup restores the original destination tuple.
     fn run_reverse_rewrite_fixture(elf_path: &Path) -> RunnerResult {
         let mut config = init_runtime_config();
         let client = parse_ip("192.0.2.10")?;
@@ -1265,6 +1395,7 @@ mod linux {
         )
     }
 
+    /// Verifies packets to the control listener bypass flow rewriting.
     fn run_control_bypass_fixture(elf_path: &Path) -> RunnerResult {
         const PAYLOAD: &[u8] = b"SSP4";
 
@@ -1334,6 +1465,7 @@ mod linux {
         expect_equal_u64("udp active-flow count", fixture.read_active_flows()?, 1)
     }
 
+    /// Verifies both FIN/ACK directions schedule terminal flow cleanup.
     fn run_fin_ack_teardown_fixture(elf_path: &Path) -> RunnerResult {
         let mut config = init_runtime_config();
         let client = parse_ip("192.0.2.10")?;
@@ -1502,6 +1634,7 @@ mod linux {
         )
     }
 
+    /// Verifies a TCP RST marks the flow removable immediately.
     fn run_rst_fixture(elf_path: &Path) -> RunnerResult {
         let mut config = init_runtime_config();
         let client = parse_ip("192.0.2.10")?;
@@ -1572,12 +1705,14 @@ mod linux {
         assert_zero_counts(&mut fixture)
     }
 
+    /// Resolves a stable fixture name from the registry.
     fn find_fixture(name: &str) -> Option<&'static FixtureDef> {
         FIXTURES.iter().find(|fixture| fixture.name == name)
     }
 }
 
 #[cfg(target_os = "linux")]
+/// Selects and executes the Linux fixture runner, returning its exit status.
 fn main() -> std::process::ExitCode {
     linux::main()
 }
