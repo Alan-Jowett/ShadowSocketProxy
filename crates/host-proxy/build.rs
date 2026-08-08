@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 ShadowSocketProxy contributors
+//! Generates the tonic client bindings used by the host proxy.
 
+/// Compiles the control protobuf with client bindings and requests reruns when
+/// the protocol definition changes.
 fn main() {
     let protoc = protoc_bin_vendored::protoc_bin_path().expect("protoc is available");
     std::env::set_var("PROTOC", protoc);

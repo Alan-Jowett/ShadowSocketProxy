@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 ShadowSocketProxy contributors
+//! Starts the control runtime, serves gRPC, and detaches BPF state on exit.
 
 use shadow_socket_proxy_control::{bpf::LinuxBpfBackend, lifecycle::ServiceRuntime};
 use std::net::SocketAddr;
 
 #[tokio::main]
+/// Builds the Linux backend, starts the runtime, and returns a process status
+/// after serving or reporting a startup/runtime error.
 async fn main() {
     let address = std::env::var("SSP_LISTEN_ADDR")
         .unwrap_or_else(|_| "0.0.0.0:50051".into())

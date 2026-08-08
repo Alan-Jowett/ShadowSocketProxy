@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 ShadowSocketProxy contributors
+//! Abstracts Linux TC/BPF attachment and map operations behind a testable
+//! backend, with an in-memory implementation for service and cleanup tests.
 
 use std::{
     collections::BTreeMap,
@@ -21,63 +23,94 @@ use crate::mapping::{
 };
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
+/// Errors returned while loading, attaching, reading, or cleaning BPF state.
 pub enum BackendError {
     #[error("ELF path does not exist: {0}")]
+    /// The requested BPF ELF path does not exist.
     MissingElf(PathBuf),
     #[error("invalid interface name: {0}")]
+    /// An interface name is empty or exceeds the kernel's 15-byte limit.
     InvalidInterface(String),
     #[error("backend failure at {location}: {message}")]
+    /// An operation failed at a named backend location.
     Operation { location: String, message: String },
     #[error("backend does not support Linux TC operations")]
+    /// The selected platform or adapter cannot perform the requested operation.
     Unsupported,
     #[error("no ELF has been loaded")]
+    /// No BPF object is currently loaded or attached.
     NotAttached,
     #[error("ABI version {0} is not supported")]
+    /// The loaded object exposes an ABI version this service cannot use.
     AbiMismatch(u16),
     #[error("active-flow capacity is exhausted")]
+    /// The active-flow map cannot reserve another flow slot.
     FlowCapacity,
     #[error("partial flow cleanup: {0}")]
+    /// Cleanup removed some indexes or state but could not remove all of it.
     PartialCleanup(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// One ingress or egress TC attachment owned by the backend.
 pub struct Attachment {
+    /// Linux interface carrying the classifier.
     pub interface: String,
+    /// Hook direction at which the classifier is attached.
     pub direction: Direction,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+/// TC hook direction used by the two packet-rewrite programs.
 pub enum Direction {
+    /// Packets entering the host interface.
     Ingress,
+    /// Packets leaving the host interface.
     Egress,
 }
 
 #[derive(Debug, Clone, Default)]
+/// Attach result including existing/new links and actual map capacities.
 pub struct AttachReport {
+    /// All requested attachments after the operation.
     pub attachments: Vec<Attachment>,
+    /// Links created by this operation and safe to roll back.
     pub created: Vec<Attachment>,
+    /// Maximum entries reported by the loaded BPF maps.
     pub maxima: MapMaxima,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// Outcome of deleting one flow state and its tuple indexes.
 pub struct FlowCleanupReport {
+    /// True when the flow-state record was removed.
     pub state_deleted: bool,
+    /// Number of tuple indexes removed for the flow id/generation.
     pub indexes_deleted: usize,
+    /// True when backend cleanup detected an incomplete removal.
     pub partial: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// Packet-path counters exported by the BPF program.
 pub struct BpfCounters {
+    /// Packets for which no configured family target existed.
     pub target_misses: u64,
+    /// Attempts to create flow state that failed due to capacity or map errors.
     pub flow_insert_failures: u64,
+    /// Packets bypassed because they targeted the control listener.
     pub control_bypasses: u64,
 }
 
 #[async_trait]
+/// Backend contract used by the control service and maintenance worker.
 pub trait BpfBackend: Send + Sync {
+    /// Loads `elf`, attaches both classifier directions, and reports map maxima.
     async fn attach(&self, elf: &Path, interfaces: &[String])
         -> Result<AttachReport, BackendError>;
+    /// Removes all owned links, or only links on the selected interfaces.
     async fn detach(&self, interfaces: Option<&[String]>) -> Result<(), BackendError>;
+    /// Removes links created by a failed attach transaction.
     async fn rollback_attach(&self, attachments: &[Attachment]) -> Result<(), BackendError> {
         let interfaces = attachments
             .iter()
@@ -90,12 +123,17 @@ pub trait BpfBackend: Send + Sync {
         })
         .await
     }
+    /// Lists legacy map key/value pairs as owned byte buffers.
     async fn list_entries(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, BackendError>;
+    /// Reads one legacy mapping by its encoded synthetic tuple key.
     async fn get_entry(&self, key: &[u8]) -> Result<Option<Vec<u8>>, BackendError>;
+    /// Deletes a legacy entry and reports whether it existed.
     async fn delete_entry(&self, key: &[u8]) -> Result<bool, BackendError>;
+    /// Lists native flow-state records when the backend supports the v3 ABI.
     async fn list_flow_states(&self) -> Result<Vec<FlowState>, BackendError> {
         Err(BackendError::Unsupported)
     }
+    /// Deletes one flow state and all indexes matching its id and generation.
     async fn delete_flow(
         &self,
         _flow_id: u64,
@@ -103,37 +141,54 @@ pub trait BpfBackend: Send + Sync {
     ) -> Result<FlowCleanupReport, BackendError> {
         Err(BackendError::Unsupported)
     }
+    /// Writes validated runtime settings to the BPF configuration map.
     async fn set_runtime_config(&self, _config: &RuntimeConfig) -> Result<(), BackendError> {
         Err(BackendError::Unsupported)
     }
+    /// Reads packet-path counters, if exported by the loaded object.
     async fn read_counters(&self) -> Result<BpfCounters, BackendError> {
         Err(BackendError::Unsupported)
     }
+    /// Returns usable map capacities; the default is the compiled ELF maxima.
     fn map_maxima(&self) -> MapMaxima {
         MapMaxima::default()
     }
+    /// Returns a snapshot of links currently owned by the backend.
     fn attachments(&self) -> Vec<Attachment>;
 }
 
 #[derive(Default)]
+/// Mutable backing state for the deterministic in-memory backend.
 struct MemoryState {
+    /// Legacy encoded mapping entries.
     entries: BTreeMap<Vec<u8>, Vec<u8>>,
+    /// Native flow-state records keyed by id and generation.
     flow_states: BTreeMap<(u64, u32), FlowState>,
+    /// Tuple indexes pointing at native flow states.
     flow_indexes: BTreeMap<Vec<u8>, FlowIndexValue>,
+    /// Enables the native flow-state cleanup path when true.
     flow_mode: bool,
+    /// Capacities returned to configuration validation.
     maxima: MapMaxima,
+    /// Simulated TC links.
     attachments: Vec<Attachment>,
+    /// Optional location at which attach should fail and roll back.
     fail_attach: Option<String>,
+    /// Optional encoded key that should make deletion fail.
     fail_delete: Option<Vec<u8>>,
+    /// Injected failure for legacy map scans.
     fail_list: bool,
 }
 
 #[derive(Clone, Default)]
+/// Thread-safe backend that models map/link behavior without Linux privileges.
 pub struct InMemoryBackend {
+    /// Shared simulated maps, links, capacities, and failure injections.
     state: Arc<Mutex<MemoryState>>,
 }
 
 impl InMemoryBackend {
+    /// Inserts a legacy mapping under its synthetic tuple key.
     pub fn insert_mapping(&self, mapping: Mapping) {
         let mut state = self.state.lock().unwrap();
         state.entries.insert(
@@ -142,22 +197,27 @@ impl InMemoryBackend {
         );
     }
 
+    /// Configures an attach location that should fail transactionally.
     pub fn set_attach_failure(&self, location: Option<String>) {
         self.state.lock().unwrap().fail_attach = location;
     }
 
+    /// Configures a key whose deletion should return a backend error.
     pub fn set_delete_failure(&self, key: Option<Vec<u8>>) {
         self.state.lock().unwrap().fail_delete = key;
     }
 
+    /// Enables or disables injected list-scan failure.
     pub fn set_list_failure(&self, failure: bool) {
         self.state.lock().unwrap().fail_list = failure;
     }
 
+    /// Sets capacities reported to runtime configuration validation.
     pub fn set_map_maxima(&self, maxima: MapMaxima) {
         self.state.lock().unwrap().maxima = maxima;
     }
 
+    /// Inserts a native flow and all three tuple indexes used by cleanup.
     pub fn insert_flow_state(&self, state: FlowState) {
         let mut memory = self.state.lock().unwrap();
         memory.flow_mode = true;
@@ -190,6 +250,8 @@ impl InMemoryBackend {
 
 #[async_trait]
 impl BpfBackend for InMemoryBackend {
+    /// Validates interfaces, preserves existing links, and rolls back all
+    /// changes if an injected link failure occurs.
     async fn attach(
         &self,
         _elf: &Path,
@@ -245,6 +307,7 @@ impl BpfBackend for InMemoryBackend {
         })
     }
 
+    /// Removes every simulated link, or links whose interface is selected.
     async fn detach(&self, interfaces: Option<&[String]>) -> Result<(), BackendError> {
         let mut state = self.state.lock().unwrap();
         state.attachments.retain(|attachment| {
@@ -255,6 +318,7 @@ impl BpfBackend for InMemoryBackend {
         Ok(())
     }
 
+    /// Removes exactly the links supplied by an attach report.
     async fn rollback_attach(&self, attachments: &[Attachment]) -> Result<(), BackendError> {
         let mut state = self.state.lock().unwrap();
         for attachment in attachments {
@@ -263,6 +327,7 @@ impl BpfBackend for InMemoryBackend {
         Ok(())
     }
 
+    /// Returns legacy entries plus native flows projected into legacy shape.
     async fn list_entries(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, BackendError> {
         let state = self.state.lock().unwrap();
         if state.fail_list {
@@ -286,6 +351,7 @@ impl BpfBackend for InMemoryBackend {
         Ok(entries)
     }
 
+    /// Reads a legacy entry or projects the flow referenced by a tuple index.
     async fn get_entry(&self, key: &[u8]) -> Result<Option<Vec<u8>>, BackendError> {
         let state = self.state.lock().unwrap();
         if let Some(value) = state.entries.get(key) {
@@ -300,6 +366,7 @@ impl BpfBackend for InMemoryBackend {
             .map(|flow| encode_value(&flow.mapping()).to_vec()))
     }
 
+    /// Deletes a legacy entry or the native flow referenced by its index.
     async fn delete_entry(&self, key: &[u8]) -> Result<bool, BackendError> {
         let mut state = self.state.lock().unwrap();
         if state.fail_delete.as_deref() == Some(key) {
@@ -322,6 +389,7 @@ impl BpfBackend for InMemoryBackend {
             .is_some())
     }
 
+    /// Returns native states only after flow mode has been enabled.
     async fn list_flow_states(&self) -> Result<Vec<FlowState>, BackendError> {
         let state = self.state.lock().unwrap();
         if !state.flow_mode {
@@ -330,6 +398,7 @@ impl BpfBackend for InMemoryBackend {
         Ok(state.flow_states.values().cloned().collect())
     }
 
+    /// Deletes the flow and every index carrying the same id/generation.
     async fn delete_flow(
         &self,
         flow_id: u64,
@@ -352,30 +421,42 @@ impl BpfBackend for InMemoryBackend {
         })
     }
 
+    /// Accepts runtime configuration without side effects in memory.
     async fn set_runtime_config(&self, _config: &RuntimeConfig) -> Result<(), BackendError> {
         Ok(())
     }
 
+    /// Returns the currently configured simulated map capacities.
     fn map_maxima(&self) -> MapMaxima {
         self.state.lock().unwrap().maxima
     }
 
+    /// Clones the current simulated attachment list.
     fn attachments(&self) -> Vec<Attachment> {
         self.state.lock().unwrap().attachments.clone()
     }
 }
 
 #[async_trait]
+/// Low-level adapter used by the Linux Aya backend to load and manipulate TC.
 pub trait LinuxTcAdapter: Send + Sync {
+    /// Loads an ELF and verifies its ABI version before attachment.
     async fn load_elf(&self, elf: &Path, abi_version: u16) -> Result<(), BackendError>;
+    /// Attaches one classifier at the requested interface and direction.
     async fn attach(&self, interface: &str, direction: Direction) -> Result<(), BackendError>;
+    /// Detaches one classifier link.
     async fn detach(&self, interface: &str, direction: Direction) -> Result<(), BackendError>;
+    /// Lists encoded entries from the legacy mapping map.
     async fn list_entries(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, BackendError>;
+    /// Reads one encoded entry by key.
     async fn get_entry(&self, key: &[u8]) -> Result<Option<Vec<u8>>, BackendError>;
+    /// Removes one encoded entry and reports whether it existed.
     async fn delete_entry(&self, key: &[u8]) -> Result<bool, BackendError>;
+    /// Lists native flow-state records; unsupported adapters return an error.
     async fn list_flow_states(&self) -> Result<Vec<FlowState>, BackendError> {
         Err(BackendError::Unsupported)
     }
+    /// Removes a native flow and its indexes; unsupported adapters return an error.
     async fn delete_flow(
         &self,
         _flow_id: u64,
@@ -383,12 +464,15 @@ pub trait LinuxTcAdapter: Send + Sync {
     ) -> Result<FlowCleanupReport, BackendError> {
         Err(BackendError::Unsupported)
     }
+    /// Writes runtime configuration; unsupported adapters reject it.
     async fn set_runtime_config(&self, _config: &RuntimeConfig) -> Result<(), BackendError> {
         Err(BackendError::Unsupported)
     }
+    /// Reads packet counters; unsupported adapters reject it.
     async fn read_counters(&self) -> Result<BpfCounters, BackendError> {
         Err(BackendError::Unsupported)
     }
+    /// Reports default capacities when the adapter has no runtime metadata.
     fn map_maxima(&self) -> MapMaxima {
         MapMaxima::default()
     }
@@ -396,65 +480,93 @@ pub trait LinuxTcAdapter: Send + Sync {
 
 #[cfg(not(target_os = "linux"))]
 #[derive(Default)]
+/// Non-Linux adapter placeholder whose operations all report unsupported.
 pub struct UnsupportedLinuxTcAdapter;
 
 #[cfg(not(target_os = "linux"))]
 #[async_trait]
 impl LinuxTcAdapter for UnsupportedLinuxTcAdapter {
+    /// Loads the BPF object and checks its exported ABI before use.
     async fn load_elf(&self, _elf: &Path, _abi_version: u16) -> Result<(), BackendError> {
         Err(BackendError::Unsupported)
     }
+    /// Creates one TC link for the requested interface and direction.
     async fn attach(&self, _interface: &str, _direction: Direction) -> Result<(), BackendError> {
         Err(BackendError::Unsupported)
     }
+    /// Removes one previously created TC link.
     async fn detach(&self, _interface: &str, _direction: Direction) -> Result<(), BackendError> {
         Err(BackendError::Unsupported)
     }
+    /// Enumerates encoded legacy mapping entries.
     async fn list_entries(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, BackendError> {
         Err(BackendError::Unsupported)
     }
+    /// Reads one encoded map value by key.
     async fn get_entry(&self, _key: &[u8]) -> Result<Option<Vec<u8>>, BackendError> {
         Err(BackendError::Unsupported)
     }
+    /// Deletes one encoded map value and reports whether it existed.
     async fn delete_entry(&self, _key: &[u8]) -> Result<bool, BackendError> {
         Err(BackendError::Unsupported)
     }
+    /// Reads exported packet counters from the BPF counters map.
     async fn read_counters(&self) -> Result<BpfCounters, BackendError> {
         Err(BackendError::Unsupported)
     }
 }
 
+/// Name of the v1 tuple-index map shared with the BPF object.
 pub const FLOW_INDEX_MAP_NAME_V1: &str = "ssp_flow_index_v1";
+/// Name of the v1 native flow-state map.
 pub const FLOW_STATE_MAP_NAME_V1: &str = "ssp_flow_state_v1";
+/// Name of the v3 runtime configuration map.
 pub const RUNTIME_CONFIG_MAP_NAME_V3: &str = "ssp_runtime_config_v3";
+/// Name of the v1 packet-counter map.
 pub const COUNTERS_MAP_NAME_V1: &str = "ssp_tc_counters_v1";
+/// ELF section/program name for ingress destination rewriting.
 pub const INGRESS_PROGRAM_NAME_V3: &str = "ssp_tc_ingress_v3";
+/// ELF section/program name for egress reverse-tuple restoration.
 pub const EGRESS_PROGRAM_NAME_V3: &str = "ssp_tc_egress_v3";
+/// Backward-compatible alias for the tuple-index map name.
 pub const MAP_NAME_V1: &str = FLOW_INDEX_MAP_NAME_V1;
+/// Backward-compatible alias for the current ingress program name.
 pub const INGRESS_PROGRAM_NAME_V1: &str = INGRESS_PROGRAM_NAME_V3;
+/// Backward-compatible alias for the current egress program name.
 pub const EGRESS_PROGRAM_NAME_V1: &str = EGRESS_PROGRAM_NAME_V3;
 
 #[cfg(target_os = "linux")]
+/// Aya link identifier paired with the attachment recorded for cleanup.
 struct AyaLink {
+    /// Interface and direction represented by the Aya link.
     attachment: Attachment,
+    /// Kernel link handle used to detach the classifier.
     id: aya::programs::tc::SchedClassifierLinkId,
 }
 
 #[cfg(target_os = "linux")]
+/// Loaded Aya object and all links owned by the adapter.
 struct AyaState {
+    /// Path of the loaded ELF, retained for diagnostics.
     elf: PathBuf,
+    /// Loaded programs and maps.
     bpf: aya::Ebpf,
+    /// Links to detach when the object is released.
     links: Vec<AyaLink>,
+    /// Capacities read from the loaded maps.
     maxima: MapMaxima,
 }
 
 #[cfg(target_os = "linux")]
+/// Linux Aya implementation of the TC adapter contract.
 pub struct AyaLinuxTcAdapter {
+    /// Optional loaded object; `None` means no ELF is attached.
     state: Mutex<Option<AyaState>>,
 }
 
 #[cfg(target_os = "linux")]
 impl Default for AyaLinuxTcAdapter {
+    /// Creates an adapter with no loaded object or links.
     fn default() -> Self {
         Self {
             state: Mutex::new(None),
@@ -464,6 +576,7 @@ impl Default for AyaLinuxTcAdapter {
 
 #[cfg(target_os = "linux")]
 impl AyaLinuxTcAdapter {
+    /// Wraps an arbitrary adapter failure with its logical location.
     fn operation(location: impl Into<String>, error: impl std::fmt::Display) -> BackendError {
         BackendError::Operation {
             location: location.into(),
@@ -471,10 +584,12 @@ impl AyaLinuxTcAdapter {
         }
     }
 
+    /// Associates a map API failure with the generic `map` location.
     fn map_error(error: impl std::fmt::Display) -> BackendError {
         Self::operation("map", error)
     }
 
+    /// Reads `max_entries` from a supported Aya map kind.
     fn map_max_entries(map: &mut aya::maps::Map) -> Result<usize, BackendError> {
         let info = match map {
             aya::maps::Map::HashMap(data)
@@ -492,6 +607,7 @@ impl AyaLinuxTcAdapter {
             .map(|info| info.max_entries() as usize)
     }
 
+    /// Borrows the tuple-index map for one fallible operation.
     fn with_flow_index_map<T>(
         bpf: &mut aya::Ebpf,
         operation: impl FnOnce(
@@ -509,6 +625,7 @@ impl AyaLinuxTcAdapter {
         operation(&mut map)
     }
 
+    /// Borrows the native flow-state map for one fallible operation.
     fn with_state_map<T>(
         bpf: &mut aya::Ebpf,
         operation: impl FnOnce(
@@ -526,6 +643,7 @@ impl AyaLinuxTcAdapter {
         operation(&mut map)
     }
 
+    /// Borrows the runtime configuration map for one fallible operation.
     fn with_runtime_map<T>(
         bpf: &mut aya::Ebpf,
         operation: impl FnOnce(
@@ -539,6 +657,7 @@ impl AyaLinuxTcAdapter {
         operation(&mut map)
     }
 
+    /// Borrows the packet-counter map for one fallible operation.
     fn with_counters_map<T>(
         bpf: &mut aya::Ebpf,
         operation: impl FnOnce(
@@ -556,6 +675,7 @@ impl AyaLinuxTcAdapter {
 #[cfg(target_os = "linux")]
 #[async_trait]
 impl LinuxTcAdapter for AyaLinuxTcAdapter {
+    /// Loads the ELF, validates the requested ABI, and records map capacities.
     async fn load_elf(&self, elf: &Path, abi_version: u16) -> Result<(), BackendError> {
         if abi_version != ABI_VERSION {
             return Err(BackendError::AbiMismatch(abi_version));
@@ -640,6 +760,7 @@ impl LinuxTcAdapter for AyaLinuxTcAdapter {
         Ok(())
     }
 
+    /// Attaches the named ingress or egress classifier to one interface.
     async fn attach(&self, interface: &str, direction: Direction) -> Result<(), BackendError> {
         let mut state = self.state.lock().unwrap();
         let state = state.as_mut().ok_or(BackendError::NotAttached)?;
@@ -689,6 +810,7 @@ impl LinuxTcAdapter for AyaLinuxTcAdapter {
         Ok(())
     }
 
+    /// Detaches one owned Aya link and updates adapter state.
     async fn detach(&self, interface: &str, direction: Direction) -> Result<(), BackendError> {
         let mut state = self.state.lock().unwrap();
         let state = state.as_mut().ok_or(BackendError::NotAttached)?;
@@ -742,6 +864,7 @@ impl LinuxTcAdapter for AyaLinuxTcAdapter {
         result
     }
 
+    /// Enumerates legacy tuple-index values from the loaded map.
     async fn list_entries(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, BackendError> {
         Ok(self
             .list_flow_states()
@@ -758,6 +881,7 @@ impl LinuxTcAdapter for AyaLinuxTcAdapter {
             .collect())
     }
 
+    /// Reads and returns one legacy value by encoded tuple key.
     async fn get_entry(&self, key: &[u8]) -> Result<Option<Vec<u8>>, BackendError> {
         let key: [u8; crate::mapping::KEY_LEN] = key.try_into().map_err(|_| {
             Self::operation(
@@ -800,6 +924,7 @@ impl LinuxTcAdapter for AyaLinuxTcAdapter {
         Ok(Some(encode_value(&flow.mapping()).to_vec()))
     }
 
+    /// Removes one legacy map entry and reports whether it existed.
     async fn delete_entry(&self, key: &[u8]) -> Result<bool, BackendError> {
         let key: [u8; crate::mapping::KEY_LEN] = key.try_into().map_err(|_| {
             Self::operation(
@@ -828,6 +953,7 @@ impl LinuxTcAdapter for AyaLinuxTcAdapter {
         Ok(report.state_deleted || report.indexes_deleted != 0)
     }
 
+    /// Decodes all native flow-state values for maintenance cleanup.
     async fn list_flow_states(&self) -> Result<Vec<FlowState>, BackendError> {
         let mut state = self.state.lock().unwrap();
         let state = state.as_mut().ok_or(BackendError::NotAttached)?;
@@ -842,6 +968,7 @@ impl LinuxTcAdapter for AyaLinuxTcAdapter {
         })
     }
 
+    /// Removes the state record and every matching tuple index.
     async fn delete_flow(
         &self,
         flow_id: u64,
@@ -931,6 +1058,7 @@ impl LinuxTcAdapter for AyaLinuxTcAdapter {
         })
     }
 
+    /// Encodes and writes the validated runtime settings to the BPF map.
     async fn set_runtime_config(&self, config: &RuntimeConfig) -> Result<(), BackendError> {
         let mut value = [0_u8; RUNTIME_CONFIG_VALUE_LEN];
         value[0..2].copy_from_slice(&config.schema_version.to_be_bytes());
@@ -978,6 +1106,7 @@ impl LinuxTcAdapter for AyaLinuxTcAdapter {
         })
     }
 
+    /// Reads target-miss, insertion-failure, and control-bypass counters.
     async fn read_counters(&self) -> Result<BpfCounters, BackendError> {
         let mut state = self.state.lock().unwrap();
         let state = state.as_mut().ok_or(BackendError::NotAttached)?;
@@ -993,6 +1122,7 @@ impl LinuxTcAdapter for AyaLinuxTcAdapter {
         })
     }
 
+    /// Returns capacities captured from the loaded ELF maps.
     fn map_maxima(&self) -> MapMaxima {
         self.state
             .lock()
@@ -1003,19 +1133,25 @@ impl LinuxTcAdapter for AyaLinuxTcAdapter {
     }
 }
 
+/// Production backend coordinating Aya links, map access, and attach rollback.
 pub struct LinuxBpfBackend {
+    /// Low-level adapter used for all kernel-facing operations.
     adapter: Arc<dyn LinuxTcAdapter>,
+    /// Links currently owned by this backend.
     attachments: Arc<Mutex<Vec<Attachment>>>,
+    /// Serializes attach/detach and map mutations that must be atomic.
     operation_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl Default for LinuxBpfBackend {
+    /// Creates a backend with the default Linux adapter and no links.
     fn default() -> Self {
         Self::new()
     }
 }
 
 impl LinuxBpfBackend {
+    /// Creates a backend using the supplied ELF adapter.
     pub fn new() -> Self {
         #[cfg(target_os = "linux")]
         {
@@ -1027,6 +1163,7 @@ impl LinuxBpfBackend {
         }
     }
 
+    /// Constructs a backend around a caller-provided adapter.
     pub fn with_adapter(adapter: Arc<dyn LinuxTcAdapter>) -> Self {
         Self {
             adapter,
@@ -1038,6 +1175,8 @@ impl LinuxBpfBackend {
 
 #[async_trait]
 impl BpfBackend for LinuxBpfBackend {
+    /// Loads once, attaches ingress and egress per interface, and rolls back
+    /// links created by a failed multi-interface operation.
     async fn attach(
         &self,
         elf: &Path,
@@ -1104,6 +1243,7 @@ impl BpfBackend for LinuxBpfBackend {
         })
     }
 
+    /// Detaches selected or all owned links and preserves failure details.
     async fn detach(&self, interfaces: Option<&[String]>) -> Result<(), BackendError> {
         let _operation_guard = self.operation_lock.lock().await;
         let owned = self.attachments();
@@ -1144,6 +1284,7 @@ impl BpfBackend for LinuxBpfBackend {
         Ok(())
     }
 
+    /// Rolls back only links created by the corresponding attach report.
     async fn rollback_attach(&self, attachments: &[Attachment]) -> Result<(), BackendError> {
         let _operation_guard = self.operation_lock.lock().await;
         let mut failures = Vec::new();
@@ -1175,22 +1316,27 @@ impl BpfBackend for LinuxBpfBackend {
         }
     }
 
+    /// Returns all legacy mapping entries from the loaded object.
     async fn list_entries(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, BackendError> {
         self.adapter.list_entries().await
     }
 
+    /// Reads one legacy mapping entry from the loaded object.
     async fn get_entry(&self, key: &[u8]) -> Result<Option<Vec<u8>>, BackendError> {
         self.adapter.get_entry(key).await
     }
 
+    /// Deletes one legacy mapping entry from the loaded object.
     async fn delete_entry(&self, key: &[u8]) -> Result<bool, BackendError> {
         self.adapter.delete_entry(key).await
     }
 
+    /// Returns decoded native flow states when supported by the adapter.
     async fn list_flow_states(&self) -> Result<Vec<FlowState>, BackendError> {
         self.adapter.list_flow_states().await
     }
 
+    /// Deletes a native flow and reports incomplete index cleanup.
     async fn delete_flow(
         &self,
         flow_id: u64,
@@ -1199,15 +1345,18 @@ impl BpfBackend for LinuxBpfBackend {
         self.adapter.delete_flow(flow_id, generation).await
     }
 
+    /// Writes configuration only after an ELF has been attached.
     async fn set_runtime_config(&self, config: &RuntimeConfig) -> Result<(), BackendError> {
         let _operation_guard = self.operation_lock.lock().await;
         self.adapter.set_runtime_config(config).await
     }
 
+    /// Returns the adapter's current map capacities.
     fn map_maxima(&self) -> MapMaxima {
         self.adapter.map_maxima()
     }
 
+    /// Returns a snapshot of currently owned attachments.
     fn attachments(&self) -> Vec<Attachment> {
         self.attachments.lock().unwrap().clone()
     }

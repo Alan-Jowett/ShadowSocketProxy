@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 ShadowSocketProxy contributors
+//! Scans flow-state or legacy mapping maps and removes expired entries without
+//! blocking configuration or control-service readers.
 
 use std::{
     sync::{Arc, Mutex, OnceLock},
@@ -11,46 +13,65 @@ use tokio::{sync::watch, task::JoinHandle, time};
 use crate::{bpf::BpfBackend, config::ConfigStore, logs::LogRing, mapping::decode_value};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// Cumulative counters for maintenance scans and cleanup outcomes.
 pub struct MaintenanceSnapshot {
+    /// Records examined across all cleanup passes.
     pub scanned: u64,
+    /// Records intentionally left in the map.
     pub retained: u64,
+    /// Records whose state or mapping was deleted successfully.
     pub deleted: u64,
+    /// Legacy entries that could not be decoded.
     pub decode_failed: u64,
+    /// Backend scan operations that failed.
     pub read_failed: u64,
+    /// Backend deletion operations that failed.
     pub delete_failed: u64,
+    /// Future-dated records retained as suspicious rather than deleted.
     pub anomalies: u64,
+    /// Flow cleanups that removed only part of their state or indexes.
     pub partial_cleanups: u64,
 }
 
 #[derive(Default)]
+/// Thread-safe counters and last-error state for the maintenance worker.
 pub struct MaintenanceStats {
+    /// Cumulative scan counters.
     snapshot: Mutex<MaintenanceSnapshot>,
+    /// Most recent backend or decode error, if any.
     last_error: Mutex<Option<String>>,
 }
 
 impl MaintenanceStats {
+    /// Clones the current counters without exposing their mutex.
     pub fn snapshot(&self) -> MaintenanceSnapshot {
         self.snapshot.lock().unwrap().clone()
     }
 
+    /// Returns the most recent recorded error message.
     pub fn last_error(&self) -> Option<String> {
         self.last_error.lock().unwrap().clone()
     }
 
+    /// Applies one counter mutation while holding the state lock.
     fn update(&self, update: impl FnOnce(&mut MaintenanceSnapshot)) {
         update(&mut self.snapshot.lock().unwrap());
     }
 
+    /// Replaces the recorded last-error message.
     fn error(&self, message: impl Into<String>) {
         *self.last_error.lock().unwrap() = Some(message.into());
     }
 }
 
+/// Returns nanoseconds elapsed from a process-local monotonic origin.
 fn monotonic_now_ns() -> u64 {
     static START: OnceLock<Instant> = OnceLock::new();
     START.get_or_init(Instant::now).elapsed().as_nanos() as u64
 }
 
+/// Scans at most the configured batch, deleting expired flow-state records or
+/// legacy mappings and recording failures in both stats and logs.
 pub async fn run_once<B: BpfBackend + ?Sized>(
     backend: &B,
     config: &ConfigStore,
@@ -156,6 +177,8 @@ pub async fn run_once<B: BpfBackend + ?Sized>(
     }
 }
 
+/// Starts a task that runs cleanup at the current configuration interval until
+/// the shutdown watch becomes true.
 pub fn spawn_worker<B: BpfBackend + 'static>(
     backend: Arc<B>,
     config: Arc<ConfigStore>,
@@ -181,6 +204,7 @@ pub fn spawn_worker<B: BpfBackend + 'static>(
 }
 
 #[allow(dead_code)]
+/// Converts a duration to nanoseconds for compatibility checks and tests.
 fn _duration_ns(duration: Duration) -> u64 {
     duration.as_nanos() as u64
 }

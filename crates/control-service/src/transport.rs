@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 ShadowSocketProxy contributors
+//! Linux-only TLS 1.2 PSK listener used by the gRPC control API.
 
 #[cfg(target_os = "linux")]
 use std::net::SocketAddr;
@@ -34,33 +35,47 @@ use tokio_stream::{wrappers::TcpListenerStream, Stream};
 use tonic::transport::server::Connected;
 
 #[derive(Clone)]
+/// Credentials used to construct the fixed TLS-PSK control context.
 pub struct TlsPskConfig {
+    /// Exact client identity accepted by the server callback.
     pub identity: String,
+    /// PSK bytes copied into the OpenSSL callback; at most 256 bytes.
     pub secret: Vec<u8>,
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
+/// Errors raised while configuring, binding, or handshaking TLS-PSK.
 pub enum TransportError {
     #[error("TLS-PSK is unavailable in the selected OpenSSL build")]
+    /// The platform or OpenSSL build does not expose PSK support.
     UnsupportedTlsPsk,
     #[error("TLS-PSK identity and secret are required")]
+    /// Identity or secret was empty.
     InvalidConfig,
     #[error("TLS-PSK identity contains an unsupported NUL byte or is too long")]
+    /// Identity contains NUL or exceeds the accepted 128-byte limit.
     InvalidIdentity,
     #[error("TLS-PSK secret is longer than the TLS-PSK limit")]
+    /// Secret exceeds the 256-byte PSK limit.
     SecretTooLong,
     #[error("TLS context initialization failed: {0}")]
+    /// OpenSSL rejected context or cipher configuration.
     Tls(String),
     #[error("TLS listener bind failed: {0}")]
+    /// The TCP listener could not bind to the requested address.
     Bind(String),
 }
 
+/// Reusable TLS-PSK acceptor with an HTTP/2 ALPN requirement.
 pub struct TlsPskServer {
     #[cfg(target_os = "linux")]
+    /// OpenSSL context shared by accepted connections.
     context: Arc<SslContext>,
 }
 
 impl TlsPskServer {
+    /// Validates credential bounds and builds a TLS 1.2 PSK context; on
+    /// non-Linux or PSK-disabled builds it returns `UnsupportedTlsPsk`.
     pub fn new(config: TlsPskConfig) -> Result<Self, TransportError> {
         #[cfg(not(target_os = "linux"))]
         {
@@ -88,6 +103,7 @@ impl TlsPskServer {
     }
 
     #[cfg(target_os = "linux")]
+    /// Binds a TCP listener and yields up to 64 concurrent TLS handshakes.
     pub async fn incoming(
         &self,
         address: SocketAddr,
@@ -106,6 +122,8 @@ impl TlsPskServer {
 }
 
 #[cfg(target_os = "linux")]
+/// Wraps one accepted socket, completes its handshake within five seconds, and
+/// preserves the peer address for tonic's `Connected` metadata.
 async fn accept_tls(
     context: Arc<SslContext>,
     stream: TcpStream,
@@ -123,6 +141,8 @@ async fn accept_tls(
 }
 
 #[cfg(target_os = "linux")]
+/// Configures TLS 1.2, `PSK-AES256-GCM-SHA384`, and HTTP/2 ALPN, accepting only
+/// the configured identity and secret.
 fn build_context(config: &TlsPskConfig) -> Result<SslContext, TransportError> {
     #[cfg(ssp_openssl_no_psk)]
     {
@@ -160,20 +180,26 @@ fn build_context(config: &TlsPskConfig) -> Result<SslContext, TransportError> {
 }
 
 #[cfg(target_os = "linux")]
+/// Converts an OpenSSL error stack into a transport configuration error.
 fn openssl_error(error: ErrorStack) -> TransportError {
     TransportError::Tls(error.to_string())
 }
 
 #[cfg(target_os = "linux")]
+/// TLS-wrapped TCP stream implementing tonic's connection traits.
 pub struct TlsConnection {
+    /// OpenSSL stream used for all async I/O.
     stream: SslStream<TcpStream>,
+    /// Remote socket address captured before the handshake.
     peer_addr: SocketAddr,
 }
 
 #[cfg(target_os = "linux")]
 impl Connected for TlsConnection {
+    /// Tonic connection metadata is the peer socket address.
     type ConnectInfo = SocketAddr;
 
+    /// Returns the peer address captured at accept time.
     fn connect_info(&self) -> Self::ConnectInfo {
         self.peer_addr
     }
@@ -181,6 +207,7 @@ impl Connected for TlsConnection {
 
 #[cfg(target_os = "linux")]
 impl AsyncRead for TlsConnection {
+    /// Delegates readiness and reads to the TLS stream.
     fn poll_read(
         mut self: Pin<&mut Self>,
         context: &mut Context<'_>,
@@ -192,6 +219,7 @@ impl AsyncRead for TlsConnection {
 
 #[cfg(target_os = "linux")]
 impl AsyncWrite for TlsConnection {
+    /// Delegates writes to the TLS stream.
     fn poll_write(
         mut self: Pin<&mut Self>,
         context: &mut Context<'_>,
@@ -200,6 +228,7 @@ impl AsyncWrite for TlsConnection {
         Pin::new(&mut self.stream).poll_write(context, buffer)
     }
 
+    /// Flushes pending encrypted output through OpenSSL.
     fn poll_flush(
         mut self: Pin<&mut Self>,
         context: &mut Context<'_>,
@@ -207,6 +236,7 @@ impl AsyncWrite for TlsConnection {
         Pin::new(&mut self.stream).poll_flush(context)
     }
 
+    /// Performs an orderly TLS stream shutdown.
     fn poll_shutdown(
         mut self: Pin<&mut Self>,
         context: &mut Context<'_>,

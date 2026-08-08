@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 ShadowSocketProxy contributors
+//! Runs the TCP/UDP host-side forwarder and its platform-specific control
+//! service client.
 
 use std::{
     collections::HashMap,
@@ -18,57 +20,85 @@ use tokio::{
     time,
 };
 
+/// Generated tonic messages and client/server bindings for the control RPC.
 pub mod proto {
     tonic::include_proto!("shadow_socket_proxy.control.v1");
 }
 
+/// IP protocol number used in TCP mapping lookups.
 const TCP_PROTOCOL: u8 = 6;
+/// IP protocol number used in UDP mapping lookups.
 const UDP_PROTOCOL: u8 = 17;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// Socket tuple sent to the control service for mapping lookup.
 pub struct Tuple {
+    /// Originating client address.
     pub source: SocketAddr,
+    /// Local proxy address accepted by the client.
     pub destination: SocketAddr,
+    /// TCP or UDP protocol number.
     pub protocol: u8,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Control-service result identifying where proxy traffic must be forwarded.
 pub struct OriginalDestination {
+    /// Original destination socket address.
     pub address: SocketAddr,
+    /// Protocol associated with the returned mapping.
     pub protocol: u8,
 }
 
 #[derive(Debug, Error)]
+/// Configuration, mapping, control, and I/O failures surfaced by the proxy.
 pub enum ProxyError {
     #[error("invalid configuration: {0}")]
+    /// Required endpoint, credential, address, or timeout validation failed.
     InvalidConfiguration(String),
     #[error("mapping not found")]
+    /// The control service has no mapping for the accepted tuple.
     MappingNotFound,
     #[error("mapping response is invalid: {0}")]
+    /// The response is malformed or uses the wrong transport protocol.
     InvalidMapping(String),
     #[error("control service error: {0}")]
+    /// The control RPC or TLS client failed.
     Control(String),
     #[error("I/O error: {0}")]
+    /// A socket or stream operation failed.
     Io(#[from] io::Error),
     #[error("proxy is unsupported on this platform")]
+    /// The selected build does not provide the TLS-PSK mapping client.
     UnsupportedPlatform,
 }
 
 #[async_trait]
+/// Lookup interface used by both TCP and UDP forwarding paths.
 pub trait MappingClient: Send + Sync {
+    /// Resolves a proxy tuple to its original destination or returns a typed
+    /// lookup/control error.
     async fn get_mapping(&self, tuple: &Tuple) -> Result<OriginalDestination, ProxyError>;
 }
 
 #[derive(Clone)]
+/// Listener, control-service, credential, and UDP lifecycle settings.
 pub struct ProxyConfig {
+    /// Specific local address shared by the TCP and UDP listeners.
     pub listen: SocketAddr,
+    /// URI of the TLS-PSK control service.
     pub control_endpoint: String,
+    /// Client identity presented during the TLS-PSK handshake.
     pub psk_identity: String,
+    /// Secret bytes used by the TLS-PSK handshake.
     pub psk_secret: Vec<u8>,
+    /// Inactivity duration after which a UDP association is reaped.
     pub udp_idle_timeout: Duration,
 }
 
 impl ProxyConfig {
+    /// Rejects wildcard listeners, missing credentials/endpoints, and zero UDP
+    /// idle time before any sockets are opened.
     pub fn validate(&self) -> Result<(), ProxyError> {
         if self.listen.ip().is_unspecified() {
             return Err(ProxyError::InvalidConfiguration(
@@ -95,17 +125,23 @@ impl ProxyConfig {
     }
 }
 
+/// Owns the TCP and UDP forwarding tasks for one validated configuration.
 pub struct Proxy<C> {
+    /// Immutable listener and forwarding settings.
     config: ProxyConfig,
+    /// Shared mapping client used by accepted TCP and UDP traffic.
     client: Arc<C>,
 }
 
 impl<C: MappingClient + 'static> Proxy<C> {
+    /// Validates configuration and creates a proxy that has not opened sockets.
     pub fn new(config: ProxyConfig, client: Arc<C>) -> Result<Self, ProxyError> {
         config.validate()?;
         Ok(Self { config, client })
     }
 
+    /// Binds both transports, runs them until shutdown or task failure, then
+    /// aborts the sibling task and clears UDP associations.
     pub async fn run(self, mut shutdown: watch::Receiver<bool>) -> Result<(), ProxyError> {
         let tcp_listener = TcpListener::bind(self.config.listen).await?;
         let actual_listen = tcp_listener.local_addr()?;
@@ -141,6 +177,7 @@ impl<C: MappingClient + 'static> Proxy<C> {
     }
 }
 
+/// Accepts TCP sessions until shutdown and joins or aborts all bridges.
 async fn run_tcp<C: MappingClient + 'static>(
     listener: TcpListener,
     client: Arc<C>,
@@ -172,6 +209,8 @@ async fn run_tcp<C: MappingClient + 'static>(
     while sessions.join_next().await.is_some() {}
 }
 
+/// Looks up the accepted tuple, connects to the original destination, and
+/// copies bytes bidirectionally until either stream closes.
 async fn bridge_tcp<C: MappingClient + 'static>(
     mut accepted: TcpStream,
     client: Arc<C>,
@@ -192,6 +231,8 @@ async fn bridge_tcp<C: MappingClient + 'static>(
     Ok(())
 }
 
+/// Receives datagrams, resolves/creates associations, relays replies, and
+/// periodically removes idle associations.
 async fn run_udp<C: MappingClient + 'static>(
     associations: Arc<UdpAssociations<C>>,
     mut shutdown: watch::Receiver<bool>,
@@ -220,23 +261,36 @@ async fn run_udp<C: MappingClient + 'static>(
     }
 }
 
+/// Shared UDP association table and lifecycle coordination state.
 struct UdpAssociations<C> {
+    /// Client-facing UDP socket bound to the proxy listener.
     socket: Arc<UdpSocket>,
+    /// Mapping service used to resolve each client tuple.
     client: Arc<C>,
+    /// Associations keyed by client tuple.
     entries: Mutex<HashMap<Tuple, Arc<UdpAssociation>>>,
+    /// Lifetime used by relay timeouts and periodic reaping.
     idle_timeout: Duration,
+    /// Watch receiver used to stop relay tasks.
     shutdown: watch::Receiver<bool>,
+    /// Timestamp used to rate-limit repeated forwarding warnings.
     last_failure_log: Mutex<Option<std::time::Instant>>,
 }
 
+/// One connected outbound UDP socket paired with its originating client.
 struct UdpAssociation {
+    /// Client endpoint receiving relayed responses.
     client_address: SocketAddr,
+    /// Current mapped destination; changes cause association replacement.
     destination: SocketAddr,
+    /// Connected UDP socket used for outbound datagrams and replies.
     outbound: Arc<UdpSocket>,
+    /// Last successful send or receive time for idle reaping.
     last_seen: Mutex<std::time::Instant>,
 }
 
 impl<C: MappingClient + 'static> UdpAssociations<C> {
+    /// Creates an empty association table around the proxy UDP socket.
     fn new(
         socket: Arc<UdpSocket>,
         client: Arc<C>,
@@ -253,6 +307,8 @@ impl<C: MappingClient + 'static> UdpAssociations<C> {
         }
     }
 
+    /// Resolves a tuple, replaces stale destinations, sends the datagram, and
+    /// refreshes association activity.
     async fn forward(&self, client_address: SocketAddr, payload: &[u8]) -> Result<(), ProxyError> {
         let tuple = Tuple {
             source: client_address,
@@ -282,6 +338,8 @@ impl<C: MappingClient + 'static> UdpAssociations<C> {
         Ok(())
     }
 
+    /// Binds and connects a new outbound UDP socket, publishing it atomically
+    /// if another task has not already installed the same destination.
     async fn insert_association(
         &self,
         tuple: Tuple,
@@ -312,6 +370,7 @@ impl<C: MappingClient + 'static> UdpAssociations<C> {
         Ok(candidate)
     }
 
+    /// Rebuilds an association when the mapping destination changes.
     async fn replace_association(
         &self,
         tuple: Tuple,
@@ -322,6 +381,7 @@ impl<C: MappingClient + 'static> UdpAssociations<C> {
             .await
     }
 
+    /// Logs forwarding failures at most once per second.
     async fn report_failure(&self, error: &ProxyError) {
         let now = std::time::Instant::now();
         let mut last_failure_log = self.last_failure_log.lock().await;
@@ -334,10 +394,12 @@ impl<C: MappingClient + 'static> UdpAssociations<C> {
         }
     }
 
+    /// Drops all association entries; relay tasks exit via their watch signal.
     async fn shutdown(&self) {
         self.entries.lock().await.clear();
     }
 
+    /// Removes associations idle longer than the configured timeout.
     async fn reap(&self) {
         let mut entries = self.entries.lock().await;
         let idle_timeout = self.idle_timeout;
@@ -351,6 +413,8 @@ impl<C: MappingClient + 'static> UdpAssociations<C> {
     }
 }
 
+/// Spawns the reply loop for one outbound association until timeout, I/O error,
+/// or shutdown.
 fn spawn_udp_relay(
     association: Arc<UdpAssociation>,
     client_socket: Arc<UdpSocket>,
@@ -385,6 +449,7 @@ fn spawn_udp_relay(
     });
 }
 
+/// Returns an unspecified bind address matching the destination IP family.
 fn unspecified_for(address: SocketAddr) -> SocketAddr {
     match address.ip() {
         IpAddr::V4(_) => SocketAddr::from(([0, 0, 0, 0], 0)),
@@ -394,10 +459,12 @@ fn unspecified_for(address: SocketAddr) -> SocketAddr {
 
 #[cfg(not(all(target_os = "windows", feature = "tls-psk")))]
 #[derive(Clone)]
+/// Placeholder client that reports TLS-PSK support is unavailable on this build.
 pub struct TlsPskMappingClient;
 
 #[cfg(not(all(target_os = "windows", feature = "tls-psk")))]
 impl TlsPskMappingClient {
+    /// Always returns `UnsupportedPlatform` when the Windows TLS feature is absent.
     pub async fn connect(
         _endpoint: &str,
         _identity: &str,
@@ -410,12 +477,14 @@ impl TlsPskMappingClient {
 #[cfg(not(all(target_os = "windows", feature = "tls-psk")))]
 #[async_trait]
 impl MappingClient for TlsPskMappingClient {
+    /// Always returns `UnsupportedPlatform` when the Windows TLS feature is absent.
     async fn get_mapping(&self, _tuple: &Tuple) -> Result<OriginalDestination, ProxyError> {
         Err(ProxyError::UnsupportedPlatform)
     }
 }
 
 #[cfg(all(target_os = "windows", feature = "tls-psk"))]
+/// Windows TLS-PSK control-service client, compiled only with `tls-psk`.
 mod windows_client {
     use super::*;
     use hyper_util::rt::TokioIo;
@@ -429,11 +498,15 @@ mod windows_client {
     use tower::service_fn;
 
     #[derive(Clone)]
+    /// Reusable TLS-PSK gRPC channel for mapping lookups.
     pub struct TlsPskMappingClient {
+        /// Serialized access to the tonic client because lookups are concurrent.
         client: Arc<Mutex<proto::control_client::ControlClient<tonic::transport::Channel>>>,
     }
 
     impl TlsPskMappingClient {
+        /// Validates credentials, builds TLS 1.2 PSK context, and connects the
+        /// tonic channel to `endpoint`.
         pub async fn connect(
             endpoint: &str,
             identity: &str,
@@ -466,6 +539,8 @@ mod windows_client {
 
     #[async_trait]
     impl MappingClient for TlsPskMappingClient {
+        /// Converts the socket tuple to protobuf, performs the RPC, and
+        /// validates the returned original tuple and protocol.
         async fn get_mapping(&self, tuple: &Tuple) -> Result<OriginalDestination, ProxyError> {
             let request = proto::GetMappingRequest {
                 synthetic: Some(proto::Tuple {
@@ -523,6 +598,8 @@ mod windows_client {
         }
     }
 
+    /// Converts a protobuf tuple to a socket tuple, rejecting family/width and
+    /// protocol-field violations.
     fn tuple_from_proto(tuple: proto::Tuple) -> Result<Tuple, ProxyError> {
         let source = ip_from_bytes(tuple.family, &tuple.source_address)?;
         let destination = ip_from_bytes(tuple.family, &tuple.destination_address)?;
@@ -542,6 +619,7 @@ mod windows_client {
         })
     }
 
+    /// Encodes an IP address as its native 4- or 16-byte representation.
     fn ip_bytes(address: &IpAddr) -> Vec<u8> {
         match address {
             IpAddr::V4(address) => address.octets().to_vec(),
@@ -549,6 +627,7 @@ mod windows_client {
         }
     }
 
+    /// Decodes a family-tagged address and rejects incorrect byte lengths.
     fn ip_from_bytes(family: u32, bytes: &[u8]) -> Result<IpAddr, ProxyError> {
         match family {
             4 if bytes.len() == 4 => Ok(IpAddr::V4(std::net::Ipv4Addr::new(
@@ -561,6 +640,7 @@ mod windows_client {
         }
     }
 
+    /// Builds the TLS 1.2 AES-256-GCM PSK context used by the Windows client.
     fn build_context(identity: &str, secret: &[u8]) -> Result<Arc<SslContext>, ProxyError> {
         let mut builder = SslContextBuilder::new(SslMethod::tls_client()).map_err(openssl_error)?;
         builder
@@ -587,6 +667,7 @@ mod windows_client {
         Ok(Arc::new(builder.build()))
     }
 
+    /// Opens a TCP stream for the URI and completes the client TLS handshake.
     async fn connect_tls(
         uri: http::Uri,
         context: Arc<SslContext>,
@@ -606,10 +687,12 @@ mod windows_client {
         Ok(TokioIo::new(ssl))
     }
 
+    /// Converts OpenSSL setup failures into proxy control errors.
     fn openssl_error(error: ErrorStack) -> ProxyError {
         ProxyError::Control(error.to_string())
     }
 
+    /// Converts an OpenSSL/display error into an I/O error for async adapters.
     fn openssl_io_error(error: impl std::fmt::Display) -> io::Error {
         io::Error::other(error.to_string())
     }

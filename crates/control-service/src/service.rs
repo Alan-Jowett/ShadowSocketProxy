@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 ShadowSocketProxy contributors
+//! gRPC control surface and conversions enforcing the protobuf/BPF ABI boundary.
 
 use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
@@ -22,15 +23,22 @@ use crate::{
 };
 
 #[derive(Clone)]
+/// gRPC service backed by shared configuration, logs, stats, and BPF state.
 pub struct ControlService {
+    /// Backend used for attachment and map operations.
     backend: Arc<dyn BpfBackend>,
+    /// Atomically published runtime settings.
     config: Arc<ConfigStore>,
+    /// Bounded log ring exposed through `PullLogs`.
     logs: Arc<LogRing>,
+    /// Maintenance counters and last error exposed through `GetStatus`.
     stats: Arc<MaintenanceStats>,
+    /// Release/acquire readiness flag for health checks.
     ready: Arc<AtomicBool>,
 }
 
 impl ControlService {
+    /// Creates an unready service sharing the supplied runtime components.
     pub fn new(
         backend: Arc<dyn BpfBackend>,
         config: Arc<ConfigStore>,
@@ -46,14 +54,17 @@ impl ControlService {
         }
     }
 
+    /// Publishes readiness after attach/configuration succeeds.
     pub fn set_ready(&self, ready: bool) {
         self.ready.store(ready, Ordering::Release);
     }
 
+    /// Reads the readiness flag with acquire ordering.
     pub fn is_ready(&self) -> bool {
         self.ready.load(Ordering::Acquire)
     }
 
+    /// Maps backend failures to gRPC status classes without exposing internals.
     fn map_backend_error(error: BackendError) -> Status {
         let message = error.to_string();
         match error {
@@ -70,6 +81,7 @@ impl ControlService {
     }
 }
 
+/// Encodes a valid same-family tuple into protobuf address bytes.
 fn tuple_to_proto(tuple: &Tuple) -> proto::Tuple {
     let (family, source_address, destination_address) = match (tuple.source, tuple.destination) {
         (IpAddr::V4(source), IpAddr::V4(destination)) => {
@@ -91,6 +103,7 @@ fn tuple_to_proto(tuple: &Tuple) -> proto::Tuple {
 }
 
 #[allow(clippy::result_large_err)]
+/// Validates protobuf widths/ranges and constructs an ABI-safe tuple.
 fn tuple_from_proto(tuple: Option<proto::Tuple>) -> Result<Tuple, Status> {
     let tuple = tuple.ok_or_else(|| Status::invalid_argument("synthetic tuple is required"))?;
     let source = match tuple.family {
@@ -134,6 +147,7 @@ fn tuple_from_proto(tuple: Option<proto::Tuple>) -> Result<Tuple, Status> {
     Ok(tuple)
 }
 
+/// Converts a decoded mapping into the public RPC response shape.
 fn mapping_to_proto(mapping: Mapping) -> proto::Mapping {
     proto::Mapping {
         synthetic: Some(tuple_to_proto(&mapping.synthetic)),
@@ -144,6 +158,7 @@ fn mapping_to_proto(mapping: Mapping) -> proto::Mapping {
     }
 }
 
+/// Encodes IPv4/IPv6 addresses for protobuf fields.
 fn ip_bytes(address: IpAddr) -> Vec<u8> {
     match address {
         IpAddr::V4(address) => address.octets().to_vec(),
@@ -151,6 +166,7 @@ fn ip_bytes(address: IpAddr) -> Vec<u8> {
     }
 }
 
+/// Converts a shared runtime snapshot to millisecond protobuf fields.
 fn config_to_proto(config: Arc<RuntimeConfig>) -> proto::ConfigReply {
     let listener_family = if config.listener.address.is_ipv4() {
         4
@@ -193,6 +209,7 @@ fn config_to_proto(config: Arc<RuntimeConfig>) -> proto::ConfigReply {
 }
 
 #[allow(clippy::result_large_err)]
+/// Decodes a family-tagged protobuf address and reports a field-specific error.
 fn parse_address(family: u32, bytes: Vec<u8>, label: &str) -> Result<IpAddr, Status> {
     match family {
         4 if bytes.len() == 4 => Ok(IpAddr::V4(Ipv4Addr::from(
@@ -208,6 +225,7 @@ fn parse_address(family: u32, bytes: Vec<u8>, label: &str) -> Result<IpAddr, Sta
 }
 
 #[allow(clippy::result_large_err)]
+/// Parses optional target address/port pairs, rejecting partial values.
 fn parse_target(
     family: u32,
     address: Vec<u8>,
@@ -229,6 +247,8 @@ fn parse_target(
 }
 
 #[allow(clippy::result_large_err)]
+/// Builds a runtime configuration from protobuf and leaves semantic validation
+/// to `RuntimeConfig::validate_with_maxima`.
 fn runtime_config_from_proto(config: Option<proto::Config>) -> Result<RuntimeConfig, Status> {
     let config = config.ok_or_else(|| Status::invalid_argument("config is required"))?;
     if config.schema_version != RUNTIME_CONFIG_ABI_VERSION as u32 {
@@ -277,6 +297,8 @@ fn runtime_config_from_proto(config: Option<proto::Config>) -> Result<RuntimeCon
 
 #[tonic::async_trait]
 impl Control for ControlService {
+    /// Attaches both classifiers, validates reported capacities, writes runtime
+    /// config, and rolls back links on any post-attach failure.
     async fn attach(
         &self,
         request: Request<proto::InterfaceRequest>,
@@ -338,6 +360,7 @@ impl Control for ControlService {
         }
     }
 
+    /// Detaches all or selected interfaces and clears readiness when none remain.
     async fn detach(
         &self,
         request: Request<proto::DetachRequest>,
@@ -364,6 +387,7 @@ impl Control for ControlService {
         }))
     }
 
+    /// Returns a sorted, paged mapping view and logs malformed entries as skips.
     async fn list_mappings(
         &self,
         request: Request<proto::ListMappingsRequest>,
@@ -422,6 +446,8 @@ impl Control for ControlService {
         }))
     }
 
+    /// Looks up one synthetic tuple and returns not-found distinctly from ABI
+    /// decode failures.
     async fn get_mapping(
         &self,
         request: Request<proto::GetMappingRequest>,
@@ -439,6 +465,8 @@ impl Control for ControlService {
         Ok(Response::new(mapping_to_proto(mapping)))
     }
 
+    /// Combines readiness, attachments, map maxima, packet counters, and
+    /// maintenance statistics into one status response.
     async fn get_status(
         &self,
         _request: Request<proto::Empty>,
@@ -482,6 +510,7 @@ impl Control for ControlService {
         }))
     }
 
+    /// Returns the current atomic runtime configuration snapshot.
     async fn get_config(
         &self,
         _request: Request<proto::Empty>,
@@ -489,6 +518,8 @@ impl Control for ControlService {
         Ok(Response::new(config_to_proto(self.config.snapshot())))
     }
 
+    /// Validates and atomically publishes a config update while preserving the
+    /// immutable listener descriptor.
     async fn set_config(
         &self,
         request: Request<proto::SetConfigRequest>,
@@ -514,6 +545,7 @@ impl Control for ControlService {
         Ok(Response::new(config_to_proto(updated)))
     }
 
+    /// Reads a bounded log page after the supplied cursor.
     async fn pull_logs(
         &self,
         request: Request<proto::PullLogsRequest>,
@@ -545,6 +577,7 @@ impl Control for ControlService {
         }))
     }
 
+    /// Reports readiness as the health result without changing service state.
     async fn health(
         &self,
         _request: Request<proto::Empty>,

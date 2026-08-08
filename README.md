@@ -87,3 +87,36 @@ Configure the listener and control service with CLI options; provide the PSK thr
 mapping lookup fails. The listen address must be a specific local IPv4 or IPv6
 address, not a wildcard address, so UDP lookups preserve the actual local
 destination tuple.
+
+## Documentation
+
+The generated site combines private-item Rustdoc with Doxygen for the
+canonical BPF source. From a clean checkout with Rust 1.96.1 and Doxygen:
+
+```text
+python scripts/check-rustdoc.py
+```
+
+PowerShell:
+
+```powershell
+$env:RUSTDOCFLAGS = "-D warnings"
+cargo doc --locked --workspace --no-deps --document-private-items
+```
+
+POSIX shell:
+
+```sh
+RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --no-deps --document-private-items
+```
+
+Then, on either platform:
+
+```text
+python -c "import shutil; shutil.rmtree('docs/.generated', ignore_errors=True); shutil.rmtree('site', ignore_errors=True)"
+doxygen docs/Doxyfile
+python scripts/assemble-docs.py --site-dir site
+```
+
+The disposable `site/` directory contains `index.html`, `rustdoc/`, and
+`bpf/`; it is not committed to the source branch.
