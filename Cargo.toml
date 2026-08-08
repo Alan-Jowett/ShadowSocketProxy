@@ -5,6 +5,7 @@
 members = [
     "crates/bpf/fixture-runner",
     "crates/control-service",
+    "crates/e2e-runner",
     "crates/host-proxy",
 ]
 resolver = "2"

@@ -120,3 +120,21 @@ python scripts/assemble-docs.py --site-dir site
 
 The disposable `site/` directory contains `index.html`, `rustdoc/`, and
 `bpf/`; it is not committed to the source branch.
+
+## Windows/WSL end-to-end validation
+
+The checked-in Windows/WSL driver exercises the deployed BPF, control service,
+and host proxy with an ephemeral TLS-PSK. It requires Windows, an installed
+WSL distribution, and the Windows OpenSSL/Rust prerequisites:
+
+```powershell
+cargo build --locked --release -p shadow-socket-proxy-e2e-runner --features tls-psk
+.\scripts\run-windows-wsl-e2e.ps1 `
+  -BpfArtifact .\artifacts\bpf\shadow-socket-proxy.bpf.o `
+  -ControlArtifact .\artifacts\control\shadow-socket-proxy-control `
+  -HostArtifact .\artifacts\host
+```
+
+The command fails when WSL, BPF/TC, authentication, process, marker,
+mapping, counter, or cleanup prerequisites are unavailable; it never falls
+back to direct forwarding.

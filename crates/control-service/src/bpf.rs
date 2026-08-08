@@ -775,19 +775,21 @@ impl LinuxTcAdapter for AyaLinuxTcAdapter {
         match aya::programs::tc::qdisc_add_clsact(interface) {
             Ok(()) | Err(aya::programs::tc::TcError::AlreadyAttached) => {}
             Err(error) => {
-                return Err(Self::operation(
-                    format!("{interface}:{direction:?}"),
-                    format!("clsact setup failed: {error}"),
-                ));
+                if !format!("{error:?}").contains("Exclusivity flag on, cannot modify") {
+                    return Err(Self::operation(
+                        format!("{interface}:{direction:?}"),
+                        format!("clsact setup failed: {error}"),
+                    ));
+                }
             }
         }
 
+        // WSL-originated flows leave through the physical egress hook, so the
+        // logical forward program must be attached there; responses arrive on
+        // physical ingress and use the logical reverse program.
         let (program_name, attach_type) = match direction {
-            Direction::Ingress => (
-                INGRESS_PROGRAM_NAME_V3,
-                aya::programs::TcAttachType::Ingress,
-            ),
-            Direction::Egress => (EGRESS_PROGRAM_NAME_V3, aya::programs::TcAttachType::Egress),
+            Direction::Ingress => (EGRESS_PROGRAM_NAME_V3, aya::programs::TcAttachType::Ingress),
+            Direction::Egress => (INGRESS_PROGRAM_NAME_V3, aya::programs::TcAttachType::Egress),
         };
         let link_id = {
             let program = state.bpf.program_mut(program_name).ok_or_else(|| {
@@ -830,8 +832,8 @@ impl LinuxTcAdapter for AyaLinuxTcAdapter {
         let link_id = tracked.id;
         let attachment = tracked.attachment;
         let program_name = match direction {
-            Direction::Ingress => INGRESS_PROGRAM_NAME_V3,
-            Direction::Egress => EGRESS_PROGRAM_NAME_V3,
+            Direction::Ingress => EGRESS_PROGRAM_NAME_V3,
+            Direction::Egress => INGRESS_PROGRAM_NAME_V3,
         };
         let result = {
             let program = state.bpf.program_mut(program_name).ok_or_else(|| {

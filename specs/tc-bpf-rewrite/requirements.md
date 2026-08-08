@@ -144,8 +144,9 @@ return nonzero. CI MUST enable this gate and MUST NOT silently skip it.
 
 Toolchain, dependency, capability, loader, verifier, packet, action,
 checksum, state, and Rust failures MUST remain visible failures. The workflow
-MUST not alter production behavior, publish artifacts, or introduce a
-direct-forward fallback.
+MUST not alter production behavior, publish artifacts to a branch or release,
+or introduce a direct-forward fallback. Workflow-run artifacts are permitted
+when required by the approved end-to-end validation contract.
 
 ### REQ-CI-006 — Reproducible Windows CI environment
 
@@ -165,6 +166,48 @@ enabled fails.
 Before the change is submitted for review, the same OpenSSL version and
 Windows host-proxy validation commands MUST pass on a Windows development
 environment.
+
+### REQ-CI-E2E-001 — Separate deployable artifacts
+
+CI MUST upload separate workflow artifacts for the canonical BPF ELF, Linux
+control-service executable/runtime manifest, and Windows host-proxy executable
+with required runtime DLLs. Artifact contents and names MUST be deterministic
+and downloadable by the end-to-end job.
+
+### REQ-CI-E2E-002 — Windows-host/WSL deployment
+
+CI MUST use `windows-latest` as the integration host, use its default WSL
+distribution, deploy the BPF ELF and control service inside WSL, and run the
+host proxy on Windows. Privileged WSL setup and teardown MUST use explicit
+`wsl.exe -u root` execution and MUST not require an interactive sudo password.
+
+### REQ-CI-E2E-003 — Authenticated TCP path
+
+The integration validation MUST generate ephemeral TLS-PSK credentials,
+configure the deployed control service, start the deployed host proxy, and
+verify that a TCP request originating in WSL reaches a Windows-host test
+server through the proxy and returns a predetermined marker.
+
+### REQ-CI-E2E-004 — Exact BPF evidence
+
+The integration validation MUST verify that the control service is ready, that
+the exercised mapping contains the Windows test-server original destination
+and the host-proxy synthetic destination, that the mapping is observed before
+teardown, and that the flow-insertion-failure counter does not increase.
+
+### REQ-CI-E2E-005 — Strict prerequisite handling
+
+The artifact and end-to-end jobs MUST run for pull requests and pushes to
+`main`. Missing WSL, package, kernel, BPF, networking, artifact,
+authentication, process, marker, mapping, or cleanup prerequisites MUST fail
+the job visibly rather than being skipped.
+
+### REQ-CI-E2E-006 — Shared local and CI driver
+
+The repository MUST contain a locally executable Windows/WSL end-to-end driver
+that performs the same deployment, TCP flow, exact evidence, and cleanup
+assertions used by CI. Local execution MUST require Windows and WSL and MUST
+fail clearly when those prerequisites are unavailable.
 
 ## Acceptance Criteria
 

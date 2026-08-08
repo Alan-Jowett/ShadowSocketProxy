@@ -52,6 +52,16 @@ RST.
 | TC-CI-008 | REQ-CI-007 | Windows host-proxy build | With TLS-PSK enabled and the pinned OpenSSL environment, formatting, strict clippy, and the locked host-proxy build succeed. |
 | TC-CI-009 | REQ-CI-007 | Windows host-proxy tests | `cargo test --locked -p shadow-socket-proxy-host --features tls-psk` succeeds on `windows-latest`. |
 | TC-CI-010 | REQ-CI-008 | Local Windows reproduction | The pinned OpenSSL installation and the Windows host-proxy validation commands pass locally before the PR is opened. |
+| TC-CI-E2E-001 | REQ-CI-E2E-001 | Build/upload BPF artifact | Canonical ELF is downloadable and valid. |
+| TC-CI-E2E-002 | REQ-CI-E2E-001 | Build/upload control artifact | Linux control executable and runtime manifest are downloadable. |
+| TC-CI-E2E-003 | REQ-CI-E2E-001 | Build/upload host artifact | Windows host executable and required runtime assets are downloadable. |
+| TC-CI-E2E-004 | REQ-CI-E2E-002/006 | Local Windows/WSL driver execution | The checked-in driver completes deployment, TCP flow, exact evidence checks, and cleanup locally; missing prerequisites fail visibly. |
+| TC-CI-E2E-005 | REQ-CI-E2E-002 | CI Windows/WSL driver execution | CI invokes the same driver with downloaded artifacts and explicit WSL-root setup. |
+| TC-CI-E2E-006 | REQ-CI-E2E-003 | Authenticated attach/configure/marker path | Attach succeeds, target configuration is accepted, and the WSL TCP request receives the known marker. |
+| TC-CI-E2E-007 | REQ-CI-E2E-004 | Exact mapping/status evidence | Ready status, original tuple, synthetic tuple, pre-teardown mapping, and non-increasing flow-insertion failures all pass. |
+| TC-CI-E2E-008 | REQ-CI-E2E-005 | Missing prerequisite/failure cleanup | Driver exits nonzero and attempts independent process/BPF cleanup. |
+| TC-CI-E2E-009 | REQ-CI-E2E-005 | PR/main trigger coverage | Artifact and E2E jobs run for both supported event types. |
+| TC-CI-E2E-010 | REQ-CI-E2E-006 | Local/CI command parity | CI calls the same checked-in driver and assertion path documented for local execution. |
 
 ## Impact Map
 
@@ -72,6 +82,12 @@ RST.
 | REQ-CI-006 | D-CI-005, D-CI-006 | TC-CI-007 | Windows workflow, winget/OpenSSL setup |
 | REQ-CI-007 | D-CI-005, D-CI-007 | TC-CI-008..009 | Windows workflow, host-proxy crate |
 | REQ-CI-008 | D-CI-006, D-CI-007 | TC-CI-010 | Local Windows environment and validation commands |
+| REQ-CI-E2E-001 | D-CI-E2E-001 | TC-CI-E2E-001..003 | Separate workflow artifacts only; no branch/release publication. |
+| REQ-CI-E2E-002 | D-CI-E2E-002 | TC-CI-E2E-004..005 | WSL-root deployment and Windows host execution. |
+| REQ-CI-E2E-003 | D-CI-E2E-003 | TC-CI-E2E-006 | Authenticated TCP marker path. |
+| REQ-CI-E2E-004 | D-CI-E2E-003 | TC-CI-E2E-007 | Exact mapping/status assertions. |
+| REQ-CI-E2E-005 | D-CI-E2E-002, D-CI-E2E-003 | TC-CI-E2E-008..009 | Strict failure and trigger behavior. |
+| REQ-CI-E2E-006 | D-CI-E2E-002 | TC-CI-E2E-004, TC-CI-E2E-010 | Shared local/CI executable driver. |
 
 ## Explicit No-Impact Decisions
 
@@ -82,6 +98,7 @@ RST.
   fields.
 - No direct-forward fallback is added when a target is unset or a mapping is
   missing.
-- The workflow does not publish artifacts; it only reports validation status.
+- Workflow artifacts are retained only for the workflow run and are not
+  published to a branch or release.
 - Linux/BPF gates, host-proxy forwarding, control-plane protocol behavior, and
   TLS/PSK policy are unchanged; this change only adds Windows build coverage.

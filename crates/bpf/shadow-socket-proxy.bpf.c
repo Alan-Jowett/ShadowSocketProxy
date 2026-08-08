@@ -712,27 +712,28 @@ static __always_inline int target_for_packet(const struct packet_info *packet,
 }
 
 /**
- * Returns true when the packet targets the configured control listener.
+ * Returns true when either endpoint is the configured control listener.
  * Wildcard listeners match any address in their family; only TCP is bypassed.
  * @param packet parsed packet tuple
- * @param ingress choose destination matching for ingress or source matching
- *        for egress
  * @return 1 for control traffic that must not create or rewrite a flow
  */
-static __always_inline int is_control_packet(const struct packet_info *packet,
-                                             bool ingress)
+static __always_inline int is_control_packet(const struct packet_info *packet)
 {
     __u32 config_key = 0;
     struct runtime_config_value *config =
         bpf_map_lookup_elem(&ssp_runtime_config_v3, &config_key);
-    const __u8 *endpoint = ingress ? packet->destination : packet->source;
-    __be16 port = ingress ? packet->destination_port : packet->source_port;
+    const __u8 *endpoint;
     __u32 i;
 
     if (!config ||
         bpf_ntohs(config->schema_version) != RUNTIME_CONFIG_ABI_VERSION ||
-        packet->protocol != IPPROTO_TCP ||
-        port != config->listener_port)
+        packet->protocol != IPPROTO_TCP)
+        return 0;
+    if (packet->destination_port == config->listener_port)
+        endpoint = packet->destination;
+    else if (packet->source_port == config->listener_port)
+        endpoint = packet->source;
+    else
         return 0;
     if (packet->family == 4) {
         if (config->listener_family != 4)
@@ -860,7 +861,7 @@ static __always_inline int process_packet(struct __sk_buff *skb, bool ingress)
 
     if (!parse_packet(skb, &packet))
         return TC_ACT_OK;
-    if (is_control_packet(&packet, ingress)) {
+    if (is_control_packet(&packet)) {
         increment_counter(2);
         return TC_ACT_OK;
     }
@@ -989,9 +990,10 @@ static __always_inline int process_packet(struct __sk_buff *skb, bool ingress)
 }
 
 /**
- * Ingress TC entrypoint: resolves/creates a flow, rewrites the destination,
+ * Forward TC entrypoint: resolves/creates a flow, rewrites the destination,
  * and returns `TC_ACT_OK` unless active-flow allocation must drop the packet.
- * @param skb packet received on the ingress hook
+ * The loader binds this logical ingress program to the WSL egress hook.
+ * @param skb packet processed on the forward hook
  * @return TC action from `process_packet`
  */
 SEC("classifier")
@@ -1001,9 +1003,10 @@ int ssp_tc_ingress_v3(struct __sk_buff *skb)
 }
 
 /**
- * Egress TC entrypoint: resolves the reverse tuple and restores the original
- * destination address and port.
- * @param skb packet received on the egress hook
+ * Reverse TC entrypoint: resolves the reverse tuple and restores the original
+ * destination address and port. The loader binds this logical egress program
+ * to the WSL ingress hook.
+ * @param skb packet processed on the reverse hook
  * @return TC action from `process_packet`
  */
 SEC("classifier")
