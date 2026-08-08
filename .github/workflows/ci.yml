@@ -25,6 +25,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             doxygen \
+            graphviz \
             libssl-dev \
             pkg-config
 
@@ -65,6 +66,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             doxygen \
+            graphviz \
             libssl-dev \
             pkg-config
 
