@@ -66,6 +66,29 @@
   check, build and test for all the components (both the BPF and the two rust
   crates); follow-up approval to add the missing runner.`
 
+### CHG-006 — Make host-proxy lifecycle observable
+
+- **Before:** Host-proxy lifecycle visibility is inconsistent: startup and
+  activation use unconditional stderr messages, some forwarding failures are
+  rate-limited, and UDP idle-association removal, relay termination, and
+  shutdown do not consistently emit structured lifecycle events.
+- **After:** Host-proxy MUST emit filterable structured `tracing` events for
+  TCP and UDP lifecycle transitions and operational failures. Normal
+  lifecycle events MUST cover TCP forwarding start and termination, UDP
+  association creation, replacement, expiry/garbage collection, relay stop,
+  and proxy shutdown. Mapping lookup/validation failures, outbound
+  connect/send/receive failures, relay delivery failures, and control-service
+  detach failures MUST be distinguishable events with error context. Lifecycle
+  events MUST include protocol and, where applicable, the synthetic tuple,
+  mapped/original destination, association age, idle timeout, reason, and
+  error fields. UDP association reuse MUST NOT produce an info event for every
+  datagram. Existing unconditional stderr startup and activation messages
+  remain unchanged; lifecycle events are controlled by `RUST_LOG`.
+- **Retired:** No packet-rewrite, flow-map, control RPC, or forwarding
+  semantics are retired or changed by this observability requirement.
+- **Traceability:** `USER-REQUEST: issue 11 needs host-proxy lifecycle logging,
+  including visible garbage collection of old UDP associations.`
+
 ## Stable Requirements
 
 ### REQ-TC-001 — Family-preserving global DNAT
@@ -209,6 +232,30 @@ that performs the same deployment, TCP flow, exact evidence, and cleanup
 assertions used by CI. Local execution MUST require Windows and WSL and MUST
 fail clearly when those prerequisites are unavailable.
 
+### REQ-HP-LOG-001 — Structured lifecycle events
+
+The host-proxy MUST emit `tracing` lifecycle events for TCP forwarding start
+and termination, UDP association creation, replacement, expiry/garbage
+collection, relay stop, and proxy shutdown. UDP association reuse MUST NOT
+emit an info event for every datagram.
+
+### REQ-HP-LOG-002 — Failure event visibility
+
+The host-proxy MUST emit distinguishable structured events for mapping lookup
+and validation failures, outbound connect/send/receive failures, relay
+delivery failures, and control-service detach failures. Failure events MUST
+preserve the underlying error context and MUST NOT be silently converted into
+successful-looking lifecycle events.
+
+### REQ-HP-LOG-003 — Operational context and filtering
+
+Applicable lifecycle and failure events MUST include protocol and the
+synthetic tuple; association events MUST also include the mapped/original
+destination, association age when known, idle timeout when relevant, and a
+machine-readable reason or error. Lifecycle logging MUST remain filterable by
+the existing `RUST_LOG` configuration. Existing unconditional stderr startup
+and activation messages are not replaced by this requirement.
+
 ## Acceptance Criteria
 
 - Valid IPv4/IPv6 TCP and UDP packets rewrite with correct L3/L4 checksums.
@@ -227,10 +274,16 @@ fail clearly when those prerequisites are unavailable.
 - A pull request or push to `main` installs and verifies OpenSSL 4.0.1 on
   Windows and runs the TLS-PSK host-proxy format, clippy, build, and test
   gates; any failure is reported as a failed workflow.
+- Host-proxy logs structured TCP and UDP lifecycle events, visibly reports
+  idle UDP association garbage collection, includes the required operational
+  context, and reports the specified failure classes without logging every
+  UDP reuse at info level.
 
 ## Non-Goals
 
 - Cross-family translation, SNAT, wildcard target matching, or QUIC close state.
 - Rewriting malformed packets, non-initial fragments, or unsupported protocols.
 - Replacing TC, changing host-proxy forwarding, or changing TLS/PSK policy.
+- Moving stale-mapping ownership, changing UDP lookup/cache behavior, or
+  introducing per-datagram lifecycle logging.
 - Publishing CI build artifacts or changing production packet behavior.

@@ -62,6 +62,11 @@ RST.
 | TC-CI-E2E-008 | REQ-CI-E2E-005 | Missing prerequisite/failure cleanup | Driver exits nonzero and attempts independent process/BPF cleanup. |
 | TC-CI-E2E-009 | REQ-CI-E2E-005 | PR/main trigger coverage | Artifact and E2E jobs run for both supported event types. |
 | TC-CI-E2E-010 | REQ-CI-E2E-006 | Local/CI command parity | CI calls the same checked-in driver and assertion path documented for local execution. |
+| TC-HP-LOG-001 | REQ-HP-LOG-001/003 | TCP lifecycle logging | A TCP session emits structured start and termination events with protocol and synthetic tuple context; no lifecycle event is emitted as unconditional stderr. |
+| TC-HP-LOG-002 | REQ-HP-LOG-001/003 | UDP association lifecycle logging | Creation, replacement, idle expiry, relay stop, and proxy shutdown emit structured events with destination, age/timeout, and reason fields; ordinary datagram reuse does not emit an info event. |
+| TC-HP-LOG-003 | REQ-HP-LOG-002/003 | Mapping and forwarding failures | Lookup/validation, connect, send/receive, and relay delivery failures emit distinguishable structured records retaining the underlying error and tuple/protocol context. |
+| TC-HP-LOG-004 | REQ-HP-LOG-002 | Detach failure visibility | Control-service detach failure remains an explicit error event and non-success result; it is not hidden by normal shutdown logging. |
+| TC-HP-LOG-005 | REQ-HP-LOG-001/003 | Log filtering and field contract | `RUST_LOG` controls lifecycle visibility, while existing startup/activation stderr messages remain present; required event fields are stable and machine-readable. |
 
 ## Impact Map
 
@@ -88,11 +93,14 @@ RST.
 | REQ-CI-E2E-004 | D-CI-E2E-003 | TC-CI-E2E-007 | Exact mapping/status assertions. |
 | REQ-CI-E2E-005 | D-CI-E2E-002, D-CI-E2E-003 | TC-CI-E2E-008..009 | Strict failure and trigger behavior. |
 | REQ-CI-E2E-006 | D-CI-E2E-002 | TC-CI-E2E-004, TC-CI-E2E-010 | Shared local/CI executable driver. |
+| REQ-HP-LOG-001 | D-HP-LOG-001, D-HP-LOG-003 | TC-HP-LOG-001..002, TC-HP-LOG-005 | Host-proxy TCP/UDP lifecycle and shutdown logging. |
+| REQ-HP-LOG-002 | D-HP-LOG-002 | TC-HP-LOG-003..004 | Host-proxy mapping, forwarding, relay, and detach failure logging. |
+| REQ-HP-LOG-003 | D-HP-LOG-001..003 | TC-HP-LOG-001..005 | Structured context, filtering, and no per-datagram info logs. |
 
 ## Explicit No-Impact Decisions
 
 - Host-proxy forwarding, mapping lookup, source binding, and UDP association
-  behavior remain unchanged.
+  behavior remain unchanged; this propagation adds observability only.
 - Flow map layouts, TCP teardown semantics, maintenance bounds, and TLS/PSK
   authentication remain unchanged except for the specified status/config
   fields.
@@ -101,4 +109,5 @@ RST.
 - Workflow artifacts are retained only for the workflow run and are not
   published to a branch or release.
 - Linux/BPF gates, host-proxy forwarding, control-plane protocol behavior, and
-  TLS/PSK policy are unchanged; this change only adds Windows build coverage.
+  TLS/PSK policy are unchanged; the logging delta adds no packet, map, RPC,
+  ownership, or UDP lookup/cache semantics.
