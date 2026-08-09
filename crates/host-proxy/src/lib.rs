@@ -231,13 +231,18 @@ async fn run_tcp<C: MappingClient + 'static>(
     while sessions.join_next().await.is_some() {}
 }
 
+/// Emits a termination event if a running TCP bridge is cancelled.
 struct TcpForwardingGuard {
+    /// Synthetic tuple associated with the bridge.
     tuple: Tuple,
+    /// Original destination used by the bridge.
     original_destination: SocketAddr,
+    /// Indicates that the bridge emitted its normal termination event.
     completed: bool,
 }
 
 impl Drop for TcpForwardingGuard {
+    /// Reports cancellation when the bridge future is dropped before completion.
     fn drop(&mut self) {
         if !self.completed {
             tracing::info!(
