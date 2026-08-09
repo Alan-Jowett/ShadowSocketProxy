@@ -16,6 +16,10 @@ RST.
 
 | ID | Requirement | Scenario | Expected result |
 |---|---|---|---|
+| TC-AYA-001 | Aya port investigation | Pinned toolchain builds the isolated Aya TC parser | The build is reproducible in CI, produces an independently named ELF, and does not alter the C v3 artifact. |
+| TC-AYA-002 | Aya port investigation | Isolated parser receives malformed, truncated, IPv4 TCP/UDP, and IPv6 TCP/UDP packets | Every fixture returns `TC_ACT_OK` without modifying bytes or production maps. |
+| TC-AYA-003 | Aya port investigation | C and Aya measurement run on one kernel | Per-entrypoint instruction counts, verifier logs, load duration, and fixture duration are retained for comparison. |
+| TC-AYA-004 | Aya port investigation | Prototype artifact is supplied to the production loader | The loader rejects it unless an explicitly selected, approved ABI migration supports its complete program/map contract; no filename inference or fallback occurs. |
 | TC-TC-001 | REQ-TC-006 | Build/load v3 artifact | v3 programs, v1 flow maps, v3 runtime map, three counter slots, scratch, and active-flow maps are discovered. |
 | TC-TC-002 | REQ-TC-006 | v2/policy-only/mixed artifact | Attach/readiness rejects stale v2 symbols, policy map artifacts, missing v3 runtime map, or incomplete counters. |
 | TC-TC-003 | REQ-TC-006 | Non-Linux backend | Unsupported TC behavior remains explicit; readiness is never falsely reported. |
