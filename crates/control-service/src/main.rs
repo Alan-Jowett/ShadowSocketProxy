@@ -9,6 +9,7 @@ use std::net::SocketAddr;
 /// Builds the Linux backend, starts the runtime, and returns a process status
 /// after serving or reporting a startup/runtime error.
 async fn main() {
+    tracing_subscriber::fmt::init();
     let address = std::env::var("SSP_LISTEN_ADDR")
         .unwrap_or_else(|_| "0.0.0.0:50051".into())
         .parse::<SocketAddr>()
@@ -37,6 +38,7 @@ async fn main() {
         eprintln!("shadow-socket-proxy-control failed to start: {error}");
         std::process::exit(1);
     }
+    tracing::info!(listener = %address, "control service ready for BPF attachment");
     if let Err(error) = runtime.serve().await {
         eprintln!("shadow-socket-proxy-control server failed: {error}");
         std::process::exit(1);

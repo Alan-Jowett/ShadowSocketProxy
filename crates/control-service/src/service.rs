@@ -309,11 +309,8 @@ impl Control for ControlService {
                 "elf_path and interfaces are required",
             ));
         }
-        match self
-            .backend
-            .attach(&PathBuf::from(request.elf_path), &request.interfaces)
-            .await
-        {
+        let elf_path = PathBuf::from(&request.elf_path);
+        match self.backend.attach(&elf_path, &request.interfaces).await {
             Ok(report) => {
                 if let Err(error) = self.config.validate_snapshot_with_maxima(report.maxima) {
                     let rollback = self.backend.rollback_attach(&report.created).await;
@@ -347,6 +344,12 @@ impl Control for ControlService {
                     }));
                 }
                 self.set_ready(true);
+                tracing::info!(
+                    elf = %request.elf_path,
+                    interfaces = ?request.interfaces,
+                    attachments = report.attachments.len(),
+                    "BPF program attached"
+                );
                 Ok(Response::new(proto::OperationReply {
                     success: true,
                     message: "attached ingress and egress".into(),

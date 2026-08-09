@@ -88,6 +88,152 @@ mapping lookup fails. The listen address must be a specific local IPv4 or IPv6
 address, not a wildcard address, so UDP lookups preserve the actual local
 destination tuple.
 
+## Windows/WSL demo deployment
+
+This is a prototype, not a hardened production service. The following procedure
+runs the same control service, BPF program, and Windows host proxy that a demo
+uses. It redirects all eligible new IPv4 TCP and UDP flows from the selected
+WSL interface through the Windows proxy. The proxy creates the actual outbound
+connections, so only use a disposable WSL distribution or a quiet demo
+environment.
+
+The host needs Windows, WSL 2, a WSL distribution with BPF/TC support, Rust
+1.96.1 available in both Windows and WSL, and a PSK-capable OpenSSL
+installation. The examples use an Ubuntu distribution named `Ubuntu`, a
+repository at `C:\dev\ShadowSocketProxy`, and the default WSL interface
+`eth0`.
+
+### Build the components
+
+Install the Linux build and runtime prerequisites as WSL root, then build as
+the normal WSL user:
+
+```powershell
+wsl -d Ubuntu -u root -- sh -c `
+  'apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y `
+   build-essential clang llvm linux-libc-dev libssl-dev pkg-config make `
+   iproute2 python3 ca-certificates'
+
+wsl -d Ubuntu -- bash -lc `
+  'cd /mnt/c/dev/ShadowSocketProxy &&
+   make -C crates/bpf clean all &&
+   cargo build --locked --release -p shadow-socket-proxy-control'
+```
+
+Install the Windows OpenSSL development package and build the host components:
+
+```powershell
+winget install --id ShiningLight.OpenSSL.Dev --version 4.0.1 --exact `
+  --scope machine --accept-source-agreements --accept-package-agreements
+
+$openssl = Get-ChildItem 'C:\Program Files' -Directory -Filter 'OpenSSL*' |
+  ForEach-Object { Join-Path $_.FullName 'bin\openssl.exe' } |
+  Where-Object { Test-Path $_ } |
+  Select-Object -First 1
+$opensslRoot = Split-Path (Split-Path $openssl -Parent) -Parent
+$env:OPENSSL_DIR = $opensslRoot
+$env:OPENSSL_LIB_DIR = Join-Path $opensslRoot 'lib\VC\x64\MD'
+
+cargo build --locked --release -p shadow-socket-proxy-host --features tls-psk
+```
+
+### Start the demo
+
+Open three PowerShell terminals in the repository. First, calculate the WSL
+gateway address and create one PSK shared by the control service and proxy:
+
+```powershell
+$gateway = (wsl -d Ubuntu -- ip route show default).Split()[2]
+$identity = 'ssp-demo'
+$secret = [Convert]::ToHexString((1..32 | ForEach-Object { Get-Random -Maximum 256 }))
+$secret | Set-Content -NoNewline .\ssp-demo.psk
+```
+
+In the first terminal, load the shared credentials and start the control
+service as WSL root. WSL traffic leaves through physical egress, so
+`SSP_TC_HOOK_LAYOUT=wsl` is required here. Do not set that variable for a
+native Linux deployment, which uses the default ingress/egress layout.
+
+```powershell
+$identity = 'ssp-demo'
+$secret = (Get-Content -Raw .\ssp-demo.psk).Trim()
+
+wsl -d Ubuntu -u root -- env `
+  SSP_LISTEN_ADDR=127.0.0.1:50051 `
+  SSP_TC_HOOK_LAYOUT=wsl `
+  SSP_TLS_PSK_IDENTITY=$identity `
+  SSP_TLS_PSK_SECRET=$secret `
+  /mnt/c/dev/ShadowSocketProxy/target/release/shadow-socket-proxy-control
+```
+
+In the second terminal, rediscover the gateway, identity, and OpenSSL path
+before starting the Windows proxy. The `127.0.0.1` control endpoint uses WSL
+localhost forwarding, while the proxy listens on the WSL gateway address that
+BPF will use as its synthetic destination. The proxy authenticates to the
+control service, attaches the supplied BPF ELF to the interface, and sets its
+own listener as the global target before it accepts traffic.
+
+```powershell
+$gateway = (wsl -d Ubuntu -- ip route show default).Split()[2]
+$identity = 'ssp-demo'
+$openssl = Get-ChildItem 'C:\Program Files' -Directory -Filter 'OpenSSL*' |
+  ForEach-Object { Join-Path $_.FullName 'bin\openssl.exe' } |
+  Where-Object { Test-Path $_ } |
+  Select-Object -First 1
+$opensslRoot = Split-Path (Split-Path $openssl -Parent) -Parent
+$env:PATH = "$opensslRoot\bin;$env:PATH"
+
+.\target\release\shadow-socket-proxy-host.exe `
+  --listen "${gateway}:15000" `
+  --control-endpoint https://127.0.0.1:50051 `
+  --psk-identity $identity `
+  --psk-secret-file .\ssp-demo.psk `
+  --bpf-elf /mnt/c/dev/ShadowSocketProxy/crates/bpf/shadow-socket-proxy.bpf.o `
+  --interface eth0
+```
+
+The proxy prints `connected to control service` followed by `attached BPF
+program and configured proxy target`. The control-service terminal prints
+`BPF program attached`; `wsl -d Ubuntu -u root -- bpftool prog list` also shows
+the loaded programs. Each accepted TCP connection and newly created UDP
+association then prints a `forwarding connection` record with its client,
+proxy, and original destination.
+
+In the third terminal, optionally start a local marker server and demonstrate
+the redirected WSL-to-Windows path:
+
+```powershell
+$gateway = (wsl -d Ubuntu -- ip route show default).Split()[2]
+$marker = 'ssp-demo-marker'
+$markerProcess = Start-Process pwsh -PassThru -ArgumentList @(
+  '-NoProfile', '-File', '.\scripts\tcp-marker-server.ps1',
+  '-BindAddress', $gateway, '-Port', '18080', '-Marker', $marker
+)
+
+wsl -d Ubuntu -- python3 -c `
+  "import socket; s = socket.create_connection(('$gateway', 18080), 10); s.sendall(b'demo\n'); print(s.recv(1024).decode().strip()); s.close()"
+```
+
+After the marker validation succeeds, WSL applications can make normal
+outbound connections; their eligible IPv4 TCP and UDP flows are redirected
+through the Windows proxy. For example:
+
+```powershell
+wsl -d Ubuntu -- python3 -c `
+  "import socket; s = socket.create_connection(('1.1.1.1', 443), 10); print(s.getpeername()); s.close()"
+```
+
+### Stop the demo
+
+Press `Ctrl+C` in the proxy terminal; it detaches the BPF links it attached.
+Then stop the control service and marker process, and remove the temporary PSK
+file:
+
+```powershell
+Stop-Process -Id $markerProcess.Id
+Remove-Item .\ssp-demo.psk
+```
+
 ## Documentation
 
 The generated site combines private-item Rustdoc with Doxygen for the

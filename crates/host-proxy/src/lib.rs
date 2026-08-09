@@ -140,14 +140,31 @@ impl<C: MappingClient + 'static> Proxy<C> {
         Ok(Self { config, client })
     }
 
-    /// Binds both transports, runs them until shutdown or task failure, then
-    /// aborts the sibling task and clears UDP associations.
-    pub async fn run(self, mut shutdown: watch::Receiver<bool>) -> Result<(), ProxyError> {
+    /// Binds TCP and UDP listeners at the configured specific address.
+    pub async fn bind(&self) -> Result<(TcpListener, Arc<UdpSocket>), ProxyError> {
         let tcp_listener = TcpListener::bind(self.config.listen).await?;
         let actual_listen = tcp_listener.local_addr()?;
         let udp_socket = Arc::new(UdpSocket::bind(actual_listen).await?);
+        Ok((tcp_listener, udp_socket))
+    }
+
+    /// Binds both transports, runs them until shutdown or task failure, then
+    /// aborts the sibling task and clears UDP associations.
+    pub async fn run(self, shutdown: watch::Receiver<bool>) -> Result<(), ProxyError> {
+        let (tcp_listener, udp_socket) = self.bind().await?;
+        self.run_bound(tcp_listener, udp_socket, shutdown).await
+    }
+
+    /// Runs with pre-bound listeners so control-plane activation can safely
+    /// target a listening proxy before any redirected traffic is enabled.
+    pub async fn run_bound(
+        self,
+        tcp_listener: TcpListener,
+        udp_socket: Arc<UdpSocket>,
+        mut shutdown: watch::Receiver<bool>,
+    ) -> Result<(), ProxyError> {
         let udp = Arc::new(UdpAssociations::new(
-            udp_socket.clone(),
+            udp_socket,
             self.client.clone(),
             self.config.udp_idle_timeout,
             shutdown.clone(),
@@ -227,6 +244,13 @@ async fn bridge_tcp<C: MappingClient + 'static>(
         ));
     }
     let mut outbound = TcpStream::connect(original.address).await?;
+    tracing::info!(
+        protocol = "tcp",
+        client = %tuple.source,
+        proxy = %tuple.destination,
+        destination = %original.address,
+        "forwarding connection"
+    );
     let _ = io::copy_bidirectional(&mut accepted, &mut outbound).await?;
     Ok(())
 }
@@ -346,21 +370,32 @@ impl<C: MappingClient + 'static> UdpAssociations<C> {
         client_address: SocketAddr,
         mapping: OriginalDestination,
     ) -> Result<Arc<UdpAssociation>, ProxyError> {
-        let outbound = Arc::new(UdpSocket::bind(unspecified_for(mapping.address)).await?);
-        outbound.connect(mapping.address).await?;
+        let destination = mapping.address;
+        let outbound = Arc::new(UdpSocket::bind(unspecified_for(destination)).await?);
+        outbound.connect(destination).await?;
         let candidate = Arc::new(UdpAssociation {
             client_address,
-            destination: mapping.address,
+            destination,
             outbound,
             last_seen: Mutex::new(std::time::Instant::now()),
         });
         let mut entries = self.entries.lock().await;
         if let Some(existing) = entries.get(&tuple) {
-            if existing.destination == mapping.address {
+            if existing.destination == destination {
                 return Ok(existing.clone());
             }
         }
+        let source = tuple.source;
+        let proxy = tuple.destination;
         entries.insert(tuple, candidate.clone());
+        drop(entries);
+        tracing::info!(
+            protocol = "udp",
+            client = %source,
+            proxy = %proxy,
+            destination = %destination,
+            "forwarding connection"
+        );
         spawn_udp_relay(
             candidate.clone(),
             self.socket.clone(),
@@ -472,6 +507,21 @@ impl TlsPskMappingClient {
     ) -> Result<Self, ProxyError> {
         Err(ProxyError::UnsupportedPlatform)
     }
+
+    /// Reports that BPF activation is unavailable without the Windows TLS client.
+    pub async fn activate(
+        &self,
+        _elf_path: &str,
+        _interface: &str,
+        _proxy: SocketAddr,
+    ) -> Result<(), ProxyError> {
+        Err(ProxyError::UnsupportedPlatform)
+    }
+
+    /// Reports that BPF detachment is unavailable without the Windows TLS client.
+    pub async fn detach(&self, _interface: &str) -> Result<(), ProxyError> {
+        Err(ProxyError::UnsupportedPlatform)
+    }
 }
 
 #[cfg(not(all(target_os = "windows", feature = "tls-psk")))]
@@ -534,6 +584,71 @@ mod windows_client {
                     channel,
                 ))),
             })
+        }
+
+        /// Attaches the WSL BPF ELF and sets this proxy listener as its family
+        /// target before the proxy begins accepting redirected traffic.
+        pub async fn activate(
+            &self,
+            elf_path: &str,
+            interface: &str,
+            proxy: SocketAddr,
+        ) -> Result<(), ProxyError> {
+            if elf_path.is_empty() || interface.is_empty() {
+                return Err(ProxyError::InvalidConfiguration(
+                    "BPF ELF path and interface are required".into(),
+                ));
+            }
+            let mut client = self.client.lock().await;
+            let attached = client
+                .attach(proto::InterfaceRequest {
+                    elf_path: elf_path.into(),
+                    interfaces: vec![interface.into()],
+                })
+                .await
+                .map_err(|error| ProxyError::Control(error.to_string()))?
+                .into_inner();
+            if !attached.success {
+                return Err(ProxyError::Control(attached.message));
+            }
+            let mut config = client
+                .get_config(proto::Empty {})
+                .await
+                .map_err(|error| ProxyError::Control(error.to_string()))?
+                .into_inner()
+                .config
+                .ok_or_else(|| ProxyError::Control("control service returned no config".into()))?;
+            match proxy.ip() {
+                IpAddr::V4(address) => {
+                    config.ipv4_target_address = address.octets().to_vec();
+                    config.ipv4_target_port = proxy.port() as u32;
+                }
+                IpAddr::V6(address) => {
+                    config.ipv6_target_address = address.octets().to_vec();
+                    config.ipv6_target_port = proxy.port() as u32;
+                }
+            }
+            client
+                .set_config(proto::SetConfigRequest {
+                    config: Some(config),
+                })
+                .await
+                .map_err(|error| ProxyError::Control(error.to_string()))?;
+            Ok(())
+        }
+
+        /// Detaches BPF classifiers associated with one interface.
+        pub async fn detach(&self, interface: &str) -> Result<(), ProxyError> {
+            self.client
+                .lock()
+                .await
+                .detach(proto::DetachRequest {
+                    interfaces: vec![interface.into()],
+                    all: false,
+                })
+                .await
+                .map_err(|error| ProxyError::Control(error.to_string()))?;
+            Ok(())
         }
     }
 
