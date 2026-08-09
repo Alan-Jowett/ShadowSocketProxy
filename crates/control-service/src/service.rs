@@ -344,11 +344,11 @@ impl Control for ControlService {
                     }));
                 }
                 self.set_ready(true);
-                tracing::info!(
-                    elf = %request.elf_path,
-                    interfaces = ?request.interfaces,
-                    attachments = report.attachments.len(),
-                    "BPF program attached"
+                eprintln!(
+                    "control service: attached BPF {} to {:?} ({} classifiers)",
+                    request.elf_path,
+                    request.interfaces,
+                    report.attachments.len()
                 );
                 Ok(Response::new(proto::OperationReply {
                     success: true,

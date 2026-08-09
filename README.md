@@ -159,6 +159,7 @@ $identity = 'ssp-demo'
 $secret = (Get-Content -Raw .\ssp-demo.psk).Trim()
 
 wsl -d Ubuntu -u root -- env `
+  RUST_LOG=info `
   SSP_LISTEN_ADDR=127.0.0.1:50051 `
   SSP_TC_HOOK_LAYOUT=wsl `
   SSP_TLS_PSK_IDENTITY=$identity `
@@ -182,6 +183,7 @@ $openssl = Get-ChildItem 'C:\Program Files' -Directory -Filter 'OpenSSL*' |
   Select-Object -First 1
 $opensslRoot = Split-Path (Split-Path $openssl -Parent) -Parent
 $env:PATH = "$opensslRoot\bin;$env:PATH"
+$env:RUST_LOG = 'info'
 
 .\target\release\shadow-socket-proxy-host.exe `
   --listen "${gateway}:15000" `
@@ -196,7 +198,7 @@ The proxy prints `connected to control service` followed by `attached BPF
 program and configured proxy target`. The control-service terminal prints
 `BPF program attached`; `wsl -d Ubuntu -u root -- bpftool prog list` also shows
 the loaded programs. Each accepted TCP connection and newly created UDP
-association then prints a `forwarding connection` record with its client,
+association then prints an unconditional forwarding record with its client,
 proxy, and original destination.
 
 In the third terminal, optionally start a local marker server and demonstrate

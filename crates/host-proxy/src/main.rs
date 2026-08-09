@@ -82,9 +82,9 @@ async fn main() {
                 std::process::exit(1);
             }
         };
-    tracing::info!(
-        control_endpoint = %args.control_endpoint,
-        "connected to control service"
+    eprintln!(
+        "host proxy: connected to control service at {}",
+        args.control_endpoint
     );
     let proxy_address = config.listen;
     let proxy = Proxy::new(config, Arc::new(client.clone())).expect("validated configuration");
@@ -102,11 +102,9 @@ async fn main() {
         eprintln!("control service activation failed: {error}");
         std::process::exit(1);
     }
-    tracing::info!(
-        bpf_elf = %args.bpf_elf,
-        interface = %args.interface,
-        proxy = %proxy_address,
-        "attached BPF program and configured proxy target"
+    eprintln!(
+        "host proxy: attached BPF {} to {} and configured proxy target {}",
+        args.bpf_elf, args.interface, proxy_address
     );
     let control = client.clone();
     let (shutdown, receiver) = watch::channel(false);

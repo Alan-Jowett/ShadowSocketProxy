@@ -38,7 +38,7 @@ async fn main() {
         eprintln!("shadow-socket-proxy-control failed to start: {error}");
         std::process::exit(1);
     }
-    tracing::info!(listener = %address, "control service ready for BPF attachment");
+    eprintln!("control service: ready for BPF attachment at {address}");
     if let Err(error) = runtime.serve().await {
         eprintln!("shadow-socket-proxy-control server failed: {error}");
         std::process::exit(1);

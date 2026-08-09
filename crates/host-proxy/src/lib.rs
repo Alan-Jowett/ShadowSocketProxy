@@ -244,12 +244,9 @@ async fn bridge_tcp<C: MappingClient + 'static>(
         ));
     }
     let mut outbound = TcpStream::connect(original.address).await?;
-    tracing::info!(
-        protocol = "tcp",
-        client = %tuple.source,
-        proxy = %tuple.destination,
-        destination = %original.address,
-        "forwarding connection"
+    eprintln!(
+        "host proxy: forwarding TCP connection from {} via {} to {}",
+        tuple.source, tuple.destination, original.address
     );
     let _ = io::copy_bidirectional(&mut accepted, &mut outbound).await?;
     Ok(())
@@ -389,12 +386,9 @@ impl<C: MappingClient + 'static> UdpAssociations<C> {
         let proxy = tuple.destination;
         entries.insert(tuple, candidate.clone());
         drop(entries);
-        tracing::info!(
-            protocol = "udp",
-            client = %source,
-            proxy = %proxy,
-            destination = %destination,
-            "forwarding connection"
+        eprintln!(
+            "host proxy: forwarding UDP association from {} via {} to {}",
+            source, proxy, destination
         );
         spawn_udp_relay(
             candidate.clone(),
