@@ -1440,8 +1440,8 @@ mod linux {
             11,
         );
         fixture.run_program(
-            "control-bypass tcp response",
-            INGRESS_PROGRAM_NAME,
+            "control-bypass tcp reverse",
+            EGRESS_PROGRAM_NAME,
             &tcp_input,
             &tcp_input,
         )?;

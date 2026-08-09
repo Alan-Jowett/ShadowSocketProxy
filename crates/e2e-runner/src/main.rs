@@ -3,14 +3,16 @@
 //! Runs the shared Windows/WSL TCP deployment validation against the control API.
 
 #[cfg(not(all(target_os = "windows", feature = "tls-psk")))]
-/// Reports that the deployment driver requires its Windows TLS-PSK build.
+/// Prints a Windows/TLS-PSK requirement diagnostic and exits unsuccessfully
+/// when this test driver is built on an unsupported platform or without TLS.
 fn main() {
     eprintln!("shadow-socket-proxy-e2e-runner requires Windows and the tls-psk feature");
     std::process::exit(1);
 }
 
 #[cfg(all(target_os = "windows", feature = "tls-psk"))]
-/// Contains the Windows implementation that configures and exercises WSL.
+/// Authenticates to the WSL control service, attaches/configures BPF, creates
+/// the TCP probe, and verifies the returned marker and exact flow mapping.
 mod windows {
     use std::{
         net::{IpAddr, SocketAddr},
@@ -192,6 +194,13 @@ mod windows {
             mapping = page.mappings.into_iter().find(|entry| {
                 let original_matches = entry.original.as_ref().is_some_and(|tuple| {
                     tuple.family == 4
+                        && tuple.protocol == 6
+                        && tuple.source_address
+                            == match client_tuple.ip() {
+                                IpAddr::V4(address) => address.octets().to_vec(),
+                                IpAddr::V6(_) => Vec::new(),
+                            }
+                        && tuple.source_port == client_tuple.port() as u32
                         && tuple.destination_address
                             == match args.target.ip() {
                                 IpAddr::V4(address) => address.octets().to_vec(),
@@ -201,6 +210,7 @@ mod windows {
                 });
                 let synthetic_matches = entry.synthetic.as_ref().is_some_and(|tuple| {
                     tuple.family == 4
+                        && tuple.protocol == 6
                         && tuple.source_address
                             == match client_tuple.ip() {
                                 IpAddr::V4(address) => address.octets().to_vec(),

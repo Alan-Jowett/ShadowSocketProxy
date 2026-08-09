@@ -127,13 +127,17 @@ try {
         -RedirectStandardOutput $controlStdout -RedirectStandardError $controlStderr `
         -ArgumentList @(
             "-d", $Distribution, "-u", "root", "--", "env",
-            "SSP_LISTEN_ADDR=0.0.0.0:$controlPort",
+            "SSP_LISTEN_ADDR=127.0.0.1:$controlPort",
             "SSP_TC_HOOK_LAYOUT=wsl",
             "SSP_TLS_PSK_IDENTITY=$identity",
             "SSP_TLS_PSK_SECRET=$secret",
             $controlWsl
         )
-    Start-Sleep -Seconds 2
+    Wait-WslTcpListener $Distribution $controlPort
+    if ($controlProcess.HasExited) {
+        Get-Content $controlStderr -ErrorAction SilentlyContinue
+        throw "control service exited before the host proxy started"
+    }
 
     $serverProcess = Start-Process pwsh -PassThru -WindowStyle Hidden -ArgumentList @(
         "-NoProfile", "-File", $server, "-BindAddress", $hostGateway,
@@ -160,11 +164,6 @@ try {
         Get-Content $proxyStderr -ErrorAction SilentlyContinue
         throw
     }
-    Wait-WslTcpListener $Distribution $controlPort
-    if ($controlProcess.HasExited) {
-        Get-Content $controlStderr -ErrorAction SilentlyContinue
-        throw "control service exited before the E2E runner started"
-    }
     & $runner --control-endpoint $endpoint --psk-identity $identity `
         --psk-secret $secret --elf-path $bpfWsl --interface $Interface `
         --target $target --proxy $proxyAddress --wsl-distribution $Distribution `
@@ -177,22 +176,35 @@ try {
     }
 }
 finally {
+    $cleanupErrors = [System.Collections.Generic.List[string]]::new()
     foreach ($process in @($proxyProcess, $serverProcess, $controlProcess)) {
-        if ($null -ne $process -and -not $process.HasExited) {
-            Stop-Process -Id $process.Id -Force
+        try {
+            if ($null -ne $process -and -not $process.HasExited) {
+                Stop-Process -Id $process.Id -Force
+            }
+        }
+        catch {
+            $cleanupErrors.Add("process cleanup failed: $_")
+        }
+    }
+    if ($qdiscPrepared) {
+        try {
+            Invoke-WslRoot $Distribution @("tc", "qdisc", "del", "dev", $Interface, "clsact")
+        }
+        catch {
+            $cleanupErrors.Add("qdisc cleanup failed: $_")
         }
     }
     try {
-        if ($qdiscPrepared) {
-            Invoke-WslRoot $Distribution @("tc", "qdisc", "del", "dev", $Interface, "clsact")
-        }
         & wsl.exe --terminate $Distribution
         if ($LASTEXITCODE -ne 0) {
             throw "WSL distribution termination failed"
         }
     }
     catch {
-        Write-Error "WSL cleanup failed: $_"
-        throw
+        $cleanupErrors.Add("WSL termination failed: $_")
+    }
+    if ($cleanupErrors.Count -ne 0) {
+        throw "WSL cleanup failed: $($cleanupErrors -join '; ')"
     }
 }
