@@ -18,8 +18,13 @@ try {
         try {
             $stream = $client.GetStream()
             $buffer = New-Object byte[] 4096
-            [void]$stream.Read($buffer, 0, $buffer.Length)
-            $response = [Text.Encoding]::UTF8.GetBytes("$Marker`n")
+            $read = $stream.Read($buffer, 0, $buffer.Length)
+            if ($read -eq 0) {
+                continue
+            }
+            $response = [Text.Encoding]::UTF8.GetBytes(
+                "$Marker|$($client.Client.RemoteEndPoint)`n"
+            )
             $stream.Write($response, 0, $response.Length)
             $stream.Flush()
         }

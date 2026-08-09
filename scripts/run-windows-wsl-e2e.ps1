@@ -138,7 +138,7 @@ try {
             "SSP_TC_HOOK_LAYOUT=wsl",
             "SSP_TLS_PSK_IDENTITY=$identity",
             "SSP_TLS_PSK_SECRET=$secret",
-            $controlWsl
+            "`"$controlWsl`""
         )
     Wait-WslTcpListener $Distribution $controlPort
     if ($controlProcess.HasExited) {
@@ -147,7 +147,7 @@ try {
     }
 
     $serverProcess = Start-Process pwsh -PassThru -WindowStyle Hidden -ArgumentList @(
-        "-NoProfile", "-File", $server, "-BindAddress", $hostGateway,
+        "-NoProfile", "-File", "`"$server`"", "-BindAddress", $hostGateway,
         "-Port", $serverPort, "-Marker", $marker
     )
     Wait-TcpPort $hostGateway $serverPort
@@ -157,7 +157,9 @@ try {
         "--listen", $proxyAddress,
         "--control-endpoint", $endpoint,
         "--psk-identity", $identity,
-        "--psk-secret", $secret
+        "--psk-secret", $secret,
+        "--bpf-elf", "`"$bpfWsl`"",
+        "--interface", $Interface
     )
     Start-Sleep -Milliseconds 500
     if ($proxyProcess.HasExited) {
@@ -172,8 +174,8 @@ try {
         throw
     }
     & $runner --control-endpoint $endpoint --psk-identity $identity `
-        --psk-secret $secret --elf-path $bpfWsl --interface $Interface `
-        --target $target --proxy $proxyAddress --wsl-distribution $Distribution `
+        --psk-secret $secret --target $target --proxy $proxyAddress `
+        --wsl-distribution $Distribution `
         --marker $marker
     $runnerExitCode = $LASTEXITCODE
     if ($runnerExitCode -ne 0) {

@@ -605,29 +605,49 @@ mod windows_client {
             if !attached.success {
                 return Err(ProxyError::Control(attached.message));
             }
-            let mut config = client
-                .get_config(proto::Empty {})
-                .await
-                .map_err(|error| ProxyError::Control(error.to_string()))?
-                .into_inner()
-                .config
-                .ok_or_else(|| ProxyError::Control("control service returned no config".into()))?;
-            match proxy.ip() {
-                IpAddr::V4(address) => {
-                    config.ipv4_target_address = address.octets().to_vec();
-                    config.ipv4_target_port = proxy.port() as u32;
+            let configured = async {
+                let mut config = client
+                    .get_config(proto::Empty {})
+                    .await
+                    .map_err(|error| ProxyError::Control(error.to_string()))?
+                    .into_inner()
+                    .config
+                    .ok_or_else(|| {
+                        ProxyError::Control("control service returned no config".into())
+                    })?;
+                match proxy.ip() {
+                    IpAddr::V4(address) => {
+                        config.ipv4_target_address = address.octets().to_vec();
+                        config.ipv4_target_port = proxy.port() as u32;
+                    }
+                    IpAddr::V6(address) => {
+                        config.ipv6_target_address = address.octets().to_vec();
+                        config.ipv6_target_port = proxy.port() as u32;
+                    }
                 }
-                IpAddr::V6(address) => {
-                    config.ipv6_target_address = address.octets().to_vec();
-                    config.ipv6_target_port = proxy.port() as u32;
-                }
+                client
+                    .set_config(proto::SetConfigRequest {
+                        config: Some(config),
+                    })
+                    .await
+                    .map_err(|error| ProxyError::Control(error.to_string()))?;
+                Ok(())
             }
-            client
-                .set_config(proto::SetConfigRequest {
-                    config: Some(config),
-                })
-                .await
-                .map_err(|error| ProxyError::Control(error.to_string()))?;
+            .await;
+            if let Err(error) = configured {
+                let rollback = client
+                    .detach(proto::DetachRequest {
+                        interfaces: vec![interface.into()],
+                        all: false,
+                    })
+                    .await;
+                return match rollback {
+                    Ok(_) => Err(error),
+                    Err(rollback_error) => Err(ProxyError::Control(format!(
+                        "{error}; attach rollback failed: {rollback_error}"
+                    ))),
+                };
+            }
             Ok(())
         }
 

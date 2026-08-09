@@ -52,12 +52,6 @@ mod windows {
         /// Ephemeral TLS-PSK secret.
         psk_secret: String,
         #[arg(long)]
-        /// Deployed BPF ELF path as visible inside WSL.
-        elf_path: String,
-        #[arg(long)]
-        /// WSL interface receiving the TC classifiers.
-        interface: String,
-        #[arg(long)]
         /// Windows test-server address that BPF should preserve as original.
         target: SocketAddr,
         #[arg(long)]
@@ -74,43 +68,12 @@ mod windows {
     /// Tonic client type used for authenticated control RPCs.
     type Client = proto::control_client::ControlClient<tonic::transport::Channel>;
 
-    /// Attaches the deployed BPF program, configures its target, generates a
-    /// WSL TCP flow, and verifies marker, mapping, readiness, and counter state.
+    /// Verifies the proxy-owned BPF activation with a WSL TCP flow, exact
+    /// marker response, mapping state, readiness, and counter checks.
     pub async fn run() -> Result<(), String> {
         let args = Args::parse();
         let mut client =
             connect(&args.control_endpoint, &args.psk_identity, &args.psk_secret).await?;
-
-        let attach = client
-            .attach(proto::InterfaceRequest {
-                elf_path: args.elf_path.clone(),
-                interfaces: vec![args.interface.clone()],
-            })
-            .await
-            .map_err(|error| format!("attach failed: {error}"))?
-            .into_inner();
-        if !attach.success {
-            return Err(format!("attach rejected: {}", attach.message));
-        }
-
-        let mut config = client
-            .get_config(proto::Empty {})
-            .await
-            .map_err(|error| format!("get config failed: {error}"))?
-            .into_inner()
-            .config
-            .ok_or_else(|| "get config returned no configuration".to_string())?;
-        config.ipv4_target_address = match args.proxy.ip() {
-            IpAddr::V4(address) => address.octets().to_vec(),
-            IpAddr::V6(_) => return Err("E2E proxy must be IPv4".into()),
-        };
-        config.ipv4_target_port = args.proxy.port() as u32;
-        client
-            .set_config(proto::SetConfigRequest {
-                config: Some(config),
-            })
-            .await
-            .map_err(|error| format!("set config failed: {error}"))?;
 
         let before = client
             .get_status(proto::Empty {})
@@ -118,7 +81,7 @@ mod windows {
             .map_err(|error| format!("initial status failed: {error}"))?
             .into_inner();
         if !before.ready {
-            return Err("control service is not ready after attach".into());
+            return Err("control service is not ready after proxy activation".into());
         }
 
         let output = Command::new("wsl.exe")
@@ -169,8 +132,20 @@ mod windows {
             .lines()
             .find_map(|line| line.strip_prefix("RESPONSE="))
             .ok_or_else(|| "WSL client did not report a marker response".to_string())?;
-        if returned_marker != args.marker {
+        let (marker, peer) = returned_marker
+            .split_once('|')
+            .ok_or_else(|| "marker response omitted its observed peer".to_string())?;
+        if marker != args.marker {
             return Err(format!("unexpected marker response: {returned_marker}"));
+        }
+        let peer = peer
+            .parse::<SocketAddr>()
+            .map_err(|error| format!("invalid marker peer: {error}"))?;
+        if peer.ip() != args.proxy.ip() {
+            return Err(format!(
+                "marker was reached directly by {peer} instead of through proxy {}",
+                args.proxy.ip()
+            ));
         }
 
         let mut mapping = None;
@@ -183,49 +158,56 @@ mod windows {
             if status.flow_insert_failures != before.flow_insert_failures {
                 return Err("flow insertion failure counter increased".into());
             }
-            let page = client
-                .list_mappings(proto::ListMappingsRequest {
-                    limit: 256,
-                    page_token: Vec::new(),
-                })
-                .await
-                .map_err(|error| format!("list mappings failed: {error}"))?
-                .into_inner();
-            mapping = page.mappings.into_iter().find(|entry| {
-                let original_matches = entry.original.as_ref().is_some_and(|tuple| {
-                    tuple.family == 4
-                        && tuple.protocol == 6
-                        && tuple.source_address
-                            == match client_tuple.ip() {
-                                IpAddr::V4(address) => address.octets().to_vec(),
-                                IpAddr::V6(_) => Vec::new(),
-                            }
-                        && tuple.source_port == client_tuple.port() as u32
-                        && tuple.destination_address
-                            == match args.target.ip() {
-                                IpAddr::V4(address) => address.octets().to_vec(),
-                                IpAddr::V6(_) => Vec::new(),
-                            }
-                        && tuple.destination_port == args.target.port() as u32
+            let mut page_token = Vec::new();
+            loop {
+                let page = client
+                    .list_mappings(proto::ListMappingsRequest {
+                        limit: 256,
+                        page_token,
+                    })
+                    .await
+                    .map_err(|error| format!("list mappings failed: {error}"))?
+                    .into_inner();
+                mapping = page.mappings.into_iter().find(|entry| {
+                    let original_matches = entry.original.as_ref().is_some_and(|tuple| {
+                        tuple.family == 4
+                            && tuple.protocol == 6
+                            && tuple.source_address
+                                == match client_tuple.ip() {
+                                    IpAddr::V4(address) => address.octets().to_vec(),
+                                    IpAddr::V6(_) => Vec::new(),
+                                }
+                            && tuple.source_port == client_tuple.port() as u32
+                            && tuple.destination_address
+                                == match args.target.ip() {
+                                    IpAddr::V4(address) => address.octets().to_vec(),
+                                    IpAddr::V6(_) => Vec::new(),
+                                }
+                            && tuple.destination_port == args.target.port() as u32
+                    });
+                    let synthetic_matches = entry.synthetic.as_ref().is_some_and(|tuple| {
+                        tuple.family == 4
+                            && tuple.protocol == 6
+                            && tuple.source_address
+                                == match client_tuple.ip() {
+                                    IpAddr::V4(address) => address.octets().to_vec(),
+                                    IpAddr::V6(_) => Vec::new(),
+                                }
+                            && tuple.source_port == client_tuple.port() as u32
+                            && tuple.destination_address
+                                == match args.proxy.ip() {
+                                    IpAddr::V4(address) => address.octets().to_vec(),
+                                    IpAddr::V6(_) => Vec::new(),
+                                }
+                            && tuple.destination_port == args.proxy.port() as u32
+                    });
+                    original_matches && synthetic_matches
                 });
-                let synthetic_matches = entry.synthetic.as_ref().is_some_and(|tuple| {
-                    tuple.family == 4
-                        && tuple.protocol == 6
-                        && tuple.source_address
-                            == match client_tuple.ip() {
-                                IpAddr::V4(address) => address.octets().to_vec(),
-                                IpAddr::V6(_) => Vec::new(),
-                            }
-                        && tuple.source_port == client_tuple.port() as u32
-                        && tuple.destination_address
-                            == match args.proxy.ip() {
-                                IpAddr::V4(address) => address.octets().to_vec(),
-                                IpAddr::V6(_) => Vec::new(),
-                            }
-                        && tuple.destination_port == args.proxy.port() as u32
-                });
-                original_matches && synthetic_matches
-            });
+                if mapping.is_some() || page.next_page_token.is_empty() {
+                    break;
+                }
+                page_token = page.next_page_token;
+            }
             if mapping.is_some() {
                 break;
             }
