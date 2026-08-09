@@ -667,7 +667,9 @@ mod windows_client {
         Ok(Arc::new(builder.build()))
     }
 
-    /// Opens a TCP stream for the URI and completes the client TLS handshake.
+    /// Opens a TCP stream within five seconds for the URI and completes the
+    /// client TLS handshake so an unreachable control service cannot block
+    /// proxy startup indefinitely.
     async fn connect_tls(
         uri: http::Uri,
         context: Arc<SslContext>,
@@ -675,7 +677,12 @@ mod windows_client {
         let authority = uri.authority().ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "endpoint authority missing")
         })?;
-        let stream = TcpStream::connect(authority.as_str()).await?;
+        let stream = time::timeout(
+            Duration::from_secs(5),
+            TcpStream::connect(authority.as_str()),
+        )
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "control connect timeout"))??;
         let host = authority.host();
         let mut ssl = Ssl::new(&context).map_err(openssl_io_error)?;
         ssl.set_hostname(host).map_err(openssl_io_error)?;

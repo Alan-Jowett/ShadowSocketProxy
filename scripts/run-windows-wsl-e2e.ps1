@@ -101,7 +101,9 @@ $secret = -join (1..32 | ForEach-Object { "{0:x2}" -f (Get-Random -Maximum 256) 
 $controlPort = 50051
 $proxyPort = 15000
 $serverPort = 18080
-$endpoint = "https://$wslIp`:$controlPort"
+# WSL localhost forwarding avoids Hyper-V firewall policy between the Windows
+# host and the WSL virtual NIC for the TLS control-plane connection.
+$endpoint = "https://127.0.0.1:$controlPort"
 $target = "${hostGateway}:$serverPort"
 $proxyAddress = "${hostGateway}:$proxyPort"
 $serverProcess = $null
@@ -148,9 +150,16 @@ try {
     )
     Start-Sleep -Milliseconds 500
     if ($proxyProcess.HasExited) {
+        Get-Content $proxyStderr -ErrorAction SilentlyContinue
         throw "host proxy exited before readiness checks"
     }
-    Wait-TcpPort $hostGateway $proxyPort
+    try {
+        Wait-TcpPort $hostGateway $proxyPort
+    }
+    catch {
+        Get-Content $proxyStderr -ErrorAction SilentlyContinue
+        throw
+    }
     Wait-WslTcpListener $Distribution $controlPort
     if ($controlProcess.HasExited) {
         Get-Content $controlStderr -ErrorAction SilentlyContinue
