@@ -1288,28 +1288,6 @@ mod windows_client {
                     } else {
                         ProxyError::Control(error.to_string())
                     }
-
-                    #[async_trait]
-                    impl FlowClient for TlsPskMappingClient {
-                        /// Delegates typed flow enumeration to the authenticated channel.
-                        async fn enumerate_flows(
-                            &self,
-                            page_token: Vec<u8>,
-                            limit: u32,
-                        ) -> Result<(Vec<FlowRecord>, Vec<u8>), ProxyError>
-                        {
-                            self.enumerate_flows(page_token, limit).await
-                        }
-
-                        /// Delegates generation-checked flow deletion to the authenticated channel.
-                        async fn delete_flow(
-                            &self,
-                            flow_id: u64,
-                            generation: u32,
-                        ) -> Result<FlowDeleteReport, ProxyError> {
-                            self.delete_flow(flow_id, generation).await
-                        }
-                    }
                 })?
                 .into_inner();
             let synthetic = mapping
@@ -1341,6 +1319,27 @@ mod windows_client {
                 address: address.destination,
                 protocol: address.protocol,
             })
+        }
+    }
+
+    #[async_trait]
+    impl FlowClient for TlsPskMappingClient {
+        /// Delegates typed flow enumeration to the authenticated channel.
+        async fn enumerate_flows(
+            &self,
+            page_token: Vec<u8>,
+            limit: u32,
+        ) -> Result<(Vec<FlowRecord>, Vec<u8>), ProxyError> {
+            self.enumerate_flows(page_token, limit).await
+        }
+
+        /// Delegates generation-checked flow deletion to the authenticated channel.
+        async fn delete_flow(
+            &self,
+            flow_id: u64,
+            generation: u32,
+        ) -> Result<FlowDeleteReport, ProxyError> {
+            self.delete_flow(flow_id, generation).await
         }
     }
 
