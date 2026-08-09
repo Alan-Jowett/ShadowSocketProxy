@@ -333,9 +333,14 @@ mod windows {
             .map_err(|error| std::io::Error::other(error.to_string()))?;
         let mut stream = SslStream::new(ssl, stream)
             .map_err(|error| std::io::Error::other(error.to_string()))?;
-        Pin::new(&mut stream)
-            .connect()
+        timeout(Duration::from_secs(10), Pin::new(&mut stream).connect())
             .await
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "control TLS handshake timeout",
+                )
+            })?
             .map_err(|error| std::io::Error::other(error.to_string()))?;
         Ok(TokioIo::new(stream))
     }

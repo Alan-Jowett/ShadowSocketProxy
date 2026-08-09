@@ -50,7 +50,7 @@ jobs:
           if-no-files-found: error
 
   build-control-service-artifact:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
 
     steps:
       - name: Check out repository
@@ -216,7 +216,8 @@ jobs:
           .\scripts\run-windows-wsl-e2e.ps1 `
             -BpfArtifact "${{ github.workspace }}\artifacts\bpf\shadow-socket-proxy.bpf.o" `
             -ControlArtifact "${{ github.workspace }}\artifacts\control\shadow-socket-proxy-control" `
-            -HostArtifact "${{ github.workspace }}\artifacts\host"
+            -HostArtifact "${{ github.workspace }}\artifacts\host" `
+            -TerminateDistribution
 
   documentation:
     runs-on: ubuntu-latest

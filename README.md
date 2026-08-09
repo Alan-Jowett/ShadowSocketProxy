@@ -138,3 +138,7 @@ cargo build --locked --release -p shadow-socket-proxy-e2e-runner --features tls-
 The command fails when WSL, BPF/TC, authentication, process, marker,
 mapping, counter, or cleanup prerequisites are unavailable; it never falls
 back to direct forwarding.
+
+Local runs retain the selected WSL distribution and its existing TC setup.
+CI passes `-TerminateDistribution` because it uses a disposable hosted
+distribution.

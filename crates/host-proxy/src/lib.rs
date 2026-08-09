@@ -687,9 +687,9 @@ mod windows_client {
         let mut ssl = Ssl::new(&context).map_err(openssl_io_error)?;
         ssl.set_hostname(host).map_err(openssl_io_error)?;
         let mut ssl = SslStream::new(ssl, stream).map_err(openssl_io_error)?;
-        Pin::new(&mut ssl)
-            .connect()
+        time::timeout(Duration::from_secs(5), Pin::new(&mut ssl).connect())
             .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "control TLS handshake timeout"))?
             .map_err(openssl_io_error)?;
         Ok(TokioIo::new(ssl))
     }

@@ -7,6 +7,7 @@ param(
     [string] $HostArtifact,
     [string] $Distribution,
     [string] $Interface,
+    [switch] $TerminateDistribution,
     [string] $WorkDirectory = (Join-Path $env:TEMP "shadow-socket-proxy-e2e")
 )
 
@@ -109,7 +110,7 @@ $proxyAddress = "${hostGateway}:$proxyPort"
 $serverProcess = $null
 $controlProcess = $null
 $proxyProcess = $null
-$qdiscPrepared = $false
+$qdiscCreated = $false
 $controlStdout = Join-Path $WorkDirectory "control.stdout.log"
 $controlStderr = Join-Path $WorkDirectory "control.stderr.log"
 $proxyStdout = Join-Path $WorkDirectory "host-proxy.stdout.log"
@@ -120,8 +121,14 @@ try {
         "if command -v dnf >/dev/null; then dnf install -y iproute iproute-tc python3 openssl-libs ca-certificates; elif command -v apt-get >/dev/null; then apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends iproute2 python3 libssl3 ca-certificates; else echo 'unsupported WSL package manager' >&2; exit 1; fi")
     Invoke-WslRoot $Distribution @("chmod", "+x", $bpfWsl, $controlWsl)
     Invoke-WslRoot $Distribution @("sh", "-c",
-        "command -v tc >/dev/null || { echo 'tc is required but unavailable' >&2; exit 1; }; tc qdisc del dev $Interface clsact 2>/dev/null || true; tc qdisc add dev $Interface clsact")
-    $qdiscPrepared = $true
+        "command -v tc >/dev/null || { echo 'tc is required but unavailable' >&2; exit 1; }")
+    $qdiscListing = Invoke-Wsl @(
+        "-d", $Distribution, "-u", "root", "--", "tc", "qdisc", "show", "dev", $Interface
+    )
+    if ($qdiscListing -notmatch "(?m)^qdisc clsact ") {
+        Invoke-WslRoot $Distribution @("tc", "qdisc", "add", "dev", $Interface, "clsact")
+        $qdiscCreated = $true
+    }
 
     $controlProcess = Start-Process wsl.exe -PassThru -WindowStyle Hidden `
         -RedirectStandardOutput $controlStdout -RedirectStandardError $controlStderr `
@@ -187,7 +194,7 @@ finally {
             $cleanupErrors.Add("process cleanup failed: $_")
         }
     }
-    if ($qdiscPrepared) {
+    if ($qdiscCreated) {
         try {
             Invoke-WslRoot $Distribution @("tc", "qdisc", "del", "dev", $Interface, "clsact")
         }
@@ -195,14 +202,16 @@ finally {
             $cleanupErrors.Add("qdisc cleanup failed: $_")
         }
     }
-    try {
-        & wsl.exe --terminate $Distribution
-        if ($LASTEXITCODE -ne 0) {
-            throw "WSL distribution termination failed"
+    if ($TerminateDistribution) {
+        try {
+            & wsl.exe --terminate $Distribution
+            if ($LASTEXITCODE -ne 0) {
+                throw "WSL distribution termination failed"
+            }
         }
-    }
-    catch {
-        $cleanupErrors.Add("WSL termination failed: $_")
+        catch {
+            $cleanupErrors.Add("WSL termination failed: $_")
+        }
     }
     if ($cleanupErrors.Count -ne 0) {
         throw "WSL cleanup failed: $($cleanupErrors -join '; ')"
