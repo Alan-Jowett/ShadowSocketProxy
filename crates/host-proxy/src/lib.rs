@@ -190,6 +190,11 @@ impl<C: MappingClient + 'static> Proxy<C> {
             },
         };
         udp.shutdown().await;
+        tracing::info!(
+            protocol = "proxy",
+            reason = "forwarding_stopped",
+            "host proxy shutdown"
+        );
         result
     }
 }
@@ -226,6 +231,32 @@ async fn run_tcp<C: MappingClient + 'static>(
     while sessions.join_next().await.is_some() {}
 }
 
+/// Emits a termination event if a running TCP bridge is cancelled.
+struct TcpForwardingGuard {
+    /// Synthetic tuple associated with the bridge.
+    tuple: Tuple,
+    /// Original destination used by the bridge.
+    original_destination: SocketAddr,
+    /// Indicates that the bridge emitted its normal termination event.
+    completed: bool,
+}
+
+impl Drop for TcpForwardingGuard {
+    /// Reports cancellation when the bridge future is dropped before completion.
+    fn drop(&mut self) {
+        if !self.completed {
+            tracing::info!(
+                protocol = "tcp",
+                synthetic_source = %self.tuple.source,
+                synthetic_destination = %self.tuple.destination,
+                original_destination = %self.original_destination,
+                reason = "cancelled",
+                "TCP forwarding terminated"
+            );
+        }
+    }
+}
+
 /// Looks up the accepted tuple, connects to the original destination, and
 /// copies bytes bidirectionally until either stream closes.
 async fn bridge_tcp<C: MappingClient + 'static>(
@@ -237,18 +268,87 @@ async fn bridge_tcp<C: MappingClient + 'static>(
         destination: accepted.local_addr()?,
         protocol: TCP_PROTOCOL,
     };
-    let original = client.get_mapping(&tuple).await?;
+    let original = match client.get_mapping(&tuple).await {
+        Ok(original) => original,
+        Err(error) => {
+            tracing::warn!(
+                protocol = "tcp",
+                synthetic_source = %tuple.source,
+                synthetic_destination = %tuple.destination,
+                error = %error,
+                "TCP mapping lookup failed"
+            );
+            return Err(error);
+        }
+    };
     if original.protocol != TCP_PROTOCOL {
+        tracing::warn!(
+            protocol = "tcp",
+            synthetic_source = %tuple.source,
+            synthetic_destination = %tuple.destination,
+            original_destination = %original.address,
+            reason = "protocol_mismatch",
+            "TCP mapping validation failed"
+        );
         return Err(ProxyError::InvalidMapping(
             "TCP lookup returned a non-TCP mapping".into(),
         ));
     }
-    let mut outbound = TcpStream::connect(original.address).await?;
-    eprintln!(
-        "host proxy: forwarding TCP connection from {} via {} to {}",
-        tuple.source, tuple.destination, original.address
+    let mut outbound = match TcpStream::connect(original.address).await {
+        Ok(outbound) => outbound,
+        Err(error) => {
+            tracing::warn!(
+                protocol = "tcp",
+                synthetic_source = %tuple.source,
+                synthetic_destination = %tuple.destination,
+                original_destination = %original.address,
+                error = %error,
+                "TCP outbound connection failed"
+            );
+            return Err(error.into());
+        }
+    };
+    let mut termination = TcpForwardingGuard {
+        tuple: tuple.clone(),
+        original_destination: original.address,
+        completed: false,
+    };
+    tracing::info!(
+        protocol = "tcp",
+        synthetic_source = %tuple.source,
+        synthetic_destination = %tuple.destination,
+        original_destination = %original.address,
+        reason = "forwarding_started",
+        "TCP forwarding started"
     );
-    let _ = io::copy_bidirectional(&mut accepted, &mut outbound).await?;
+    match io::copy_bidirectional(&mut accepted, &mut outbound).await {
+        Ok((client_to_destination, destination_to_client)) => {
+            tracing::info!(
+                protocol = "tcp",
+                synthetic_source = %tuple.source,
+                synthetic_destination = %tuple.destination,
+                original_destination = %original.address,
+                client_to_destination,
+                destination_to_client,
+                reason = "stream_closed",
+                "TCP forwarding terminated"
+            );
+            termination.completed = true;
+        }
+        Err(error) => {
+            tracing::warn!(
+                protocol = "tcp",
+                synthetic_source = %tuple.source,
+                synthetic_destination = %tuple.destination,
+                original_destination = %original.address,
+                error = %error,
+                reason = "stream_error",
+                "TCP forwarding terminated with error"
+            );
+            termination.completed = true;
+            return Err(error.into());
+        }
+    }
     Ok(())
 }
 
@@ -302,8 +402,14 @@ struct UdpAssociations<C> {
 struct UdpAssociation {
     /// Client endpoint receiving relayed responses.
     client_address: SocketAddr,
+    /// Synthetic client tuple used for the control-service mapping.
+    synthetic_source: SocketAddr,
+    /// Synthetic proxy tuple used for the control-service mapping.
+    synthetic_destination: SocketAddr,
     /// Current mapped destination; changes cause association replacement.
     destination: SocketAddr,
+    /// Monotonic creation time used to report association lifetime.
+    created_at: std::time::Instant,
     /// Connected UDP socket used for outbound datagrams and replies.
     outbound: Arc<UdpSocket>,
     /// Last successful send or receive time for idle reaping.
@@ -336,8 +442,28 @@ impl<C: MappingClient + 'static> UdpAssociations<C> {
             destination: self.socket.local_addr()?,
             protocol: UDP_PROTOCOL,
         };
-        let mapping = self.client.get_mapping(&tuple).await?;
+        let mapping = match self.client.get_mapping(&tuple).await {
+            Ok(mapping) => mapping,
+            Err(error) => {
+                tracing::warn!(
+                    protocol = "udp",
+                    synthetic_source = %tuple.source,
+                    synthetic_destination = %tuple.destination,
+                    error = %error,
+                    "UDP mapping lookup failed"
+                );
+                return Err(error);
+            }
+        };
         if mapping.protocol != UDP_PROTOCOL {
+            tracing::warn!(
+                protocol = "udp",
+                synthetic_source = %tuple.source,
+                synthetic_destination = %tuple.destination,
+                original_destination = %mapping.address,
+                reason = "protocol_mismatch",
+                "UDP mapping validation failed"
+            );
             return Err(ProxyError::InvalidMapping(
                 "UDP lookup returned a non-UDP mapping".into(),
             ));
@@ -347,14 +473,29 @@ impl<C: MappingClient + 'static> UdpAssociations<C> {
             if existing.destination == mapping.address {
                 existing
             } else {
-                self.replace_association(tuple, client_address, mapping)
-                    .await?
+                self.replace_association(
+                    tuple.clone(),
+                    client_address,
+                    mapping,
+                    existing.destination,
+                )
+                .await?
             }
         } else {
-            self.insert_association(tuple, client_address, mapping)
+            self.insert_association(tuple.clone(), client_address, mapping, None)
                 .await?
         };
-        association.outbound.send(payload).await?;
+        if let Err(error) = association.outbound.send(payload).await {
+            tracing::warn!(
+                protocol = "udp",
+                synthetic_source = %tuple.source,
+                synthetic_destination = %tuple.destination,
+                original_destination = %association.destination,
+                error = %error,
+                "UDP datagram send failed"
+            );
+            return Err(error.into());
+        }
         *association.last_seen.lock().await = std::time::Instant::now();
         Ok(())
     }
@@ -366,13 +507,40 @@ impl<C: MappingClient + 'static> UdpAssociations<C> {
         tuple: Tuple,
         client_address: SocketAddr,
         mapping: OriginalDestination,
+        previous_destination: Option<SocketAddr>,
     ) -> Result<Arc<UdpAssociation>, ProxyError> {
         let destination = mapping.address;
-        let outbound = Arc::new(UdpSocket::bind(unspecified_for(destination)).await?);
-        outbound.connect(destination).await?;
+        let outbound = Arc::new(match UdpSocket::bind(unspecified_for(destination)).await {
+            Ok(outbound) => outbound,
+            Err(error) => {
+                tracing::warn!(
+                    protocol = "udp",
+                    synthetic_source = %tuple.source,
+                    synthetic_destination = %tuple.destination,
+                    original_destination = %destination,
+                    error = %error,
+                    "UDP outbound socket bind failed"
+                );
+                return Err(error.into());
+            }
+        });
+        if let Err(error) = outbound.connect(destination).await {
+            tracing::warn!(
+                protocol = "udp",
+                synthetic_source = %tuple.source,
+                synthetic_destination = %tuple.destination,
+                original_destination = %destination,
+                error = %error,
+                "UDP outbound connection failed"
+            );
+            return Err(error.into());
+        }
         let candidate = Arc::new(UdpAssociation {
             client_address,
+            synthetic_source: tuple.source,
+            synthetic_destination: tuple.destination,
             destination,
+            created_at: std::time::Instant::now(),
             outbound,
             last_seen: Mutex::new(std::time::Instant::now()),
         });
@@ -386,10 +554,27 @@ impl<C: MappingClient + 'static> UdpAssociations<C> {
         let proxy = tuple.destination;
         entries.insert(tuple, candidate.clone());
         drop(entries);
-        eprintln!(
-            "host proxy: forwarding UDP association from {} via {} to {}",
-            source, proxy, destination
-        );
+        match previous_destination {
+            Some(previous_destination) => tracing::info!(
+                protocol = "udp",
+                synthetic_source = %source,
+                synthetic_destination = %proxy,
+                previous_destination = %previous_destination,
+                original_destination = %destination,
+                association_age_ms = 0_u64,
+                reason = "association_replaced",
+                "UDP association replaced"
+            ),
+            None => tracing::info!(
+                protocol = "udp",
+                synthetic_source = %source,
+                synthetic_destination = %proxy,
+                original_destination = %destination,
+                association_age_ms = 0_u64,
+                reason = "association_created",
+                "UDP association created"
+            ),
+        }
         spawn_udp_relay(
             candidate.clone(),
             self.socket.clone(),
@@ -405,8 +590,9 @@ impl<C: MappingClient + 'static> UdpAssociations<C> {
         tuple: Tuple,
         client_address: SocketAddr,
         mapping: OriginalDestination,
+        previous_destination: SocketAddr,
     ) -> Result<Arc<UdpAssociation>, ProxyError> {
-        self.insert_association(tuple, client_address, mapping)
+        self.insert_association(tuple, client_address, mapping, Some(previous_destination))
             .await
     }
 
@@ -425,20 +611,64 @@ impl<C: MappingClient + 'static> UdpAssociations<C> {
 
     /// Drops all association entries; relay tasks exit via their watch signal.
     async fn shutdown(&self) {
-        self.entries.lock().await.clear();
+        let count = {
+            let mut entries = self.entries.lock().await;
+            let count = entries.len();
+            entries.clear();
+            count
+        };
+        tracing::info!(
+            protocol = "udp",
+            association_count = count,
+            reason = "proxy_shutdown",
+            "UDP associations cleared"
+        );
     }
 
     /// Removes associations idle longer than the configured timeout.
     async fn reap(&self) {
+        let candidates = {
+            let entries = self.entries.lock().await;
+            entries
+                .iter()
+                .map(|(tuple, association)| (tuple.clone(), association.clone()))
+                .collect::<Vec<_>>()
+        };
+        let mut expired = Vec::new();
+        for (tuple, association) in candidates {
+            let age = association.last_seen.lock().await.elapsed();
+            if age >= self.idle_timeout {
+                expired.push((tuple, association, age));
+            }
+        }
+        if expired.is_empty() {
+            return;
+        }
         let mut entries = self.entries.lock().await;
-        let idle_timeout = self.idle_timeout;
-        entries.retain(|_, association| {
-            association
-                .last_seen
-                .try_lock()
-                .map(|last_seen| last_seen.elapsed() < idle_timeout)
-                .unwrap_or(true)
-        });
+        for (tuple, association, _) in expired {
+            let Some(current) = entries.get(&tuple).cloned() else {
+                continue;
+            };
+            if !Arc::ptr_eq(&current, &association) {
+                continue;
+            }
+            let idle_age = current.last_seen.lock().await.elapsed();
+            if idle_age >= self.idle_timeout {
+                let association_age = current.created_at.elapsed();
+                entries.remove(&tuple);
+                tracing::info!(
+                    protocol = "udp",
+                    synthetic_source = %tuple.source,
+                    synthetic_destination = %tuple.destination,
+                    original_destination = %current.destination,
+                    association_age_ms = association_age.as_millis() as u64,
+                    idle_age_ms = idle_age.as_millis() as u64,
+                    idle_timeout_ms = self.idle_timeout.as_millis() as u64,
+                    reason = "idle_timeout",
+                    "UDP association expired"
+                );
+            }
+        }
     }
 }
 
@@ -457,22 +687,91 @@ fn spawn_udp_relay(
                 let receive = time::timeout(idle_timeout, association.outbound.recv(&mut buffer));
                 tokio::pin!(receive);
                 tokio::select! {
-                    _ = shutdown.changed() => return,
+                    _ = shutdown.changed() => {
+                        tracing::info!(
+                            protocol = "udp",
+                            synthetic_source = %association.synthetic_source,
+                            synthetic_destination = %association.synthetic_destination,
+                            client_address = %association.client_address,
+                            original_destination = %association.destination,
+                            association_age_ms = association.created_at.elapsed().as_millis() as u64,
+                            reason = "proxy_shutdown",
+                            "UDP relay stopped"
+                        );
+                        return;
+                    },
                     result = &mut receive => result,
                 }
             };
             match result {
                 Ok(Ok(length)) => {
-                    if client_socket
+                    if let Err(error) = client_socket
                         .send_to(&buffer[..length], association.client_address)
                         .await
-                        .is_err()
                     {
+                        tracing::warn!(
+                            protocol = "udp",
+                            synthetic_source = %association.synthetic_source,
+                            synthetic_destination = %association.synthetic_destination,
+                            client_address = %association.client_address,
+                            original_destination = %association.destination,
+                            error = %error,
+                            association_age_ms = association.created_at.elapsed().as_millis() as u64,
+                            reason = "relay_delivery",
+                            "UDP relay delivery failed"
+                        );
+                        tracing::info!(
+                            protocol = "udp",
+                            synthetic_source = %association.synthetic_source,
+                            synthetic_destination = %association.synthetic_destination,
+                            client_address = %association.client_address,
+                            original_destination = %association.destination,
+                            association_age_ms = association.created_at.elapsed().as_millis() as u64,
+                            reason = "delivery_error",
+                            "UDP relay stopped"
+                        );
                         break;
                     }
                     *association.last_seen.lock().await = std::time::Instant::now();
                 }
-                Ok(Err(_)) | Err(_) => break,
+                Ok(Err(error)) => {
+                    tracing::warn!(
+                        protocol = "udp",
+                        synthetic_source = %association.synthetic_source,
+                        synthetic_destination = %association.synthetic_destination,
+                        client_address = %association.client_address,
+                        original_destination = %association.destination,
+                        error = %error,
+                        association_age_ms = association.created_at.elapsed().as_millis() as u64,
+                        reason = "receive_error",
+                        "UDP relay receive failed"
+                    );
+                    tracing::info!(
+                        protocol = "udp",
+                        synthetic_source = %association.synthetic_source,
+                        synthetic_destination = %association.synthetic_destination,
+                        client_address = %association.client_address,
+                        original_destination = %association.destination,
+                        association_age_ms = association.created_at.elapsed().as_millis() as u64,
+                        reason = "receive_error",
+                        "UDP relay stopped"
+                    );
+                    break;
+                }
+                Err(_) => {
+                    tracing::info!(
+                        protocol = "udp",
+                        synthetic_source = %association.synthetic_source,
+                        synthetic_destination = %association.synthetic_destination,
+                        client_address = %association.client_address,
+                        original_destination = %association.destination,
+                        idle_timeout_ms = idle_timeout.as_millis() as u64,
+                        association_age_ms = association.created_at.elapsed().as_millis() as u64,
+                        reason = "idle_timeout",
+                        "UDP relay stopped"
+                    );
+                    break;
+                }
             }
         }
     });
@@ -842,6 +1141,84 @@ pub use windows_client::PublicTlsPskMappingClient as TlsPskMappingClient;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        collections::{HashSet, VecDeque},
+        sync::Mutex as StdMutex,
+    };
+    use tracing::{field::Visit, Event, Subscriber};
+    use tracing_subscriber::{
+        layer::{Context, Layer},
+        prelude::*,
+        registry::LookupSpan,
+    };
+
+    #[derive(Clone, Default)]
+    struct EventRecorder {
+        reasons: Arc<StdMutex<Vec<String>>>,
+        field_sets: Arc<StdMutex<Vec<HashSet<String>>>>,
+    }
+
+    struct FieldVisitor {
+        fields: HashSet<String>,
+        reasons: Vec<String>,
+    }
+
+    impl FieldVisitor {
+        fn new() -> Self {
+            Self {
+                fields: HashSet::new(),
+                reasons: Vec::new(),
+            }
+        }
+    }
+
+    impl Visit for FieldVisitor {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.fields.insert(field.name().to_owned());
+            if field.name() == "reason" {
+                self.reasons.push(format!("{value:?}"));
+            }
+        }
+    }
+
+    impl<S> Layer<S> for EventRecorder
+    where
+        S: Subscriber + for<'a> LookupSpan<'a>,
+    {
+        fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+            let mut visitor = FieldVisitor::new();
+            event.record(&mut visitor);
+            self.reasons.lock().unwrap().extend(visitor.reasons);
+            self.field_sets.lock().unwrap().push(visitor.fields);
+        }
+    }
+
+    impl EventRecorder {
+        fn has_reason(&self, reason: &str) -> bool {
+            self.reasons
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|value| value.contains(reason))
+        }
+
+        fn count_reason(&self, reason: &str) -> usize {
+            self.reasons
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|value| value.contains(reason))
+                .count()
+        }
+
+        fn has_fields(&self, required: &[&str]) -> bool {
+            self.field_sets.lock().unwrap().iter().any(|fields| {
+                required
+                    .iter()
+                    .all(|required_field| fields.contains(*required_field))
+            })
+        }
+    }
 
     #[derive(Clone)]
     struct MockClient {
@@ -855,6 +1232,20 @@ mod tests {
             assert_eq!(tuple.protocol, self.protocol);
             Ok(OriginalDestination {
                 address: self.destination,
+                protocol: tuple.protocol,
+            })
+        }
+    }
+
+    struct SequenceClient {
+        destinations: StdMutex<VecDeque<SocketAddr>>,
+    }
+
+    #[async_trait]
+    impl MappingClient for SequenceClient {
+        async fn get_mapping(&self, tuple: &Tuple) -> Result<OriginalDestination, ProxyError> {
+            Ok(OriginalDestination {
+                address: self.destinations.lock().unwrap().pop_front().unwrap(),
                 protocol: tuple.protocol,
             })
         }
@@ -972,5 +1363,82 @@ mod tests {
         shutdown_sender.send(true).unwrap();
         receiver.await.unwrap();
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn udp_lifecycle_events_capture_replacement_and_expiry() {
+        let recorder = EventRecorder::default();
+        let subscriber = tracing_subscriber::registry().with(recorder.clone());
+        let _default = tracing::subscriber::set_default(subscriber);
+
+        let first_destination = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let second_destination = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let proxy_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let (shutdown_sender, shutdown) = watch::channel(false);
+        let associations = UdpAssociations::new(
+            proxy_socket.clone(),
+            Arc::new(SequenceClient {
+                destinations: StdMutex::new(VecDeque::from([
+                    first_destination.local_addr().unwrap(),
+                    second_destination.local_addr().unwrap(),
+                    second_destination.local_addr().unwrap(),
+                ])),
+            }),
+            Duration::from_secs(5),
+            shutdown,
+        );
+        let client_address: SocketAddr = "127.0.0.1:42000".parse().unwrap();
+
+        associations.forward(client_address, b"one").await.unwrap();
+        associations.forward(client_address, b"two").await.unwrap();
+        associations
+            .forward(client_address, b"three")
+            .await
+            .unwrap();
+
+        let tuple = Tuple {
+            source: client_address,
+            destination: proxy_socket.local_addr().unwrap(),
+            protocol: UDP_PROTOCOL,
+        };
+        let association = associations
+            .entries
+            .lock()
+            .await
+            .get(&tuple)
+            .unwrap()
+            .clone();
+        *association.last_seen.lock().await = std::time::Instant::now() - Duration::from_secs(10);
+        associations.reap().await;
+        shutdown_sender.send(true).unwrap();
+
+        assert_eq!(recorder.count_reason("association_created"), 1);
+        assert_eq!(recorder.count_reason("association_replaced"), 1);
+        assert_eq!(recorder.count_reason("idle_timeout"), 1);
+        assert!(recorder.has_fields(&[
+            "protocol",
+            "synthetic_source",
+            "synthetic_destination",
+            "original_destination",
+            "association_age_ms",
+        ]));
+    }
+
+    #[test]
+    fn tcp_cancellation_emits_termination_event() {
+        let recorder = EventRecorder::default();
+        let subscriber = tracing_subscriber::registry().with(recorder.clone());
+        let _default = tracing::subscriber::set_default(subscriber);
+        let guard = TcpForwardingGuard {
+            tuple: Tuple {
+                source: "127.0.0.1:42000".parse().unwrap(),
+                destination: "127.0.0.1:15000".parse().unwrap(),
+                protocol: TCP_PROTOCOL,
+            },
+            original_destination: "127.0.0.1:443".parse().unwrap(),
+            completed: false,
+        };
+        drop(guard);
+        assert!(recorder.has_reason("cancelled"));
     }
 }

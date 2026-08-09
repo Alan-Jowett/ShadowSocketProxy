@@ -128,6 +128,7 @@ async fn main() {
         }
     };
     if let Err(error) = control.detach(&args.interface).await {
+        tracing::error!(interface = %args.interface, error = %error, "control-service detach failed");
         eprintln!("control service detachment failed: {error}");
         std::process::exit(1);
     }

@@ -8,9 +8,10 @@
 ```text
 USER-REQUEST -> CHG-001..004 -> REQ-TC-001..007
              -> CHG-005 -> REQ-CI-001..005
-             -> D-TC-001..009, D-CI-001..004
-             -> TC-TC-001..026, TC-CI-001..006
-             -> BPF, backend, protobuf, service, lifecycle, and test changes
+             -> CHG-006 -> REQ-HP-LOG-001..003
+             -> D-TC-001..009, D-CI-001..004, D-HP-LOG-001..003
+             -> TC-TC-001..026, TC-CI-001..006, TC-HP-LOG-001..005
+             -> BPF, backend, protobuf, service, lifecycle, logging, and test changes
 ```
 
 ## Design
@@ -95,6 +96,35 @@ All reads/writes remain verifier-safe and bounds checked. IPv4 header checksum,
 IPv4/IPv6 pseudo-header checksum, and TCP/UDP port updates use the existing
 helpers. Unsupported, malformed, non-initial, and non-linear packets return
 `TC_ACT_OK` without map or packet mutation.
+
+### D-HP-LOG-001 — Lifecycle event taxonomy
+
+Host-proxy lifecycle records use the existing `tracing` subscriber and
+machine-readable event names and fields. TCP emits start and termination
+events for each forwarding session. UDP emits association-created,
+association-replaced, association-expired, relay-stopped, and proxy-shutdown
+events. Association reuse is not emitted per datagram at info level.
+Existing unconditional stderr startup and activation messages remain the
+bootstrap path.
+
+### D-HP-LOG-002 — Failure event taxonomy
+
+Mapping lookup and validation failures, outbound connect/send/receive
+failures, relay delivery failures, and control-service detach failures are
+recorded as distinct `warn` or `error` events according to whether the
+affected operation is recoverable. Each event retains the source error and
+relevant protocol and tuple context. Rate limiting may prevent repeated
+data-plane failures from overwhelming logs, but MUST NOT hide the first
+failure or convert it into a success event.
+
+### D-HP-LOG-003 — Structured context and lifecycle timing
+
+Event fields include protocol and synthetic tuple whenever a tuple exists.
+Association events include mapped/original destination, association age when
+known, idle timeout when relevant, and a machine-readable reason. Reaping
+captures the removed association's last-used age before deletion so idle UDP
+garbage collection is visible. Shutdown emits one proxy lifecycle event after
+forwarding tasks stop and before or alongside control-service detachment.
 
 ### D-CI-001 — GitHub Actions workflow
 
@@ -196,3 +226,5 @@ returns nonzero.
 | INV-CI-002 | CI uses the canonical Makefile and generated ELF; workflow artifacts do not alter production runtime behavior or publish branches/releases. |
 | INV-CI-003 | Windows TLS-PSK validation requires the pinned PSK-capable OpenSSL installation and never falls back to plaintext or unauthenticated transport. |
 | INV-CI-004 | The local and CI E2E paths use the same driver and exact assertions. |
+| INV-HP-LOG-001 | Lifecycle and failure events preserve protocol/tuple context and retain underlying errors. |
+| INV-HP-LOG-002 | UDP idle-association removal and relay termination are observable without per-datagram info-level logging. |
