@@ -86,12 +86,18 @@ async fn main() {
         "host proxy: connected to control service at {}",
         args.control_endpoint
     );
-    let proxy_address = config.listen;
     let proxy = Proxy::new(config, Arc::new(client.clone())).expect("validated configuration");
     let (tcp_listener, udp_socket) = match proxy.bind().await {
         Ok(listeners) => listeners,
         Err(error) => {
             eprintln!("host proxy bind failed: {error}");
+            std::process::exit(1);
+        }
+    };
+    let proxy_address = match tcp_listener.local_addr() {
+        Ok(address) => address,
+        Err(error) => {
+            eprintln!("host proxy listener address lookup failed: {error}");
             std::process::exit(1);
         }
     };
