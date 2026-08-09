@@ -135,4 +135,3 @@ those measurements rather than infer performance from source language.
 | Incremental checksums | L3/L4 plus `csum_diff` | L3/L4 supported; diff needs confirmation | IPv4 and IPv6 checksum fixtures and verifier log |
 | Linux test tooling | Aya fixture runner + test-run | Reusable for separate names | Capability-enabled CI run |
 | Windows/WSL E2E | Canonical C artifact | Not applicable until migration | Existing E2E suite against selected artifact |
-
