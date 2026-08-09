@@ -13,6 +13,212 @@ permissions:
   contents: read
 
 jobs:
+  build-bpf-artifact:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install BPF build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang \
+            llvm \
+            linux-libc-dev \
+            libssl-dev \
+            pkg-config \
+            make
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: 1.96.1
+
+      - name: Build BPF artifact
+        run: |
+          make -C crates/bpf clean all
+          mkdir -p artifact
+          cp crates/bpf/shadow-socket-proxy.bpf.o artifact/
+
+      - name: Upload BPF artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: shadow-socket-proxy-bpf
+          path: artifact
+          if-no-files-found: error
+
+  build-control-service-artifact:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install control-service dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libssl-dev \
+            pkg-config
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: 1.96.1
+
+      - name: Build control-service artifact
+        run: |
+          cargo build --locked --release -p shadow-socket-proxy-control
+          mkdir -p artifact
+          cp target/release/shadow-socket-proxy-control artifact/
+          printf '%s\n' 'runtime: libssl3 ca-certificates' > artifact/manifest.txt
+
+      - name: Upload control-service artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: shadow-socket-proxy-control
+          path: artifact
+          if-no-files-found: error
+
+  build-host-proxy-artifact:
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install OpenSSL
+        shell: pwsh
+        run: |
+          winget install --id ShiningLight.OpenSSL.Dev --version 4.0.1 --exact `
+            --scope machine --accept-source-agreements --accept-package-agreements
+
+      - name: Verify OpenSSL and configure environment
+        shell: pwsh
+        run: |
+          $openssl = Get-ChildItem -Path 'C:\Program Files' -Directory -Filter 'OpenSSL*' |
+            ForEach-Object { Join-Path $_.FullName 'bin\openssl.exe' } |
+            Where-Object { Test-Path $_ } |
+            Select-Object -First 1
+          if ($null -eq $openssl) { throw "OpenSSL executable was not found" }
+          $root = Split-Path (Split-Path $openssl -Parent) -Parent
+          "OPENSSL_DIR=$root" >> $env:GITHUB_ENV
+          "OPENSSL_LIB_DIR=$root\lib\VC\x64\MD" >> $env:GITHUB_ENV
+          "OPENSSL_INCLUDE_DIR=$root\include" >> $env:GITHUB_ENV
+          "OPENSSL_ROOT=$root" >> $env:GITHUB_ENV
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: 1.96.1
+
+      - name: Build host-proxy artifact
+        run: cargo build --locked --release -p shadow-socket-proxy-host --features tls-psk
+
+      - name: Package host-proxy artifact
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force artifact | Out-Null
+          Copy-Item target\release\shadow-socket-proxy-host.exe artifact\
+          Get-ChildItem "$env:OPENSSL_ROOT\bin\*.dll" | Copy-Item -Destination artifact\
+
+      - name: Upload host-proxy artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: shadow-socket-proxy-host
+          path: artifact
+          if-no-files-found: error
+
+  e2e-windows-wsl:
+    needs:
+      - build-bpf-artifact
+      - build-control-service-artifact
+      - build-host-proxy-artifact
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install and initialize WSL distribution
+        shell: pwsh
+        run: |
+          $distribution = "Ubuntu-22.04"
+          if (-not (Get-Command wsl.exe -ErrorAction SilentlyContinue)) {
+            throw "wsl.exe is required for Windows/WSL E2E validation"
+          }
+          $installed = @(
+            & wsl.exe --list --quiet 2>$null |
+              ForEach-Object { ($_ -replace "`0", "").Trim() } |
+              Where-Object { $_ }
+          )
+          if ($installed -notcontains $distribution) {
+            & wsl.exe --install --distribution $distribution --no-launch
+            if ($LASTEXITCODE -ne 0) {
+              throw "WSL distribution installation failed"
+            }
+          }
+          & wsl.exe --set-default $distribution
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unable to select WSL distribution $distribution"
+          }
+          & wsl.exe -d $distribution -u root -- uname -a
+          if ($LASTEXITCODE -ne 0) {
+            throw "WSL distribution $distribution did not initialize"
+          }
+
+      - name: Download BPF artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: shadow-socket-proxy-bpf
+          path: artifacts\bpf
+
+      - name: Download control-service artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: shadow-socket-proxy-control
+          path: artifacts\control
+
+      - name: Download host-proxy artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: shadow-socket-proxy-host
+          path: artifacts\host
+
+      - name: Install OpenSSL development package
+        shell: pwsh
+        run: |
+          winget install --id ShiningLight.OpenSSL.Dev --version 4.0.1 --exact `
+            --scope machine --accept-source-agreements --accept-package-agreements
+          $openssl = Get-ChildItem -Path 'C:\Program Files' -Directory -Filter 'OpenSSL*' |
+            ForEach-Object { Join-Path $_.FullName 'bin\openssl.exe' } |
+            Where-Object { Test-Path $_ } |
+            Select-Object -First 1
+          if ($null -eq $openssl) { throw "OpenSSL executable was not found" }
+          $root = Split-Path (Split-Path $openssl -Parent) -Parent
+          "OPENSSL_DIR=$root" >> $env:GITHUB_ENV
+          "OPENSSL_LIB_DIR=$root\lib\VC\x64\MD" >> $env:GITHUB_ENV
+          "OPENSSL_INCLUDE_DIR=$root\include" >> $env:GITHUB_ENV
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: 1.96.1
+
+      - name: Build local E2E driver
+        run: cargo build --locked --release -p shadow-socket-proxy-e2e-runner --features tls-psk
+
+      - name: Run Windows/WSL end-to-end validation
+        shell: pwsh
+        run: |
+          .\scripts\run-windows-wsl-e2e.ps1 `
+            -BpfArtifact "${{ github.workspace }}\artifacts\bpf\shadow-socket-proxy.bpf.o" `
+            -ControlArtifact "${{ github.workspace }}\artifacts\control\shadow-socket-proxy-control" `
+            -HostArtifact "${{ github.workspace }}\artifacts\host" `
+            -TerminateDistribution
+
   documentation:
     runs-on: ubuntu-latest
 

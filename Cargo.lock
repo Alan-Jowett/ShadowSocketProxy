@@ -1118,7 +1118,25 @@ dependencies = [
  "tonic",
  "tonic-build",
  "tracing",
+ "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "shadow-socket-proxy-e2e-runner"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "http",
+ "hyper-util",
+ "openssl",
+ "prost",
+ "protoc-bin-vendored",
+ "tokio",
+ "tokio-openssl",
+ "tonic",
+ "tonic-build",
+ "tower 0.5.3",
 ]
 
 [[package]]

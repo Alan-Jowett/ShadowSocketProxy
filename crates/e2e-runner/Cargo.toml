@@ -1,0 +1,34 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 ShadowSocketProxy contributors
+
+[package]
+name = "shadow-socket-proxy-e2e-runner"
+version = "0.1.0"
+edition = "2021"
+description = "Windows/WSL end-to-end validation driver for ShadowSocketProxy"
+license = "MIT"
+
+[[bin]]
+name = "shadow-socket-proxy-e2e-runner"
+path = "src/main.rs"
+
+[features]
+default = []
+tls-psk = ["dep:hyper-util", "dep:openssl", "dep:tokio-openssl"]
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+http = "1"
+prost = "0.13"
+tokio = { version = "1.40", features = ["macros", "rt-multi-thread", "net", "io-util", "process", "time"] }
+tonic = { version = "0.12", features = ["transport"] }
+tower = "0.5"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+hyper-util = { version = "0.1", features = ["tokio"], optional = true }
+openssl = { version = "0.10.81", optional = true }
+tokio-openssl = { version = "0.6.5", optional = true }
+
+[build-dependencies]
+protoc-bin-vendored = "3"
+tonic-build = "0.12"

@@ -27,6 +27,12 @@ struct Args {
     #[arg(long)]
     /// File containing the PSK secret when inline credentials are omitted.
     psk_secret_file: Option<PathBuf>,
+    #[arg(long)]
+    /// BPF ELF path as visible from the Linux control service.
+    bpf_elf: String,
+    #[arg(long)]
+    /// WSL interface on which the control service attaches the BPF programs.
+    interface: String,
     #[arg(long, default_value_t = 60)]
     /// Seconds of UDP inactivity before an association is discarded.
     udp_idle_timeout_secs: u64,
@@ -76,21 +82,57 @@ async fn main() {
                 std::process::exit(1);
             }
         };
-    let proxy = Proxy::new(config, Arc::new(client)).expect("validated configuration");
+    eprintln!(
+        "host proxy: connected to control service at {}",
+        args.control_endpoint
+    );
+    let proxy = Proxy::new(config, Arc::new(client.clone())).expect("validated configuration");
+    let (tcp_listener, udp_socket) = match proxy.bind().await {
+        Ok(listeners) => listeners,
+        Err(error) => {
+            eprintln!("host proxy bind failed: {error}");
+            std::process::exit(1);
+        }
+    };
+    let proxy_address = match tcp_listener.local_addr() {
+        Ok(address) => address,
+        Err(error) => {
+            eprintln!("host proxy listener address lookup failed: {error}");
+            std::process::exit(1);
+        }
+    };
+    if let Err(error) = client
+        .activate(&args.bpf_elf, &args.interface, proxy_address)
+        .await
+    {
+        eprintln!("control service activation failed: {error}");
+        std::process::exit(1);
+    }
+    eprintln!(
+        "host proxy: attached BPF {} to {} and configured proxy target {}",
+        args.bpf_elf, args.interface, proxy_address
+    );
+    let control = client.clone();
     let (shutdown, receiver) = watch::channel(false);
-    tokio::select! {
-        result = proxy.run(receiver) => {
-            if let Err(error) = result {
-                eprintln!("host proxy failed: {error}");
-                std::process::exit(1);
-            }
+    let result = tokio::select! {
+        result = proxy.run_bound(tcp_listener, udp_socket, receiver) => {
+            result
         }
         result = tokio::signal::ctrl_c() => {
             if let Err(error) = result {
-                eprintln!("shutdown signal failed: {error}");
-                std::process::exit(1);
+                Err(shadow_socket_proxy_host::ProxyError::Io(error))
+            } else {
+                let _ = shutdown.send(true);
+                Ok(())
             }
-            let _ = shutdown.send(true);
         }
+    };
+    if let Err(error) = control.detach(&args.interface).await {
+        eprintln!("control service detachment failed: {error}");
+        std::process::exit(1);
+    }
+    if let Err(error) = result {
+        eprintln!("host proxy failed: {error}");
+        std::process::exit(1);
     }
 }

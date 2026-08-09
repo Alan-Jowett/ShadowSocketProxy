@@ -9,6 +9,7 @@ use std::net::SocketAddr;
 /// Builds the Linux backend, starts the runtime, and returns a process status
 /// after serving or reporting a startup/runtime error.
 async fn main() {
+    tracing_subscriber::fmt::init();
     let address = std::env::var("SSP_LISTEN_ADDR")
         .unwrap_or_else(|_| "0.0.0.0:50051".into())
         .parse::<SocketAddr>()
@@ -20,12 +21,24 @@ async fn main() {
         eprintln!("invalid SSP_LISTEN_ADDR: listener port must be non-zero");
         std::process::exit(1);
     }
-    let backend = LinuxBpfBackend::new();
+    let backend = match std::env::var("SSP_TC_HOOK_LAYOUT") {
+        Ok(value) if value == "wsl" => LinuxBpfBackend::new_with_wsl_hooks(),
+        Ok(value) => {
+            eprintln!("invalid SSP_TC_HOOK_LAYOUT: expected wsl, got {value}");
+            std::process::exit(1);
+        }
+        Err(std::env::VarError::NotPresent) => LinuxBpfBackend::new(),
+        Err(error) => {
+            eprintln!("invalid SSP_TC_HOOK_LAYOUT: {error}");
+            std::process::exit(1);
+        }
+    };
     let mut runtime = ServiceRuntime::new_with_listener(backend, address);
     if let Err(error) = runtime.start().await {
         eprintln!("shadow-socket-proxy-control failed to start: {error}");
         std::process::exit(1);
     }
+    eprintln!("control service: ready for BPF attachment at {address}");
     if let Err(error) = runtime.serve().await {
         eprintln!("shadow-socket-proxy-control server failed: {error}");
         std::process::exit(1);

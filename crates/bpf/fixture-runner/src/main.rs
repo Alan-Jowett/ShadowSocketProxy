@@ -1429,6 +1429,25 @@ mod linux {
         assert_counter_values(&mut fixture, 0, 0, 1)?;
         assert_zero_counts(&mut fixture)?;
 
+        build_ipv4_tcp_packet(
+            &mut tcp_input,
+            &listener_destination,
+            &client,
+            LISTENER_PORT,
+            40002,
+            TCP_FLAG_SYN | TCP_FLAG_ACK,
+            11,
+            11,
+        );
+        fixture.run_program(
+            "control-bypass tcp reverse",
+            EGRESS_PROGRAM_NAME,
+            &tcp_input,
+            &tcp_input,
+        )?;
+        assert_counter_values(&mut fixture, 0, 0, 2)?;
+        assert_zero_counts(&mut fixture)?;
+
         build_ipv4_udp_packet(
             &mut udp_input,
             &client,
@@ -1451,7 +1470,7 @@ mod linux {
             &udp_input,
             &udp_expected,
         )?;
-        assert_counter_values(&mut fixture, 0, 0, 1)?;
+        assert_counter_values(&mut fixture, 0, 0, 2)?;
         expect_equal_u64(
             "udp flow-index count",
             fixture.count_flow_index_entries()? as u64,

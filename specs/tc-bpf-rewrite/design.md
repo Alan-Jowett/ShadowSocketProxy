@@ -153,6 +153,32 @@ Windows validation runs `cargo fmt --all -- --check`,
 -p shadow-socket-proxy-host --features tls-psk`, and
 `cargo test --locked -p shadow-socket-proxy-host --features tls-psk`.
 
+### D-CI-E2E-001 — Deployable workflow artifacts
+
+Three independent build jobs upload deterministic workflow artifacts:
+`shadow-socket-proxy-bpf`, `shadow-socket-proxy-control`, and
+`shadow-socket-proxy-host`. The BPF artifact contains the canonical ELF, the
+control artifact contains the release Linux executable and runtime manifest,
+and the host artifact contains the release Windows executable and required
+OpenSSL DLLs.
+
+### D-CI-E2E-002 — Shared Windows/WSL driver
+
+`scripts/run-windows-wsl-e2e.ps1` provisions the default WSL distribution and
+invokes `wsl.exe -u root` for package installation, process deployment, and
+cleanup. It launches the Windows marker server and host proxy, then invokes
+the checked-in `shadow-socket-proxy-e2e-runner` executable. CI downloads the
+three deployable artifacts and builds only this test driver from source;
+developers can invoke the same script locally.
+
+### D-CI-E2E-003 — Ordered deployment and evidence
+
+The driver performs `Attach`, then `SetConfig`, then generates the WSL TCP
+flow after the host proxy is ready. It asserts ready status, the marker,
+original and synthetic tuple fields, mapping presence before teardown, and
+non-increasing flow-insertion failures. Any assertion or prerequisite failure
+returns nonzero.
+
 ## Invariants
 
 | ID | Invariant |
@@ -167,5 +193,6 @@ Windows validation runs `cargo fmt --all -- --check`,
 | INV-TC-008 | Readiness requires the complete v3 artifact and rejects stale/mixed policy artifacts. |
 | INV-TC-009 | The listener descriptor is present before attach and immutable through SetConfig. |
 | INV-CI-001 | Every required Rust, BPF-build, and explicitly enabled kernel-fixture gate is executed and failures remain visible. |
-| INV-CI-002 | CI uses the canonical Makefile and generated ELF; it does not alter production runtime behavior or publish artifacts. |
+| INV-CI-002 | CI uses the canonical Makefile and generated ELF; workflow artifacts do not alter production runtime behavior or publish branches/releases. |
 | INV-CI-003 | Windows TLS-PSK validation requires the pinned PSK-capable OpenSSL installation and never falls back to plaintext or unauthenticated transport. |
+| INV-CI-004 | The local and CI E2E paths use the same driver and exact assertions. |
