@@ -9,9 +9,13 @@
 USER-REQUEST -> CHG-001..004 -> REQ-TC-001..007
              -> CHG-005 -> REQ-CI-001..005
              -> CHG-006 -> REQ-HP-LOG-001..003
-             -> D-TC-001..009, D-CI-001..004, D-HP-LOG-001..003
-             -> TC-TC-001..026, TC-CI-001..006, TC-HP-LOG-001..005
-             -> BPF, backend, protobuf, service, lifecycle, logging, and test changes
+             -> CHG-007..009 -> REQ-HP-MAINT-001..006
+             -> D-TC-001..009, D-CI-001..004, D-HP-LOG-001..003,
+                D-HP-MAINT-001..006
+             -> TC-TC-001..026, TC-CI-001..006, TC-HP-LOG-001..005,
+                TC-HP-MAINT-001..010
+             -> BPF, backend, protobuf, service, lifecycle, logging,
+                maintenance, and test changes
 ```
 
 ## Design
@@ -63,8 +67,8 @@ normal target path even when its port equals the listener port.
 Flow creation uses the existing creating/state/index/publish protocol. Any
 insertion failure rolls back attempt-owned entries, drops the eligible packet,
 and increments counter slot 1. The active-flow cap accounts for three indexes
-per flow and never resizes maps. Existing TCP/UDP lifecycle and maintenance
-cleanup semantics remain unchanged.
+per flow and never resizes maps. Flow timestamps and TCP lifecycle state remain
+dataplane observations; host-proxy owns cleanup decisions.
 
 ### D-TC-006 — Backend and service surface
 
@@ -125,6 +129,80 @@ known, idle timeout when relevant, and a machine-readable reason. Reaping
 captures the removed association's last-used age before deletion so idle UDP
 garbage collection is visible. Shutdown emits one proxy lifecycle event after
 forwarding tasks stop and before or alongside control-service detachment.
+
+### D-HP-MAINT-001 — Ownership and activation boundary
+
+Host-proxy is the stateful controller. It authenticates to the control-service,
+orchestrates attach/configure/detach, schedules maintenance, owns local
+association state, and decides when a flow is expired or deleted. The
+control-service keeps no maintenance worker or lifecycle policy state between
+requests; it validates request safety, translates typed operations, and
+reports dataplane outcomes.
+
+### D-HP-MAINT-002 — Typed BPF-agnostic flow contract
+
+The control API adds typed `EnumerateFlows` and `DeleteFlow` operations. A
+flow record contains an opaque flow identity, generation, synthetic/original
+tuples, protocol, last-used timestamp, and TCP lifecycle flags/state. The
+contract does not expose BPF map names, map keys, encoded values, or
+Aya/libbpf-specific types to host-proxy. Enumeration returns the complete
+record needed for maintenance, so a separate `GetFlow` operation is not
+required.
+
+`EnumerateFlows` accepts a bounded limit and an opaque continuation token and
+returns a server-issued token when more records remain. The adapter orders a
+maintenance scan by opaque flow identity and generation; the token carries
+the scan cursor and expires when the enumeration pass ends or the control
+session is lost. The scan is best-effort rather than a global snapshot:
+records deleted during enumeration may be omitted, newly created records may
+appear on a later pass, and the host treats repeated identities as harmless.
+Malformed, expired, or over-limit tokens are explicit request errors.
+
+### D-HP-MAINT-003 — Generation-safe cleanup primitive
+
+`DeleteFlow` accepts flow identity and generation and performs the adapter's
+canonical state-plus-index cleanup as one backend operation. It returns
+complete removal, already absent, stale generation, or partial cleanup
+outcomes and never deletes a newer generation when the supplied generation no
+longer matches. A partial result includes the state/index removal counts and a
+retryable indication; host-proxy retries the same identity/generation. An
+already-absent result is idempotent success. Host-proxy invalidates a matching
+local UDP association only for complete or already-absent results, never for a
+stale-generation, partial, or transport-error result.
+
+### D-HP-MAINT-004 — Host maintenance loop
+
+Host-proxy owns cleanup interval, idle TTL, TCP terminal grace, scan batch,
+and UDP association timeout configuration. A single maintenance scheduler
+serializes passes so they never overlap. Each pass enumerates bounded flow
+pages, applies TCP/UDP retention policy to the returned observations, issues
+generation-checked deletes, and coordinates local association invalidation
+only after the selected flow outcome is known. Failed enumeration/deletion
+operations are logged and retried on a later pass. Reconnect attempts use
+bounded exponential backoff capped at the cleanup interval and reset after a
+successful control operation; shutdown cancels the scheduler and retries.
+The control-service does not apply these policies autonomously.
+
+### D-HP-MAINT-005 — UDP association cache and invalidation
+
+The first datagram for a synthetic UDP tuple performs one flow lookup and
+creates a connected local association. Subsequent datagrams reuse it without
+RPCs. Expiry, host-selected flow deletion, or a controlled outbound failure
+invalidates the association; a later datagram may create a fresh lookup. A
+destination-specific refusal, timeout, or unreachable error permits one
+re-resolution/retry for that datagram. Local resource, configuration, and
+unrelated I/O errors preserve the current association and are surfaced.
+Mapping and deletion errors preserve the current association until the
+host-policy retry/invalidating decision is made.
+
+### D-HP-MAINT-006 — Control loss and retry behavior
+
+Existing forwarding tasks continue while the control channel is unavailable.
+Host-proxy records reconnect, enumeration, deletion, and partial-cleanup
+failures, retries control operations on later passes, and does not remove local
+forwarding state solely because an RPC failed. No direct-forward fallback is
+introduced. Operational counters, health state, and logs may remain process
+local in the control-service, but they cannot drive lifecycle policy.
 
 ### D-CI-001 — GitHub Actions workflow
 
@@ -228,3 +306,6 @@ returns nonzero.
 | INV-CI-004 | The local and CI E2E paths use the same driver and exact assertions. |
 | INV-HP-LOG-001 | Lifecycle and failure events preserve protocol/tuple context and retain underlying errors. |
 | INV-HP-LOG-002 | UDP idle-association removal and relay termination are observable without per-datagram info-level logging. |
+| INV-HP-MAINT-001 | Host-proxy is the sole lifecycle-policy owner; control-service requests are stateless adapters. |
+| INV-HP-MAINT-002 | A flow identity/generation maps to one canonical state and all tuple indexes during adapter cleanup. |
+| INV-HP-MAINT-003 | Control-plane loss does not interrupt existing forwarding or cause unconfirmed local deletion. |

@@ -89,6 +89,62 @@
 - **Traceability:** `USER-REQUEST: add host-proxy lifecycle logging, including
   visible garbage collection of old UDP associations.`
 
+### CHG-007 — Move dataplane lifecycle ownership to host-proxy
+
+- **Before:** BPF flow maintenance and stale-record deletion are owned by the
+  Linux control-service maintenance worker, while host-proxy separately owns
+  local UDP association expiry and performs UDP mapping lookups on the
+  steady-state data path. Lifecycle policy is split across processes.
+- **After:** Host-proxy MUST own BPF activation/deactivation orchestration,
+  maintenance scheduling, expiry policy, retry policy, flow deletion
+  decisions, and local TCP/UDP association lifecycle. The control-service MUST
+  be stateless between requests and act as a privileged authenticated adapter
+  that translates BPF-agnostic flow/configuration operations into dataplane
+  operations. Existing forwarding MUST continue during temporary control-plane
+  loss; host-proxy MUST reconnect and retry maintenance visibly.
+- **Retired:** Autonomous control-service maintenance scheduling, stale-flow
+  policy decisions, and steady-state per-datagram UDP mapping lookups.
+- **Traceability:** `USER-REQUEST: issue #12 — Move stale mapping maintenance
+  and lifecycle decisions to host-proxy while keeping control-service as a
+  thin adapter.`
+
+### CHG-008 — Add BPF-agnostic flow lifecycle primitives
+
+- **Before:** The control API exposes mapping-oriented list/get/delete
+  behavior and maintenance-specific service state rather than a complete
+  host-owned flow lifecycle contract.
+- **After:** The authenticated gRPC contract MUST expose typed,
+  BPF-agnostic flow primitives for enumerating flows, reading flow identity
+  and lifecycle metadata, and deleting a flow. Flow records MUST include
+  opaque flow identity, generation, synthetic/original tuples, protocol,
+  last-used time, and TCP lifecycle state where applicable. Deletion MUST
+  support generation checking, idempotent outcomes, and a cleanup report that
+  distinguishes complete, already-absent, stale-generation, and partial
+  cleanup. Enumeration and deletion MUST be sufficient for host-proxy
+  maintenance without a required per-flow read RPC.
+- **Retired:** Host-proxy dependence on BPF map names, raw key/value ABI, or
+  control-service maintenance statistics as lifecycle inputs.
+- **Traceability:** `USER-REQUEST: keep the gRPC contract simple and
+  BPF-agnostic while the control-service translates flow operations to BPF.`
+
+### CHG-009 — Make host maintenance and UDP caching explicit
+
+- **Before:** Cleanup timing is configured in the control-service runtime and
+  UDP associations query the control service for every datagram.
+- **After:** Host-proxy MUST accept explicit cleanup interval, idle TTL, TCP
+  terminal grace, scan batch, and UDP association timeout settings, with
+  current defaults preserved unless overridden. An active UDP association MUST
+  reuse its local destination without `GetMapping` on subsequent datagrams.
+  Host-proxy MUST re-resolve only after association expiry, explicit flow
+  invalidation/deletion, or one controlled outbound-failure retry path for a
+  destination-specific failure such as connection refusal, timeout, or
+  unreachable destination. Local resource errors MUST NOT discard a healthy
+  association.
+- **Retired:** Control-service-owned maintenance timing and per-datagram UDP
+  mapping RPCs.
+- **Traceability:** `USER-REQUEST: issue #12 — make the host UDP mapping
+  authoritative while active and avoid a query per UDP packet.`
+
 ## Stable Requirements
 
 ### REQ-TC-001 — Family-preserving global DNAT
@@ -256,6 +312,66 @@ machine-readable reason or error. Lifecycle logging MUST remain filterable by
 the existing `RUST_LOG` configuration. Existing unconditional stderr startup
 and activation messages are not replaced by this requirement.
 
+### REQ-HP-MAINT-001 — Host-proxy lifecycle ownership
+
+Host-proxy MUST own BPF activation/deactivation orchestration, maintenance
+scheduling, expiry policy, retry policy, flow deletion decisions, and local
+TCP/UDP association lifecycle. The control-service MUST remain stateless with
+respect to maintenance and flow-lifecycle policy between requests and MUST
+NOT autonomously schedule or decide stale-flow deletion. Process-local
+configuration, health, log, and cumulative operational telemetry state is
+allowed and is not lifecycle ownership.
+
+### REQ-HP-MAINT-002 — BPF-agnostic flow primitives
+
+The authenticated control API MUST expose typed `EnumerateFlows` and
+`DeleteFlow` primitives without requiring host-proxy to know BPF map names,
+raw keys, or raw value layouts. Enumerated records MUST include opaque flow
+identity, generation, synthetic/original tuples, protocol, last-used time,
+and TCP lifecycle state where applicable. A separate flow-read RPC is not
+required when enumeration returns this complete record.
+
+### REQ-HP-MAINT-003 — Generation-safe idempotent deletion
+
+Flow deletion MUST accept flow identity and generation, avoid deleting a
+newer incarnation when the generation no longer matches, and return an
+idempotent cleanup report distinguishing complete removal, already-absent
+state, stale generation, and partial cleanup. Cross-index cleanup MUST
+preserve the canonical flow/index consistency invariant or report the
+incomplete cleanup explicitly. A partial result MUST remain retryable with
+the same identity/generation; a stale-generation result MUST not invalidate
+local state.
+
+### REQ-HP-MAINT-004 — Host-owned maintenance policy
+
+Host-proxy MUST accept explicit cleanup interval, idle TTL, TCP terminal grace,
+flow scan batch, and UDP association timeout settings. Existing defaults MUST
+remain unchanged unless an operator overrides them. The control-service MUST
+not own or autonomously apply these policy values. Maintenance passes MUST
+not overlap; a failed pass MUST be retried on a later scheduled pass, and
+reconnection attempts MUST use bounded backoff capped by the cleanup interval
+until control access is restored. Shutdown MUST cancel pending retries.
+
+### REQ-HP-MAINT-005 — Authoritative UDP association cache
+
+After a UDP association is created, host-proxy MUST reuse its local connected
+destination without issuing `GetMapping` for each datagram. Host-proxy MUST
+perform a new mapping lookup only when no association exists, the association
+has expired, host-proxy explicitly invalidates/deletes its flow, or one
+controlled outbound-failure retry path requires re-resolution. Eligible
+outbound failures are destination-specific refusal, timeout, or unreachable
+errors; local resource/configuration errors preserve the association and are
+reported without re-resolution.
+
+### REQ-HP-MAINT-006 — Control-plane loss behavior
+
+Temporary control-service loss MUST NOT interrupt existing forwarding. The
+host-proxy MUST report scan, deletion, and reconnection failures, retain
+active local forwarding state, and retry control-plane maintenance on a later
+pass using the bounded backoff policy. It MUST NOT silently delete local state
+without control-service confirmation or introduce direct-forward fallback
+behavior.
+
 ## Acceptance Criteria
 
 - Valid IPv4/IPv6 TCP and UDP packets rewrite with correct L3/L4 checksums.
@@ -278,12 +394,20 @@ and activation messages are not replaced by this requirement.
   idle UDP association garbage collection, includes the required operational
   context, and reports the specified failure classes without logging every
   UDP reuse at info level.
+- Host-proxy owns activation, maintenance, flow deletion, and UDP association
+  policy; the control-service performs no autonomous maintenance.
+- Flow enumeration and generation-safe deletion use BPF-agnostic typed RPCs
+  with complete/idempotent/partial cleanup results.
+- Repeated UDP datagrams reuse the local association without steady-state
+  mapping RPCs, and control-plane loss preserves existing forwarding while
+  maintenance retries.
 
 ## Non-Goals
 
 - Cross-family translation, SNAT, wildcard target matching, or QUIC close state.
 - Rewriting malformed packets, non-initial fragments, or unsupported protocols.
 - Replacing TC, changing host-proxy forwarding, or changing TLS/PSK policy.
-- Moving stale-mapping ownership, changing UDP lookup/cache behavior, or
-  introducing per-datagram lifecycle logging.
+- Introducing per-datagram lifecycle logging.
+- Replacing the control-service with direct host-side BPF syscalls, exposing
+  raw BPF map ABI to host-proxy, or changing packet rewrite semantics.
 - Publishing CI build artifacts or changing production packet behavior.

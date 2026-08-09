@@ -32,9 +32,6 @@ OpenSSL tests require a build with PSK support.
 | TC-013 | REQ-004 | Decode unknown ABI version | Explicit ABI mismatch; entry is not interpreted |
 | TC-014 | REQ-004 | Decode malformed length/address/state | Explicit malformed-entry result and status/log counter |
 | TC-015 | REQ-004 | TCP state fixture covers SYN, SYN/ACK, ACK, FIN, RST | Each state is represented and survives map round-trip |
-| TC-016 | REQ-005 | Active entry inside TTL | Entry retained |
-| TC-017 | REQ-005 | Idle entry beyond TTL | Entry deleted and counted |
-| TC-018 | REQ-005 | Future timestamp/clock regression | Entry retained and anomaly surfaced |
 | TC-019 | REQ-005 | Delete failure for one entry | Failure counted/logged; other candidates still processed |
 | TC-020 | REQ-005 | Scan exceeds batch size | Cycle stops at configured bound and next cycle can continue |
 | TC-021 | REQ-005 | Re-run cleanup after deletion | No duplicate success or inconsistent state |
@@ -44,13 +41,11 @@ OpenSSL tests require a build with PSK support.
 | TC-025 | REQ-006 | Unsupported TLS-PSK backend configuration | Startup fails and readiness is false |
 | TC-026 | REQ-007 | Valid multi-field config update | One revision publishes all fields atomically |
 | TC-027 | REQ-007 | Zero, overflow, contradictory, or oversized values | Update rejected; prior revision remains |
-| TC-028 | REQ-007 | Concurrent maintenance and config update | Each maintenance cycle observes one complete revision |
 | TC-029 | REQ-007 | Log-capacity reduction | New bounded capacity applies without unbounded allocation |
 | TC-030 | REQ-008 | Pull records after valid cursor | Ordered records and next cursor returned |
 | TC-031 | REQ-008 | Pull with cursor at current tail | Empty result, not an error |
 | TC-032 | REQ-008 | Pull before oldest retained record | Explicit cursor-expired status |
 | TC-033 | REQ-008 | Concurrent append and pull | No duplicate or reordered sequence values |
-| TC-034 | REQ-002/005 | Shutdown with active maintenance and attachments | Maintenance cancels; detach is attempted; failures are reported |
 | TC-035 | REQ-003/005 | Mapping disappears between list and cleanup | No wrong tuple returned; delete is treated as already absent or explicit race |
 | TC-036 | REQ-006/007 | Unauthorized config/attach while authorized read is active | Unauthorized mutation is rejected and authorized read remains isolated |
 
@@ -58,7 +53,8 @@ OpenSSL tests require a build with PSK support.
 
 - Tuple conversion is bijective for all IPv4/IPv6 address encodings used by the
   ABI.
-- Maintenance never deletes an entry with `now - last_seen < idle_ttl`.
+- The control-service never autonomously deletes a flow; host-proxy owns cleanup
+  policy and uses generation-safe typed deletion.
 - Configuration revisions are strictly increasing and snapshots are internally
   consistent.
 - Attachment ownership prevents detaching another service instance's links.

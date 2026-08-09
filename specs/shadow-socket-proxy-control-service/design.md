@@ -26,7 +26,6 @@ The Linux Rust binary contains:
 - `bpf`: `BpfBackend` trait plus the production ELF/TC implementation and an
   in-memory test double.
 - `mapping`: versioned key/value ABI codecs and tuple conversion.
-- `maintenance`: periodic bounded scan/delete worker.
 - `control`: authenticated gRPC service for lifecycle, mappings, status,
   configuration, and log pull.
 - `logs`: bounded sequence ring with cursor validation.
@@ -56,8 +55,8 @@ ownership is an explicit error. Detach removes only service-owned attachments.
 The production implementation uses Aya 0.14 on Linux. It requires the
 versioned symbols `ssp_flow_map_v1`, `ssp_tc_ingress_v1`, and
 `ssp_tc_egress_v1`, keeps Aya program/link types inside the adapter, and
-exposes only the `BpfBackend`/`LinuxTcAdapter` operations to the gRPC and
-maintenance layers. Non-Linux builds retain an explicit unsupported adapter.
+exposes only the `BpfBackend`/`LinuxTcAdapter` operations to the gRPC adapter.
+Non-Linux builds retain an explicit unsupported adapter.
 
 ### D-003 — Versioned mapping ABI
 
@@ -85,29 +84,15 @@ change or disappear between enumeration and response are reported using
 per-entry status metadata; a backend failure fails the RPC. The service never
 returns an original tuple for a different synthetic key.
 
-### D-005 — Maintenance worker
-
-A cancellable Tokio task runs at the configured cleanup interval. Each cycle
-scans at most `map_scan_batch` entries, compares `now_monotonic_ns -
-last_seen_ns` against `idle_ttl`, and deletes only entries proven idle.
-
-The worker records scanned, retained, deleted, decode-failed, read-failed, and
-delete-failed counts. It continues after independent entry errors. A clock
-regression or future timestamp is retained and surfaced as an anomaly.
-
-### D-006 — Runtime configuration
+### D-005 — Runtime configuration
 
 Configuration is held in an atomic `ArcSwap`-style snapshot with a monotonically
 increasing revision. Set-config validates all fields against bounds and
-cross-field rules before publishing one new snapshot. Maintenance reads one
-snapshot at cycle start, so a cycle observes a coherent revision.
+cross-field rules before publishing one new snapshot.
 
-The configuration includes:
-
-- cleanup interval;
-- idle TTL;
-- map scan batch size;
-- bounded log capacity.
+The configuration includes dataplane idle TTL, TCP terminal grace, active-flow
+capacity, listener/target settings, and bounded log capacity. Host maintenance
+interval, scan batch, and retry policy are not control-service configuration.
 
 ### D-007 — gRPC API
 
@@ -117,7 +102,7 @@ The protobuf contract includes:
 - `Detach`: interface list or all service-owned attachments.
 - `ListMappings`: bounded mapping page and read metadata.
 - `GetMapping`: exact synthetic 5-tuple lookup.
-- `GetStatus`: readiness, ABI, attachment, maintenance, and error counters.
+- `GetStatus`: readiness, ABI, attachment, dataplane counters, and map maxima.
 - `GetConfig` / `SetConfig`: revisioned atomic configuration.
 - `PullLogs`: cursor, limit, records, next cursor, and cursor-expired error.
 - `Health`: liveness/readiness response.
@@ -152,10 +137,10 @@ the newest records and invalidate cursors that no longer exist.
 
 ### D-010 — Lifecycle and shutdown
 
-Startup validates configuration, prepares the TLS endpoint, initializes the
-BPF backend, and starts maintenance before reporting readiness. Shutdown
-cancels maintenance, stops accepting RPCs, attempts owned detachment, flushes
-status/log counters, and reports cleanup failures.
+Startup validates configuration, prepares the TLS endpoint, and initializes
+the BPF backend before reporting readiness. Shutdown stops accepting RPCs,
+attempts owned detachment, and reports cleanup failures. Host-proxy owns
+maintenance cancellation and flow cleanup.
 
 ## 3. Invariants
 
@@ -163,7 +148,7 @@ status/log counters, and reports cleanup failures.
 |---|---|
 | INV-001 | A successful attach means required ingress and egress attachments exist for every requested interface. |
 | INV-002 | A mapping response preserves the exact synthetic-to-original tuple association. |
-| INV-003 | Only idle entries are deleted; active or anomalous future-timestamp entries are retained. |
+| INV-003 | The control-service never autonomously deletes flows or applies host maintenance policy. |
 | INV-004 | Runtime configuration is published atomically as one revision. |
 | INV-005 | Authentication is required for every RPC, including health/status. |
 | INV-006 | Service shutdown does not claim clean teardown when owned detach fails. |
@@ -177,7 +162,7 @@ status/log counters, and reports cleanup failures.
 | REQ-002 | D-002, D-010 | TC-003–TC-006 | attach/detach RPC, TC backend |
 | REQ-003 | D-003, D-004, D-007 | TC-007–TC-011 | protobuf, mapping service |
 | REQ-004 | D-003 | TC-012–TC-015 | ABI codec, fixtures |
-| REQ-005 | D-005 | TC-016–TC-021 | maintenance worker |
+| REQ-005 | Retired by issue #12 | Host-proxy maintenance validation | no control-service worker |
 | REQ-006 | D-007, D-008 | TC-022–TC-025 | TLS adapter, auth interceptor |
 | REQ-007 | D-006, D-007 | TC-026–TC-029 | config store/RPC |
 | REQ-008 | D-009 | TC-030–TC-033 | log ring/PullLogs |

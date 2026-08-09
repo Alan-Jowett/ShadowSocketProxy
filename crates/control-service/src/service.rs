@@ -7,8 +7,9 @@ use std::{
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, OnceLock,
     },
+    time::Instant,
 };
 
 use tonic::{Request, Response, Status};
@@ -17,13 +18,18 @@ use crate::{
     bpf::{Attachment, BackendError, BpfBackend},
     config::{ConfigStore, ListenerDescriptor, RuntimeConfig},
     logs::{LogError, LogRing},
-    maintenance::MaintenanceStats,
-    mapping::{Mapping, Tuple, RUNTIME_CONFIG_ABI_VERSION},
+    mapping::{FlowState, Mapping, Tuple, RUNTIME_CONFIG_ABI_VERSION},
     proto::{self, control_server::Control},
 };
 
+/// Returns nanoseconds elapsed from a process-local monotonic origin.
+fn monotonic_now_ns() -> u64 {
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_nanos() as u64
+}
+
 #[derive(Clone)]
-/// gRPC service backed by shared configuration, logs, stats, and BPF state.
+/// gRPC service backed by shared configuration, logs, and BPF state.
 pub struct ControlService {
     /// Backend used for attachment and map operations.
     backend: Arc<dyn BpfBackend>,
@@ -31,25 +37,17 @@ pub struct ControlService {
     config: Arc<ConfigStore>,
     /// Bounded log ring exposed through `PullLogs`.
     logs: Arc<LogRing>,
-    /// Maintenance counters and last error exposed through `GetStatus`.
-    stats: Arc<MaintenanceStats>,
     /// Release/acquire readiness flag for health checks.
     ready: Arc<AtomicBool>,
 }
 
 impl ControlService {
     /// Creates an unready service sharing the supplied runtime components.
-    pub fn new(
-        backend: Arc<dyn BpfBackend>,
-        config: Arc<ConfigStore>,
-        logs: Arc<LogRing>,
-        stats: Arc<MaintenanceStats>,
-    ) -> Self {
+    pub fn new(backend: Arc<dyn BpfBackend>, config: Arc<ConfigStore>, logs: Arc<LogRing>) -> Self {
         Self {
             backend,
             config,
             logs,
-            stats,
             ready: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -158,6 +156,21 @@ fn mapping_to_proto(mapping: Mapping) -> proto::Mapping {
     }
 }
 
+/// Converts a native flow state into the BPF-agnostic flow response.
+fn flow_to_proto(flow: FlowState, observed_now_ns: u64) -> proto::Flow {
+    proto::Flow {
+        flow_id: flow.flow_id,
+        generation: flow.generation,
+        synthetic: Some(tuple_to_proto(&flow.target)),
+        original: Some(tuple_to_proto(&flow.original)),
+        protocol: flow.original.protocol as u32,
+        last_used_ns: flow.last_used_ns,
+        tcp_state_flags: flow.tcp_state_flags,
+        protocol_flags: flow.protocol_flags,
+        observed_now_ns,
+    }
+}
+
 /// Encodes IPv4/IPv6 addresses for protobuf fields.
 fn ip_bytes(address: IpAddr) -> Vec<u8> {
     match address {
@@ -176,9 +189,7 @@ fn config_to_proto(config: Arc<RuntimeConfig>) -> proto::ConfigReply {
     proto::ConfigReply {
         revision: config.revision,
         config: Some(proto::Config {
-            cleanup_interval_ms: config.cleanup_interval.as_millis() as u64,
             idle_ttl_ms: config.idle_ttl.as_millis() as u64,
-            map_scan_batch: config.map_scan_batch as u32,
             log_capacity: config.log_capacity as u32,
             active_flow_capacity: config.active_flow_capacity as u32,
             tcp_terminal_grace_ms: config.tcp_terminal_grace.as_millis() as u64,
@@ -256,8 +267,6 @@ fn runtime_config_from_proto(config: Option<proto::Config>) -> Result<RuntimeCon
             "unsupported runtime config schema version",
         ));
     }
-    let map_scan_batch = usize::try_from(config.map_scan_batch)
-        .map_err(|_| Status::invalid_argument("map scan batch is out of range"))?;
     let log_capacity = usize::try_from(config.log_capacity)
         .map_err(|_| Status::invalid_argument("log capacity is out of range"))?;
     let active_flow_capacity = usize::try_from(config.active_flow_capacity)
@@ -273,9 +282,7 @@ fn runtime_config_from_proto(config: Option<proto::Config>) -> Result<RuntimeCon
         schema_version: u16::try_from(config.schema_version)
             .map_err(|_| Status::invalid_argument("schema version is out of range"))?,
         revision: 0,
-        cleanup_interval: std::time::Duration::from_millis(config.cleanup_interval_ms),
         idle_ttl: std::time::Duration::from_millis(config.idle_ttl_ms),
-        map_scan_batch,
         log_capacity,
         active_flow_capacity,
         tcp_terminal_grace: std::time::Duration::from_millis(config.tcp_terminal_grace_ms),
@@ -468,13 +475,89 @@ impl Control for ControlService {
         Ok(Response::new(mapping_to_proto(mapping)))
     }
 
-    /// Combines readiness, attachments, map maxima, packet counters, and
-    /// maintenance statistics into one status response.
+    /// Returns a bounded, deterministically ordered page of native flow state.
+    async fn enumerate_flows(
+        &self,
+        request: Request<proto::EnumerateFlowsRequest>,
+    ) -> Result<Response<proto::EnumerateFlowsReply>, Status> {
+        let request = request.into_inner();
+        let limit = if request.limit == 0 {
+            256
+        } else {
+            request.limit as usize
+        };
+        if limit > 10_000 {
+            return Err(Status::resource_exhausted("flow page limit is too large"));
+        }
+        let offset = if request.page_token.is_empty() {
+            0
+        } else if request.page_token.len() == 8 {
+            usize::try_from(u64::from_be_bytes(
+                request.page_token.as_slice().try_into().unwrap(),
+            ))
+            .map_err(|_| Status::invalid_argument("flow page token is out of range"))?
+        } else {
+            return Err(Status::invalid_argument("invalid flow page token"));
+        };
+        let mut flows = self
+            .backend
+            .list_flow_states()
+            .await
+            .map_err(Self::map_backend_error)?;
+        let observed_now_ns = monotonic_now_ns();
+        flows.sort_by_key(|flow| (flow.flow_id, flow.generation));
+        let mut result = Vec::with_capacity(limit);
+        for (index, flow) in flows.into_iter().enumerate().skip(offset) {
+            if result.len() >= limit {
+                return Ok(Response::new(proto::EnumerateFlowsReply {
+                    flows: result,
+                    next_page_token: (index as u64).to_be_bytes().to_vec(),
+                }));
+            }
+            result.push(flow_to_proto(flow, observed_now_ns));
+        }
+        Ok(Response::new(proto::EnumerateFlowsReply {
+            flows: result,
+            next_page_token: Vec::new(),
+        }))
+    }
+
+    /// Deletes one flow generation and reports an idempotent cleanup outcome.
+    async fn delete_flow(
+        &self,
+        request: Request<proto::DeleteFlowRequest>,
+    ) -> Result<Response<proto::DeleteFlowReply>, Status> {
+        let request = request.into_inner();
+        let report = self
+            .backend
+            .delete_flow(request.flow_id, request.generation)
+            .await
+            .map_err(Self::map_backend_error)?;
+        let outcome = if report.partial {
+            proto::delete_flow_reply::Outcome::Partial
+        } else if report.stale_generation {
+            proto::delete_flow_reply::Outcome::StaleGeneration
+        } else if report.state_deleted || report.indexes_deleted != 0 {
+            proto::delete_flow_reply::Outcome::Complete
+        } else {
+            proto::delete_flow_reply::Outcome::AlreadyAbsent
+        };
+        Ok(Response::new(proto::DeleteFlowReply {
+            outcome: outcome as i32,
+            flow_id: request.flow_id,
+            generation: request.generation,
+            indexes_deleted: report.indexes_deleted as u32,
+            state_deleted: report.state_deleted,
+            retryable: report.partial,
+        }))
+    }
+
+    /// Combines readiness, attachments, map maxima, and packet counters into
+    /// one status response.
     async fn get_status(
         &self,
         _request: Request<proto::Empty>,
     ) -> Result<Response<proto::StatusReply>, Status> {
-        let stats = self.stats.snapshot();
         let counters = match self.backend.read_counters().await {
             Ok(counters) => counters,
             Err(crate::bpf::BackendError::Unsupported)
@@ -499,15 +582,9 @@ impl Control for ControlService {
                      }| format!("{interface}:{direction:?}"),
                 )
                 .collect(),
-            scanned: stats.scanned,
-            retained: stats.retained,
-            deleted: stats.deleted,
-            errors: stats.decode_failed + stats.read_failed + stats.delete_failed + stats.anomalies,
-            last_error: self.stats.last_error().unwrap_or_default(),
             target_misses: counters.target_misses,
             flow_insert_failures: counters.flow_insert_failures,
             control_bypasses: counters.control_bypasses,
-            partial_cleanups: stats.partial_cleanups,
             flow_index_map_max_entries: self.backend.map_maxima().flow_index as u32,
             flow_state_map_max_entries: self.backend.map_maxima().flow_state as u32,
         }))
@@ -600,24 +677,17 @@ mod tests {
         config::RuntimeConfig,
         mapping::{MapMaxima, Mapping, PROTOCOL_FLAG_UDP, PROTOCOL_UDP},
     };
-    use std::time::Duration;
 
     fn service() -> (Arc<InMemoryBackend>, ControlService) {
         let backend = Arc::new(InMemoryBackend::default());
         let config = Arc::new(ConfigStore::new(RuntimeConfig::default()).unwrap());
         let logs = Arc::new(LogRing::new(4));
-        let stats = Arc::new(MaintenanceStats::default());
-        (
-            backend.clone(),
-            ControlService::new(backend, config, logs, stats),
-        )
+        (backend.clone(), ControlService::new(backend, config, logs))
     }
 
     fn proto_config() -> proto::Config {
         proto::Config {
-            cleanup_interval_ms: 1_000,
             idle_ttl_ms: 2_000,
-            map_scan_batch: 1,
             log_capacity: 1,
             active_flow_capacity: 1,
             tcp_terminal_grace_ms: 1_000,
@@ -692,9 +762,7 @@ mod tests {
         let invalid = service
             .set_config(Request::new(proto::SetConfigRequest {
                 config: Some(proto::Config {
-                    cleanup_interval_ms: 0,
-                    idle_ttl_ms: 1,
-                    map_scan_batch: 1,
+                    idle_ttl_ms: 0,
                     log_capacity: 1,
                     active_flow_capacity: 1,
                     tcp_terminal_grace_ms: 1,
@@ -723,10 +791,6 @@ mod tests {
             .unwrap()
             .into_inner();
         assert_eq!(logs.records.len(), 1);
-        assert_eq!(
-            service.config.snapshot().cleanup_interval,
-            Duration::from_secs(10)
-        );
     }
 
     #[tokio::test]

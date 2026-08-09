@@ -36,6 +36,18 @@ struct Args {
     #[arg(long, default_value_t = 60)]
     /// Seconds of UDP inactivity before an association is discarded.
     udp_idle_timeout_secs: u64,
+    #[arg(long, default_value_t = 5)]
+    /// Seconds between host-owned flow maintenance passes.
+    cleanup_interval_secs: u64,
+    #[arg(long, default_value_t = 60)]
+    /// Seconds before an incomplete flow is considered idle.
+    idle_ttl_secs: u64,
+    #[arg(long, default_value_t = 30)]
+    /// Seconds of grace after a completed TCP close.
+    tcp_terminal_grace_secs: u64,
+    #[arg(long, default_value_t = 256)]
+    /// Maximum number of flows requested in one maintenance page.
+    flow_scan_batch: u32,
 }
 
 /// Selects the inline secret or reads and trims the configured secret file.
@@ -67,6 +79,10 @@ async fn main() {
         psk_identity: args.psk_identity.clone(),
         psk_secret: secret.clone(),
         udp_idle_timeout: Duration::from_secs(args.udp_idle_timeout_secs),
+        cleanup_interval: Duration::from_secs(args.cleanup_interval_secs),
+        idle_ttl: Duration::from_secs(args.idle_ttl_secs),
+        tcp_terminal_grace: Duration::from_secs(args.tcp_terminal_grace_secs),
+        flow_scan_batch: args.flow_scan_batch,
     };
     if let Err(error) = config.validate() {
         eprintln!("invalid configuration: {error}");
@@ -86,7 +102,8 @@ async fn main() {
         "host proxy: connected to control service at {}",
         args.control_endpoint
     );
-    let proxy = Proxy::new(config, Arc::new(client.clone())).expect("validated configuration");
+    let proxy =
+        Proxy::new(config.clone(), Arc::new(client.clone())).expect("validated configuration");
     let (tcp_listener, udp_socket) = match proxy.bind().await {
         Ok(listeners) => listeners,
         Err(error) => {

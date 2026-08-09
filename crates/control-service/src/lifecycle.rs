@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 ShadowSocketProxy contributors
-//! Owns startup, maintenance-task lifetime, transport serving, and shutdown
-//! ordering for the control service.
+//! Owns startup, transport serving, and shutdown ordering for the control
+//! service.
 
 use std::{net::SocketAddr, sync::Arc};
 
@@ -14,7 +14,6 @@ use crate::{
     bpf::{BackendError, BpfBackend},
     config::{ConfigError, ConfigStore, RuntimeConfig},
     logs::LogRing,
-    maintenance::{self, MaintenanceStats},
     service::ControlService,
     transport::{TlsPskConfig, TlsPskServer},
 };
@@ -36,7 +35,7 @@ pub enum RuntimeError {
     Grpc(#[from] tonic::transport::Error),
 }
 
-/// Coordinates the backend, control RPC state, maintenance worker, and server.
+/// Coordinates the backend, control RPC state, and server.
 pub struct ServiceRuntime<B: BpfBackend + 'static> {
     /// Backend used to attach and maintain the BPF program.
     backend: Arc<B>,
@@ -44,14 +43,8 @@ pub struct ServiceRuntime<B: BpfBackend + 'static> {
     pub config: Arc<ConfigStore>,
     /// Bounded service log ring.
     pub logs: Arc<LogRing>,
-    /// Maintenance worker statistics.
-    pub stats: Arc<MaintenanceStats>,
     /// Shutdown signal owned by this runtime.
     shutdown: watch::Sender<bool>,
-    /// Receiver used by serving and maintenance tasks.
-    shutdown_rx: watch::Receiver<bool>,
-    /// Optional maintenance task handle.
-    worker: Option<tokio::task::JoinHandle<()>>,
     /// gRPC control service instance.
     pub service: Arc<ControlService>,
     /// Optional TLS transport server.
@@ -77,30 +70,24 @@ impl<B: BpfBackend + 'static> ServiceRuntime<B> {
         };
         let config = Arc::new(ConfigStore::new(initial).expect("valid listener configuration"));
         let logs = Arc::new(LogRing::new(config.snapshot().log_capacity));
-        let stats = Arc::new(MaintenanceStats::default());
         let backend = Arc::new(backend);
         let service = Arc::new(ControlService::new(
             backend.clone(),
             config.clone(),
             logs.clone(),
-            stats.clone(),
         ));
-        let (shutdown, shutdown_rx) = watch::channel(false);
+        let (shutdown, _) = watch::channel(false);
         Self {
             backend,
             config,
             logs,
-            stats,
             shutdown,
-            shutdown_rx,
-            worker: None,
             service,
             transport: None,
         }
     }
 
-    /// Reads TLS-PSK credentials from the environment, initializes transport,
-    /// and starts maintenance.
+    /// Reads TLS-PSK credentials from the environment and initializes transport.
     pub async fn start(&mut self) -> Result<(), RuntimeError> {
         self.transport = Some(TlsPskServer::new(TlsPskConfig {
             identity: std::env::var("SSP_TLS_PSK_IDENTITY").unwrap_or_default(),
@@ -108,19 +95,7 @@ impl<B: BpfBackend + 'static> ServiceRuntime<B> {
                 .map(|value| value.into_bytes())
                 .unwrap_or_default(),
         })?);
-        self.start_without_transport_for_tests().await;
         Ok(())
-    }
-
-    /// Starts only maintenance; intended for environments without TLS transport.
-    pub async fn start_without_transport_for_tests(&mut self) {
-        self.worker = Some(maintenance::spawn_worker(
-            self.backend.clone(),
-            self.config.clone(),
-            self.stats.clone(),
-            self.logs.clone(),
-            self.shutdown_rx.clone(),
-        ));
     }
 
     /// Serves the gRPC control API with TLS-PSK on Linux; other platforms
@@ -154,14 +129,10 @@ impl<B: BpfBackend + 'static> ServiceRuntime<B> {
         }
     }
 
-    /// Marks the service unready, stops maintenance, waits for it, then detaches
-    /// all backend-owned links.
+    /// Marks the service unready and detaches all backend-owned links.
     pub async fn shutdown(&mut self) -> Result<(), RuntimeError> {
         self.service.set_ready(false);
         let _ = self.shutdown.send(true);
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.await;
-        }
         self.backend.detach(None).await?;
         Ok(())
     }
@@ -176,7 +147,6 @@ mod tests {
     async fn shutdown_cleans_owned_attachments() {
         let backend = InMemoryBackend::default();
         let mut runtime = ServiceRuntime::new(backend.clone());
-        runtime.start_without_transport_for_tests().await;
         runtime.shutdown().await.unwrap();
         assert!(backend.attachments().is_empty());
     }

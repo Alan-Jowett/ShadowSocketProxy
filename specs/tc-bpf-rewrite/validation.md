@@ -38,7 +38,7 @@ RST.
 | TC-TC-020 | REQ-TC-007 | Invalid startup listener | Invalid `SSP_LISTEN_ADDR` fails before runtime start, attach, or serve. |
 | TC-TC-021 | REQ-TC-005 | Runtime ABI encoding | Schema, targets, listener flags, TTLs, grace, and active cap round-trip to the v3 map layout. |
 | TC-TC-022 | REQ-TC-006 | Status counters | Status exposes target misses, flow insertion failures, control bypasses, and flow-map maxima only. |
-| TC-TC-023 | REQ-TC-006 | Maintenance partial cleanup | Idle/terminal deletion, decode failures, races, and backend errors remain explicit. |
+| TC-TC-023 | REQ-HP-MAINT-003 | Dataplane cleanup primitive | Canonical state/index deletion, decode failures, races, and backend errors remain explicit; lifecycle policy is not executed by the control-service. |
 | TC-TC-024 | REQ-TC-006 | Attach/rollback/detach/shutdown | Owned links and runtime state roll back transactionally and report partial cleanup. |
 | TC-TC-025 | REQ-TC-004/006 | Kernel test-run sequence | `bpf_prog_test_run_opts` asserts bytes, action, checksums, flow state, target miss, control bypass, FIN/ACK, and RST. |
 | TC-TC-026 | REQ-TC-006 | Protobuf wire compatibility | Retired policy tags are reserved; active legacy fields retain their original tags; new fields use fresh tags. |
@@ -67,6 +67,16 @@ RST.
 | TC-HP-LOG-003 | REQ-HP-LOG-002/003 | Mapping and forwarding failures | Lookup/validation, connect, send/receive, and relay delivery failures emit distinguishable structured records retaining the underlying error and tuple/protocol context. |
 | TC-HP-LOG-004 | REQ-HP-LOG-002 | Detach failure visibility | Control-service detach failure remains an explicit error event and non-success result; it is not hidden by normal shutdown logging. |
 | TC-HP-LOG-005 | REQ-HP-LOG-001/003 | Log filtering and field contract | `RUST_LOG` controls lifecycle visibility, while existing startup/activation stderr messages remain present; required event fields are stable and machine-readable. |
+| TC-HP-MAINT-001 | REQ-HP-MAINT-001 | Control-service statelessness | Starting the control-service creates no autonomous maintenance worker; attach, config, flow, and detach requests perform only requested adapter operations. |
+| TC-HP-MAINT-002 | REQ-HP-MAINT-002 | Flow enumeration contract | `EnumerateFlows` returns bounded, paginated typed flow records containing opaque identity, generation, synthetic/original tuples, protocol, last-used timestamp, and TCP lifecycle state without exposing BPF map ABI; malformed, expired, and over-limit tokens fail explicitly. |
+| TC-HP-MAINT-003 | REQ-HP-MAINT-003 | Generation mismatch | Deleting an older generation cannot remove a newer flow incarnation and returns an explicit stale-generation outcome without invalidating a local association. |
+| TC-HP-MAINT-004 | REQ-HP-MAINT-003 | Idempotent and partial deletion | Repeating a completed delete returns already-absent; backend/index failure returns counts plus a retryable partial outcome; retrying the same identity/generation does not affect a newer generation. |
+| TC-HP-MAINT-005 | REQ-HP-MAINT-004 | Host maintenance policy | Host-proxy accepts cleanup interval, idle TTL, TCP grace, scan batch, and UDP timeout with current defaults, serializes non-overlapping scans, and retries failures with bounded backoff capped by the cleanup interval. |
+| TC-HP-MAINT-006 | REQ-HP-MAINT-005 | UDP lookup caching | Repeated datagrams for one active association perform one mapping lookup; expiry or host invalidation permits recreation and a new lookup; one refusal/timeout/unreachable failure permits one re-resolution retry, while local resource errors preserve the association. |
+| TC-HP-MAINT-007 | REQ-HP-MAINT-006 | Control-plane loss | Existing TCP/UDP forwarding continues during RPC loss; reconnect and maintenance retry use bounded backoff and are visible, pending retries stop at shutdown, and local state is not silently discarded. |
+| TC-HP-MAINT-008 | REQ-HP-MAINT-001/003 | Host-driven TCP cleanup | Host policy deletes incomplete idle TCP, RST, and completed FIN/ACK flows using generation-safe flow operations and verifies no indexes remain. |
+| TC-HP-MAINT-009 | REQ-HP-MAINT-001/003 | Host-driven UDP cleanup | Host policy expires idle UDP, deletes the corresponding dataplane flow, and invalidates the local association only after the deletion outcome is known. |
+| TC-HP-MAINT-010 | REQ-HP-MAINT-001/006 | Activation and shutdown ownership | Host-proxy initiates attach/configure and detach; control-service shutdown does not independently run cleanup or alter host policy. |
 
 ## Impact Map
 
@@ -96,18 +106,24 @@ RST.
 | REQ-HP-LOG-001 | D-HP-LOG-001, D-HP-LOG-003 | TC-HP-LOG-001..002, TC-HP-LOG-005 | Host-proxy TCP/UDP lifecycle and shutdown logging. |
 | REQ-HP-LOG-002 | D-HP-LOG-002 | TC-HP-LOG-003..004 | Host-proxy mapping, forwarding, relay, and detach failure logging. |
 | REQ-HP-LOG-003 | D-HP-LOG-001..003 | TC-HP-LOG-001..005 | Structured context, filtering, and no per-datagram info logs. |
+| REQ-HP-MAINT-001 | D-HP-MAINT-001, D-HP-MAINT-004 | TC-HP-MAINT-001, TC-HP-MAINT-005, TC-HP-MAINT-008..010 | Host-proxy runtime, control-service lifecycle, and activation/shutdown. |
+| REQ-HP-MAINT-002 | D-HP-MAINT-002 | TC-HP-MAINT-002 | Protobuf flow records and paginated adapter RPCs. |
+| REQ-HP-MAINT-003 | D-HP-MAINT-003 | TC-HP-MAINT-003..004, TC-HP-MAINT-008..009 | Flow cleanup backend and host retry handling. |
+| REQ-HP-MAINT-004 | D-HP-MAINT-004 | TC-HP-MAINT-005 | Host-proxy CLI/configuration and maintenance scheduler. |
+| REQ-HP-MAINT-005 | D-HP-MAINT-005 | TC-HP-MAINT-006, TC-HP-MAINT-009 | UDP association cache and mapping client. |
+| REQ-HP-MAINT-006 | D-HP-MAINT-006 | TC-HP-MAINT-007, TC-HP-MAINT-010 | Control reconnect, forwarding tasks, and shutdown. |
 
 ## Explicit No-Impact Decisions
 
-- Host-proxy forwarding, mapping lookup, source binding, and UDP association
-  behavior remain unchanged; this propagation adds observability only.
-- Flow map layouts, TCP teardown semantics, maintenance bounds, and TLS/PSK
-  authentication remain unchanged except for the specified status/config
-  fields.
+- Packet rewrite and tuple restoration remain unchanged; this propagation
+  moves lifecycle ownership and adds typed flow control operations.
+- Flow map layouts and TCP teardown observations remain unchanged; deletion
+  authority, policy configuration ownership, and control RPCs change as
+  specified.
 - No direct-forward fallback is added when a target is unset or a mapping is
   missing.
 - Workflow artifacts are retained only for the workflow run and are not
   published to a branch or release.
-- Linux/BPF gates, host-proxy forwarding, control-plane protocol behavior, and
-  TLS/PSK policy are unchanged; the logging delta adds no packet, map, RPC,
-  ownership, or UDP lookup/cache semantics.
+- Linux/BPF packet-path gates, TLS/PSK authentication, and no-direct-forward
+  behavior remain unchanged. Control-plane protocol and maintenance behavior
+  are intentionally affected by CHG-007..009.

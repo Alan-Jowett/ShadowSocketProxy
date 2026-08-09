@@ -73,12 +73,80 @@ pub enum ProxyError {
     UnsupportedPlatform,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+/// BPF-agnostic flow record returned by host maintenance enumeration.
+pub struct FlowRecord {
+    /// Opaque flow identity.
+    pub flow_id: u64,
+    /// Generation paired with the identity.
+    pub generation: u32,
+    /// Synthetic tuple used by the proxy.
+    pub synthetic: Tuple,
+    /// Original tuple restored by the proxy.
+    pub original: Tuple,
+    /// Last dataplane activity timestamp.
+    pub last_used_ns: u64,
+    /// Protocol flags observed by the dataplane.
+    pub protocol_flags: u32,
+    /// TCP lifecycle flags observed by the dataplane.
+    pub tcp_state_flags: u32,
+    /// Control-service monotonic timestamp corresponding to `last_used_ns`.
+    pub observed_now_ns: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Result category for a generation-checked flow deletion.
+pub enum FlowDeleteOutcome {
+    /// State and indexes were removed.
+    Complete,
+    /// No matching state or indexes remained.
+    AlreadyAbsent,
+    /// A newer generation exists and was protected.
+    StaleGeneration,
+    /// Some state or indexes remain and the operation may be retried.
+    Partial,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// BPF-agnostic result returned by flow deletion.
+pub struct FlowDeleteReport {
+    /// Requested flow identity.
+    pub flow_id: u64,
+    /// Requested flow generation.
+    pub generation: u32,
+    /// Deletion outcome.
+    pub outcome: FlowDeleteOutcome,
+    /// Number of tuple indexes removed.
+    pub indexes_deleted: u32,
+    /// Whether canonical state was removed.
+    pub state_deleted: bool,
+    /// Whether the caller should retry.
+    pub retryable: bool,
+}
+
 #[async_trait]
 /// Lookup interface used by both TCP and UDP forwarding paths.
 pub trait MappingClient: Send + Sync {
     /// Resolves a proxy tuple to its original destination or returns a typed
     /// lookup/control error.
     async fn get_mapping(&self, tuple: &Tuple) -> Result<OriginalDestination, ProxyError>;
+}
+
+#[async_trait]
+/// Typed flow lifecycle operations used by host-owned maintenance.
+pub trait FlowClient: Send + Sync {
+    /// Enumerates one bounded page of active flows.
+    async fn enumerate_flows(
+        &self,
+        page_token: Vec<u8>,
+        limit: u32,
+    ) -> Result<(Vec<FlowRecord>, Vec<u8>), ProxyError>;
+    /// Deletes one flow only when its identity and generation still match.
+    async fn delete_flow(
+        &self,
+        flow_id: u64,
+        generation: u32,
+    ) -> Result<FlowDeleteReport, ProxyError>;
 }
 
 #[derive(Clone)]
@@ -94,6 +162,14 @@ pub struct ProxyConfig {
     pub psk_secret: Vec<u8>,
     /// Inactivity duration after which a UDP association is reaped.
     pub udp_idle_timeout: Duration,
+    /// Interval between host-owned flow maintenance passes.
+    pub cleanup_interval: Duration,
+    /// Idle age used for incomplete TCP and UDP flows.
+    pub idle_ttl: Duration,
+    /// Grace age for TCP flows after both FIN acknowledgements.
+    pub tcp_terminal_grace: Duration,
+    /// Maximum flow records requested per enumeration page.
+    pub flow_scan_batch: u32,
 }
 
 impl ProxyConfig {
@@ -121,7 +197,101 @@ impl ProxyConfig {
                 "UDP idle timeout must be nonzero".into(),
             ));
         }
+        if self.cleanup_interval.is_zero()
+            || self.idle_ttl.is_zero()
+            || self.tcp_terminal_grace.is_zero()
+            || self.flow_scan_batch == 0
+        {
+            return Err(ProxyError::InvalidConfiguration(
+                "maintenance settings must be nonzero".into(),
+            ));
+        }
         Ok(())
+    }
+}
+
+/// Runs serialized host-owned flow maintenance until shutdown.
+async fn run_maintenance<C: MappingClient + FlowClient + 'static>(
+    client: Arc<C>,
+    associations: Arc<UdpAssociations<C>>,
+    cleanup_interval: Duration,
+    idle_ttl: Duration,
+    tcp_terminal_grace: Duration,
+    flow_scan_batch: u32,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let mut interval = time::interval(cleanup_interval);
+    let mut retry_delay = cleanup_interval.min(Duration::from_millis(100));
+    loop {
+        tokio::select! {
+            _ = shutdown.changed() => break,
+            _ = interval.tick() => {
+                let mut token = Vec::new();
+                let mut scan_failed = false;
+                loop {
+                    let page = client.enumerate_flows(token, flow_scan_batch).await;
+                    let (flows, next) = match page {
+                        Ok(page) => page,
+                        Err(error) => {
+                            tracing::warn!(%error, "host maintenance flow enumeration failed");
+                            scan_failed = true;
+                            break;
+                        }
+                    };
+                    for flow in flows {
+                        let age = flow.observed_now_ns.saturating_sub(flow.last_used_ns);
+                        let tcp = flow.original.protocol == TCP_PROTOCOL;
+                        let terminal = tcp && (flow.tcp_state_flags & (1 << 2)) != 0
+                            && (flow.tcp_state_flags & (1 << 3)) != 0;
+                        let expired = flow.tcp_state_flags & (1 << 4) != 0
+                            || (!terminal && age >= idle_ttl.as_nanos() as u64)
+                            || (terminal && age >= tcp_terminal_grace.as_nanos() as u64);
+                        if expired {
+                            match client.delete_flow(flow.flow_id, flow.generation).await {
+                                Ok(report) => {
+                                    if matches!(
+                                        report.outcome,
+                                        FlowDeleteOutcome::Complete
+                                            | FlowDeleteOutcome::AlreadyAbsent
+                                    ) && flow.original.protocol == UDP_PROTOCOL
+                                    {
+                                        associations.invalidate(&flow.synthetic).await;
+                                    }
+                                    tracing::info!(
+                                    flow_id = flow.flow_id,
+                                    generation = flow.generation,
+                                    outcome = ?report.outcome,
+                                    "host maintenance flow deletion"
+                                    );
+                                }
+                                Err(error) => tracing::warn!(
+                                    flow_id = flow.flow_id,
+                                    generation = flow.generation,
+                                    %error,
+                                    "host maintenance flow deletion failed"
+                                ),
+                            }
+                        }
+                    }
+                    if next.is_empty() {
+                        break;
+                    }
+                    token = next;
+                }
+                if scan_failed {
+                    let delay = retry_delay;
+                    retry_delay = retry_delay
+                        .saturating_mul(2)
+                        .min(cleanup_interval);
+                    tokio::select! {
+                        _ = shutdown.changed() => break,
+                        _ = time::sleep(delay) => {}
+                    }
+                } else {
+                    retry_delay = cleanup_interval;
+                }
+            }
+        }
     }
 }
 
@@ -133,7 +303,7 @@ pub struct Proxy<C> {
     client: Arc<C>,
 }
 
-impl<C: MappingClient + 'static> Proxy<C> {
+impl<C: MappingClient + FlowClient + 'static> Proxy<C> {
     /// Validates configuration and creates a proxy that has not opened sockets.
     pub fn new(config: ProxyConfig, client: Arc<C>) -> Result<Self, ProxyError> {
         config.validate()?;
@@ -169,6 +339,15 @@ impl<C: MappingClient + 'static> Proxy<C> {
             self.config.udp_idle_timeout,
             shutdown.clone(),
         ));
+        let maintenance = tokio::spawn(run_maintenance(
+            self.client.clone(),
+            udp.clone(),
+            self.config.cleanup_interval,
+            self.config.idle_ttl,
+            self.config.tcp_terminal_grace,
+            self.config.flow_scan_batch,
+            shutdown.clone(),
+        ));
         let mut tcp_task =
             tokio::spawn(run_tcp(tcp_listener, self.client.clone(), shutdown.clone()));
         let mut udp_task = tokio::spawn(run_udp(udp.clone(), shutdown.clone()));
@@ -176,15 +355,18 @@ impl<C: MappingClient + 'static> Proxy<C> {
             _ = shutdown.changed() => {
                 let _ = tcp_task.await;
                 let _ = udp_task.await;
+                let _ = maintenance.await;
                 Ok(())
             },
             result = &mut tcp_task => {
                 udp_task.abort();
+                maintenance.abort();
                 let _ = udp_task.await;
                 result.map_err(|error| ProxyError::Control(error.to_string()))
             },
             result = &mut udp_task => {
                 tcp_task.abort();
+                maintenance.abort();
                 let _ = tcp_task.await;
                 result.map_err(|error| ProxyError::Control(error.to_string()))
             },
@@ -434,27 +616,63 @@ impl<C: MappingClient + 'static> UdpAssociations<C> {
         }
     }
 
-    /// Resolves a tuple, replaces stale destinations, sends the datagram, and
-    /// refreshes association activity.
+    /// Reuses an active association, resolving only when it is absent or a
+    /// destination-specific send failure requires one retry.
     async fn forward(&self, client_address: SocketAddr, payload: &[u8]) -> Result<(), ProxyError> {
         let tuple = Tuple {
             source: client_address,
             destination: self.socket.local_addr()?,
             protocol: UDP_PROTOCOL,
         };
-        let mapping = match self.client.get_mapping(&tuple).await {
-            Ok(mapping) => mapping,
-            Err(error) => {
-                tracing::warn!(
-                    protocol = "udp",
-                    synthetic_source = %tuple.source,
-                    synthetic_destination = %tuple.destination,
-                    error = %error,
-                    "UDP mapping lookup failed"
-                );
-                return Err(error);
-            }
+        let association = self.entries.lock().await.get(&tuple).cloned();
+        let association = match association {
+            Some(association) => association,
+            None => self.resolve_association(&tuple, client_address).await?,
         };
+        if let Err(error) = association.outbound.send(payload).await {
+            tracing::warn!(
+                protocol = "udp",
+                synthetic_source = %tuple.source,
+                synthetic_destination = %tuple.destination,
+                original_destination = %association.destination,
+                error = %error,
+                "UDP datagram send failed"
+            );
+            if !matches!(
+                error.kind(),
+                io::ErrorKind::ConnectionRefused
+                    | io::ErrorKind::TimedOut
+                    | io::ErrorKind::NetworkUnreachable
+                    | io::ErrorKind::HostUnreachable
+            ) {
+                return Err(error.into());
+            }
+            self.entries.lock().await.remove(&tuple);
+            let replacement = self.resolve_association(&tuple, client_address).await?;
+            replacement.outbound.send(payload).await?;
+            *replacement.last_seen.lock().await = std::time::Instant::now();
+            return Ok(());
+        }
+        *association.last_seen.lock().await = std::time::Instant::now();
+        Ok(())
+    }
+
+    /// Performs the one mapping lookup needed to create an association.
+    async fn resolve_association(
+        &self,
+        tuple: &Tuple,
+        client_address: SocketAddr,
+    ) -> Result<Arc<UdpAssociation>, ProxyError> {
+        let mapping = self.client.get_mapping(tuple).await.map_err(|error| {
+            tracing::warn!(
+                protocol = "udp",
+                synthetic_source = %tuple.source,
+                synthetic_destination = %tuple.destination,
+                error = %error,
+                "UDP mapping lookup failed"
+            );
+            error
+        })?;
         if mapping.protocol != UDP_PROTOCOL {
             tracing::warn!(
                 protocol = "udp",
@@ -468,36 +686,8 @@ impl<C: MappingClient + 'static> UdpAssociations<C> {
                 "UDP lookup returned a non-UDP mapping".into(),
             ));
         }
-        let existing = self.entries.lock().await.get(&tuple).cloned();
-        let association = if let Some(existing) = existing {
-            if existing.destination == mapping.address {
-                existing
-            } else {
-                self.replace_association(
-                    tuple.clone(),
-                    client_address,
-                    mapping,
-                    existing.destination,
-                )
-                .await?
-            }
-        } else {
-            self.insert_association(tuple.clone(), client_address, mapping, None)
-                .await?
-        };
-        if let Err(error) = association.outbound.send(payload).await {
-            tracing::warn!(
-                protocol = "udp",
-                synthetic_source = %tuple.source,
-                synthetic_destination = %tuple.destination,
-                original_destination = %association.destination,
-                error = %error,
-                "UDP datagram send failed"
-            );
-            return Err(error.into());
-        }
-        *association.last_seen.lock().await = std::time::Instant::now();
-        Ok(())
+        self.insert_association(tuple.clone(), client_address, mapping, None)
+            .await
     }
 
     /// Binds and connects a new outbound UDP socket, publishing it atomically
@@ -584,18 +774,6 @@ impl<C: MappingClient + 'static> UdpAssociations<C> {
         Ok(candidate)
     }
 
-    /// Rebuilds an association when the mapping destination changes.
-    async fn replace_association(
-        &self,
-        tuple: Tuple,
-        client_address: SocketAddr,
-        mapping: OriginalDestination,
-        previous_destination: SocketAddr,
-    ) -> Result<Arc<UdpAssociation>, ProxyError> {
-        self.insert_association(tuple, client_address, mapping, Some(previous_destination))
-            .await
-    }
-
     /// Logs forwarding failures at most once per second.
     async fn report_failure(&self, error: &ProxyError) {
         let now = std::time::Instant::now();
@@ -623,6 +801,20 @@ impl<C: MappingClient + 'static> UdpAssociations<C> {
             reason = "proxy_shutdown",
             "UDP associations cleared"
         );
+    }
+
+    /// Removes a locally cached association after confirmed host deletion.
+    async fn invalidate(&self, tuple: &Tuple) {
+        let removed = self.entries.lock().await.remove(tuple).is_some();
+        if removed {
+            tracing::info!(
+                protocol = "udp",
+                synthetic_source = %tuple.source,
+                synthetic_destination = %tuple.destination,
+                reason = "flow_deleted",
+                "UDP association invalidated"
+            );
+        }
     }
 
     /// Removes associations idle longer than the configured timeout.
@@ -826,6 +1018,28 @@ impl MappingClient for TlsPskMappingClient {
     }
 }
 
+#[cfg(not(all(target_os = "windows", feature = "tls-psk")))]
+#[async_trait]
+impl FlowClient for TlsPskMappingClient {
+    /// Reports that typed flow operations are unavailable without TLS support.
+    async fn enumerate_flows(
+        &self,
+        _page_token: Vec<u8>,
+        _limit: u32,
+    ) -> Result<(Vec<FlowRecord>, Vec<u8>), ProxyError> {
+        Err(ProxyError::UnsupportedPlatform)
+    }
+
+    /// Reports that typed flow operations are unavailable without TLS support.
+    async fn delete_flow(
+        &self,
+        _flow_id: u64,
+        _generation: u32,
+    ) -> Result<FlowDeleteReport, ProxyError> {
+        Err(ProxyError::UnsupportedPlatform)
+    }
+}
+
 #[cfg(all(target_os = "windows", feature = "tls-psk"))]
 /// Windows TLS-PSK control-service client, compiled only with `tls-psk`.
 mod windows_client {
@@ -963,6 +1177,88 @@ mod windows_client {
                 .map_err(|error| ProxyError::Control(error.to_string()))?;
             Ok(())
         }
+
+        /// Enumerates one bounded page of typed flow records.
+        pub async fn enumerate_flows(
+            &self,
+            page_token: Vec<u8>,
+            limit: u32,
+        ) -> Result<(Vec<FlowRecord>, Vec<u8>), ProxyError> {
+            let reply = self
+                .client
+                .lock()
+                .await
+                .enumerate_flows(proto::EnumerateFlowsRequest { limit, page_token })
+                .await
+                .map_err(|error| ProxyError::Control(error.to_string()))?
+                .into_inner();
+            let mut flows = Vec::with_capacity(reply.flows.len());
+            for flow in reply.flows {
+                let synthetic = tuple_from_proto(flow.synthetic.ok_or_else(|| {
+                    ProxyError::InvalidMapping("flow synthetic tuple missing".into())
+                })?)?;
+                let original = tuple_from_proto(flow.original.ok_or_else(|| {
+                    ProxyError::InvalidMapping("flow original tuple missing".into())
+                })?)?;
+                if synthetic.protocol != flow.protocol as u8
+                    || original.protocol != flow.protocol as u8
+                {
+                    return Err(ProxyError::InvalidMapping(
+                        "flow protocol does not match tuples".into(),
+                    ));
+                }
+                flows.push(FlowRecord {
+                    flow_id: flow.flow_id,
+                    generation: flow.generation,
+                    synthetic,
+                    original,
+                    last_used_ns: flow.last_used_ns,
+                    protocol_flags: flow.protocol_flags,
+                    tcp_state_flags: flow.tcp_state_flags,
+                    observed_now_ns: flow.observed_now_ns,
+                });
+            }
+            Ok((flows, reply.next_page_token))
+        }
+
+        /// Deletes one generation-checked flow and converts its typed outcome.
+        pub async fn delete_flow(
+            &self,
+            flow_id: u64,
+            generation: u32,
+        ) -> Result<FlowDeleteReport, ProxyError> {
+            let reply = self
+                .client
+                .lock()
+                .await
+                .delete_flow(proto::DeleteFlowRequest {
+                    flow_id,
+                    generation,
+                })
+                .await
+                .map_err(|error| ProxyError::Control(error.to_string()))?
+                .into_inner();
+            let outcome = match proto::delete_flow_reply::Outcome::try_from(reply.outcome)
+                .map_err(|_| ProxyError::Control("unknown flow deletion outcome".into()))?
+            {
+                proto::delete_flow_reply::Outcome::Complete => FlowDeleteOutcome::Complete,
+                proto::delete_flow_reply::Outcome::AlreadyAbsent => {
+                    FlowDeleteOutcome::AlreadyAbsent
+                }
+                proto::delete_flow_reply::Outcome::StaleGeneration => {
+                    FlowDeleteOutcome::StaleGeneration
+                }
+                proto::delete_flow_reply::Outcome::Partial => FlowDeleteOutcome::Partial,
+            };
+            Ok(FlowDeleteReport {
+                flow_id: reply.flow_id,
+                generation: reply.generation,
+                outcome,
+                indexes_deleted: reply.indexes_deleted,
+                state_deleted: reply.state_deleted,
+                retryable: reply.retryable,
+            })
+        }
     }
 
     #[async_trait]
@@ -991,6 +1287,28 @@ mod windows_client {
                         ProxyError::MappingNotFound
                     } else {
                         ProxyError::Control(error.to_string())
+                    }
+
+                    #[async_trait]
+                    impl FlowClient for TlsPskMappingClient {
+                        /// Delegates typed flow enumeration to the authenticated channel.
+                        async fn enumerate_flows(
+                            &self,
+                            page_token: Vec<u8>,
+                            limit: u32,
+                        ) -> Result<(Vec<FlowRecord>, Vec<u8>), ProxyError>
+                        {
+                            self.enumerate_flows(page_token, limit).await
+                        }
+
+                        /// Delegates generation-checked flow deletion to the authenticated channel.
+                        async fn delete_flow(
+                            &self,
+                            flow_id: u64,
+                            generation: u32,
+                        ) -> Result<FlowDeleteReport, ProxyError> {
+                            self.delete_flow(flow_id, generation).await
+                        }
                     }
                 })?
                 .into_inner();
@@ -1237,6 +1555,32 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl FlowClient for MockClient {
+        async fn enumerate_flows(
+            &self,
+            _page_token: Vec<u8>,
+            _limit: u32,
+        ) -> Result<(Vec<FlowRecord>, Vec<u8>), ProxyError> {
+            Ok((Vec::new(), Vec::new()))
+        }
+
+        async fn delete_flow(
+            &self,
+            _flow_id: u64,
+            _generation: u32,
+        ) -> Result<FlowDeleteReport, ProxyError> {
+            Ok(FlowDeleteReport {
+                flow_id: 0,
+                generation: 0,
+                outcome: FlowDeleteOutcome::AlreadyAbsent,
+                indexes_deleted: 0,
+                state_deleted: false,
+                retryable: false,
+            })
+        }
+    }
+
     struct SequenceClient {
         destinations: StdMutex<VecDeque<SocketAddr>>,
     }
@@ -1251,6 +1595,32 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl FlowClient for SequenceClient {
+        async fn enumerate_flows(
+            &self,
+            _page_token: Vec<u8>,
+            _limit: u32,
+        ) -> Result<(Vec<FlowRecord>, Vec<u8>), ProxyError> {
+            Ok((Vec::new(), Vec::new()))
+        }
+
+        async fn delete_flow(
+            &self,
+            _flow_id: u64,
+            _generation: u32,
+        ) -> Result<FlowDeleteReport, ProxyError> {
+            Ok(FlowDeleteReport {
+                flow_id: 0,
+                generation: 0,
+                outcome: FlowDeleteOutcome::AlreadyAbsent,
+                indexes_deleted: 0,
+                state_deleted: false,
+                retryable: false,
+            })
+        }
+    }
+
     #[test]
     fn configuration_rejects_missing_credentials_and_zero_timeout() {
         let config = ProxyConfig {
@@ -1259,6 +1629,10 @@ mod tests {
             psk_identity: String::new(),
             psk_secret: Vec::new(),
             udp_idle_timeout: Duration::ZERO,
+            cleanup_interval: Duration::from_secs(5),
+            idle_ttl: Duration::from_secs(60),
+            tcp_terminal_grace: Duration::from_secs(30),
+            flow_scan_batch: 256,
         };
         assert!(config.validate().is_err());
     }
@@ -1271,6 +1645,10 @@ mod tests {
             psk_identity: "identity".into(),
             psk_secret: vec![1],
             udp_idle_timeout: Duration::from_secs(5),
+            cleanup_interval: Duration::from_secs(5),
+            idle_ttl: Duration::from_secs(60),
+            tcp_terminal_grace: Duration::from_secs(30),
+            flow_scan_batch: 256,
         };
         assert!(matches!(
             config.validate(),
@@ -1413,7 +1791,7 @@ mod tests {
         shutdown_sender.send(true).unwrap();
 
         assert_eq!(recorder.count_reason("association_created"), 1);
-        assert_eq!(recorder.count_reason("association_replaced"), 1);
+        assert_eq!(recorder.count_reason("association_replaced"), 0);
         assert_eq!(recorder.count_reason("idle_timeout"), 1);
         assert!(recorder.has_fields(&[
             "protocol",

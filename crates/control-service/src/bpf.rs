@@ -89,6 +89,8 @@ pub struct FlowCleanupReport {
     pub indexes_deleted: usize,
     /// True when backend cleanup detected an incomplete removal.
     pub partial: bool,
+    /// True when no requested generation exists but another generation does.
+    pub stale_generation: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -103,7 +105,7 @@ pub struct BpfCounters {
 }
 
 #[async_trait]
-/// Backend contract used by the control service and maintenance worker.
+/// Backend contract used by the control-service adapter and flow operations.
 pub trait BpfBackend: Send + Sync {
     /// Loads `elf`, attaches both classifier directions, and reports map maxima.
     async fn attach(&self, elf: &Path, interfaces: &[String])
@@ -406,7 +408,12 @@ impl BpfBackend for InMemoryBackend {
     ) -> Result<FlowCleanupReport, BackendError> {
         let mut state = self.state.lock().unwrap();
         let Some(_) = state.flow_states.remove(&(flow_id, generation)) else {
-            return Ok(FlowCleanupReport::default());
+            return Ok(FlowCleanupReport {
+                stale_generation: state.flow_states.keys().any(|(id, other_generation)| {
+                    *id == flow_id && *other_generation != generation
+                }),
+                ..FlowCleanupReport::default()
+            });
         };
         let expected = FlowIndexValue {
             flow_id,
@@ -418,6 +425,7 @@ impl BpfBackend for InMemoryBackend {
             state_deleted: true,
             indexes_deleted: before - state.flow_indexes.len(),
             partial: false,
+            stale_generation: false,
         })
     }
 
@@ -981,7 +989,7 @@ impl LinuxTcAdapter for AyaLinuxTcAdapter {
         Ok(report.state_deleted || report.indexes_deleted != 0)
     }
 
-    /// Decodes all native flow-state values for maintenance cleanup.
+    /// Decodes all native flow-state values for typed flow enumeration.
     async fn list_flow_states(&self) -> Result<Vec<FlowState>, BackendError> {
         let mut state = self.state.lock().unwrap();
         let state = state.as_mut().ok_or(BackendError::NotAttached)?;
@@ -1019,6 +1027,18 @@ impl LinuxTcAdapter for AyaLinuxTcAdapter {
                     error => Err(Self::map_error(error)),
                 })
         })?;
+        let stale_generation = flow.is_none()
+            && Self::with_flow_index_map(&mut state.bpf, |map| {
+                map.iter()
+                    .map(|entry| {
+                        let (_, value) = entry.map_err(Self::map_error)?;
+                        let value = crate::mapping::decode_flow_index(&value)
+                            .map_err(|error| Self::operation("flow-index:decode", error))?;
+                        Ok(value.flow_id == flow_id && value.generation != generation)
+                    })
+                    .collect::<Result<Vec<_>, BackendError>>()
+                    .map(|values| values.into_iter().any(|matches| matches))
+            })?;
         let mut index_keys = if let Some(flow) = flow {
             let flow = decode_flow_state(&flow)
                 .map_err(|error| Self::operation("flow-state:decode", error))?;
@@ -1083,6 +1103,7 @@ impl LinuxTcAdapter for AyaLinuxTcAdapter {
             state_deleted,
             indexes_deleted,
             partial,
+            stale_generation,
         })
     }
 
