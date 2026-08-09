@@ -86,8 +86,8 @@
   remain unchanged; lifecycle events are controlled by `RUST_LOG`.
 - **Retired:** No packet-rewrite, flow-map, control RPC, or forwarding
   semantics are retired or changed by this observability requirement.
-- **Traceability:** `USER-REQUEST: issue 11 needs host-proxy lifecycle logging,
-  including visible garbage collection of old UDP associations.`
+- **Traceability:** `USER-REQUEST: add host-proxy lifecycle logging, including
+  visible garbage collection of old UDP associations.`
 
 ## Stable Requirements
 
