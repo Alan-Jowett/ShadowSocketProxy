@@ -707,7 +707,8 @@ impl<C: MappingClient + 'static> UdpAssociations<C> {
             ) {
                 return Err(error.into());
             }
-            if let Some(old) = self.entries.lock().await.remove(&tuple) {
+            let old = self.entries.lock().await.remove(&tuple);
+            if let Some(old) = old {
                 Self::stop_association(old).await;
             }
             let replacement = self.resolve_association(&tuple, client_address).await?;
