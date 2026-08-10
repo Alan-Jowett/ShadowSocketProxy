@@ -1299,18 +1299,6 @@ impl LinuxTcAdapter for AyaLinuxTcAdapter {
             let flow = if guard_active {
                 let mut stable = None;
                 for _ in 0..128 {
-                    let current = Self::with_state_map(&mut state.bpf, |map| {
-                        map.get(&state_key, 0)
-                            .map(Some)
-                            .or_else(|error| match error {
-                                aya::maps::MapError::KeyNotFound
-                                | aya::maps::MapError::ElementNotFound => Ok(None),
-                                error => Err(Self::map_error(error)),
-                            })
-                    })?;
-                    let Some(current) = current else {
-                        break;
-                    };
                     let in_flight = Self::with_packet_inflight_map(&mut state.bpf, |map| {
                         map.get(&state_key, 0).map(u64::from_ne_bytes).or_else(
                             |error| match error {
@@ -1321,12 +1309,20 @@ impl LinuxTcAdapter for AyaLinuxTcAdapter {
                         )
                     })?;
                     if in_flight == 0 {
-                        stable = Some(current);
+                        stable = Self::with_state_map(&mut state.bpf, |map| {
+                            map.get(&state_key, 0)
+                                .map(Some)
+                                .or_else(|error| match error {
+                                    aya::maps::MapError::KeyNotFound
+                                    | aya::maps::MapError::ElementNotFound => Ok(None),
+                                    error => Err(Self::map_error(error)),
+                                })
+                        })?;
                         break;
                     }
                     std::thread::yield_now();
                 }
-                let Some(flow) = stable else {
+                let Some(_flow) = stable else {
                     return Ok(FlowCleanupReport {
                         observation_mismatch: true,
                         ..FlowCleanupReport::default()
@@ -1354,7 +1350,42 @@ impl LinuxTcAdapter for AyaLinuxTcAdapter {
                         ..FlowCleanupReport::default()
                     });
                 }
-                Some(flow)
+                let mut quiescent = false;
+                for _ in 0..128 {
+                    let in_flight = Self::with_packet_inflight_map(&mut state.bpf, |map| {
+                        map.get(&state_key, 0).map(u64::from_ne_bytes).or_else(
+                            |error| match error {
+                                aya::maps::MapError::KeyNotFound
+                                | aya::maps::MapError::ElementNotFound => Ok(0),
+                                error => Err(Self::map_error(error)),
+                            },
+                        )
+                    })?;
+                    if in_flight == 0 {
+                        quiescent = true;
+                        break;
+                    }
+                    std::thread::yield_now();
+                }
+                if !quiescent {
+                    return Ok(FlowCleanupReport {
+                        observation_mismatch: true,
+                        ..FlowCleanupReport::default()
+                    });
+                }
+                let committed_flow = Self::with_state_map(&mut state.bpf, |map| {
+                    map.get(&state_key, 0)
+                        .map(Some)
+                        .or_else(|error| match error {
+                            aya::maps::MapError::KeyNotFound
+                            | aya::maps::MapError::ElementNotFound => Ok(None),
+                            error => Err(Self::map_error(error)),
+                        })
+                })?;
+                if committed_flow.is_none() {
+                    return Ok(FlowCleanupReport::default());
+                }
+                committed_flow
             } else {
                 initial_flow
             };
