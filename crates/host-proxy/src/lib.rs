@@ -7,17 +7,23 @@ use std::{
     collections::HashMap,
     future::Future,
     net::{IpAddr, SocketAddr},
-    sync::{Arc, Weak},
+    sync::{
+        atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering},
+        Arc, Weak,
+    },
     time::Duration,
 };
 
 use async_trait::async_trait;
 use thiserror::Error;
+#[cfg(any(not(target_os = "windows"), test))]
+use tokio::net::TcpListener;
+#[cfg(not(target_os = "windows"))]
+use tokio::task::JoinSet;
 use tokio::{
     io,
-    net::{TcpListener, TcpStream, UdpSocket},
+    net::{TcpStream, UdpSocket},
     sync::{watch, Mutex, Notify},
-    task::JoinSet,
     time,
 };
 
@@ -32,6 +38,171 @@ const TCP_PROTOCOL: u8 = 6;
 const UDP_PROTOCOL: u8 = 17;
 /// Upper bound for a host-issued control RPC or maintenance operation.
 const CONTROL_RPC_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Lifecycle state for a Windows conditional-accept request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum ConditionalAttemptState {
+    /// Request has been deferred and awaits preconnect.
+    Deferred = 0,
+    /// Worker owns a preconnected outbound socket.
+    Ready = 1,
+    /// Callback permitted `WSAAccept` to return the client socket.
+    Claimed = 2,
+    /// Request must receive conditional rejection.
+    Rejected = 3,
+    /// Shutdown cancelled the request before completion.
+    Cancelled = 4,
+}
+
+impl ConditionalAttemptState {
+    /// Decodes the atomic representation, treating unknown values as cancelled.
+    fn from_raw(value: u8) -> Self {
+        match value {
+            0 => Self::Deferred,
+            1 => Self::Ready,
+            2 => Self::Claimed,
+            3 => Self::Rejected,
+            _ => Self::Cancelled,
+        }
+    }
+}
+
+/// Exact deferred-request identity. The generation prevents a late worker
+/// result from being associated with a new request using the same tuple.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ConditionalRequestId {
+    /// Exact synthetic tuple presented to the condition callback.
+    tuple: Tuple,
+    /// Unique incarnation for one deferred use of that tuple.
+    generation: u64,
+}
+
+/// State shared by the conditional callback, coordinator, and preconnect
+/// worker. It contains no socket ownership so it is also testable off Windows.
+struct ConditionalAttempt {
+    /// Immutable identity for this deferred attempt.
+    id: ConditionalRequestId,
+    /// Timestamp of the initial `CF_DEFER`.
+    deferred_at: std::time::Instant,
+    /// Atomic lifecycle state shared across native contexts.
+    state: AtomicU8,
+    /// Ensures the admission count is decremented at most once.
+    released: AtomicBool,
+}
+
+impl ConditionalAttempt {
+    /// Creates a request in the deferred state.
+    fn new(id: ConditionalRequestId) -> Self {
+        Self {
+            id,
+            deferred_at: std::time::Instant::now(),
+            state: AtomicU8::new(ConditionalAttemptState::Deferred as u8),
+            released: AtomicBool::new(false),
+        }
+    }
+
+    /// Reads the atomically published lifecycle state.
+    fn state(&self) -> ConditionalAttemptState {
+        ConditionalAttemptState::from_raw(self.state.load(Ordering::Acquire))
+    }
+}
+
+/// Atomically limits pending Windows conditional-accept attempts and gives
+/// every admitted request a monotonically increasing generation.
+struct ConditionalAdmissions {
+    /// Maximum number of unaccepted deferred attempts.
+    limit: usize,
+    /// Currently reserved deferred attempts.
+    pending: AtomicUsize,
+    /// Source of unique request-generation values.
+    next_generation: AtomicU64,
+}
+
+impl ConditionalAdmissions {
+    /// Creates an admission controller with the configured limit.
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            pending: AtomicUsize::new(0),
+            next_generation: AtomicU64::new(1),
+        }
+    }
+
+    /// Reserves one bounded attempt and assigns its request generation.
+    fn reserve(&self, tuple: Tuple) -> Option<Arc<ConditionalAttempt>> {
+        let mut current = self.pending.load(Ordering::Acquire);
+        loop {
+            if current >= self.limit {
+                return None;
+            }
+            match self.pending.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
+                    return Some(Arc::new(ConditionalAttempt::new(ConditionalRequestId {
+                        tuple,
+                        generation,
+                    })));
+                }
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    /// Releases a reservation once, including on stale completion and shutdown
+    /// paths that race the conditional callback.
+    fn release(&self, attempt: &ConditionalAttempt) {
+        if !attempt.released.swap(true, Ordering::AcqRel) {
+            self.pending.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
+    #[cfg(test)]
+    fn pending(&self) -> usize {
+        self.pending.load(Ordering::Acquire)
+    }
+}
+
+/// Computes the remaining conditional-preconnect budget from the first defer,
+/// not from when a worker happens to start.
+fn conditional_preconnect_budget(deferred_at: std::time::Instant) -> Result<Duration, ProxyError> {
+    CONTROL_RPC_TIMEOUT
+        .checked_sub(deferred_at.elapsed())
+        .ok_or_else(|| {
+            ProxyError::Control("conditional preconnect timed out before it started".into())
+        })
+}
+
+/// Changes a deferred request to ready only once its outbound socket is stored.
+fn mark_attempt_ready(attempt: &ConditionalAttempt) -> bool {
+    attempt
+        .state
+        .compare_exchange(
+            ConditionalAttemptState::Deferred as u8,
+            ConditionalAttemptState::Ready as u8,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_ok()
+}
+
+/// Claims a ready request for the single matching accepted client socket.
+fn claim_ready_attempt(attempt: &ConditionalAttempt) -> bool {
+    attempt
+        .state
+        .compare_exchange(
+            ConditionalAttemptState::Ready as u8,
+            ConditionalAttemptState::Claimed as u8,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_ok()
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 /// Socket tuple sent to the control service for mapping lookup.
@@ -165,6 +336,8 @@ pub trait FlowClient: Send + Sync {
 pub struct ProxyConfig {
     /// Specific local address shared by the TCP and UDP listeners.
     pub listen: SocketAddr,
+    /// Native TCP listen backlog and Windows conditional-attempt limit.
+    pub listen_backlog: u32,
     /// URI of the TLS-PSK control service.
     pub control_endpoint: String,
     /// Client identity presented during the TLS-PSK handshake.
@@ -206,6 +379,11 @@ impl ProxyConfig {
         if self.udp_idle_timeout.is_zero() {
             return Err(ProxyError::InvalidConfiguration(
                 "UDP idle timeout must be nonzero".into(),
+            ));
+        }
+        if self.listen_backlog == 0 || self.listen_backlog > i32::MAX as u32 {
+            return Err(ProxyError::InvalidConfiguration(
+                "listen backlog must be between 1 and i32::MAX".into(),
             ));
         }
         for (name, duration) in [
@@ -408,6 +586,31 @@ pub struct Proxy<C> {
     client: Arc<C>,
 }
 
+/// A TCP listener whose Windows implementation owns the conditional-accept
+/// callback context for the complete coordinator lifetime.
+pub struct BoundTcpListener {
+    /// Tokio listener retained by the unchanged non-Windows path.
+    #[cfg(not(target_os = "windows"))]
+    listener: TcpListener,
+    /// Native conditional listener retained by the Windows coordinator path.
+    #[cfg(target_os = "windows")]
+    listener: windows_conditional::ConditionalListener,
+}
+
+impl BoundTcpListener {
+    /// Returns the exact address selected by the TCP listener.
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        #[cfg(not(target_os = "windows"))]
+        {
+            self.listener.local_addr()
+        }
+        #[cfg(target_os = "windows")]
+        {
+            Ok(self.listener.local_addr())
+        }
+    }
+}
+
 impl<C: MappingClient + FlowClient + 'static> Proxy<C> {
     /// Validates configuration and creates a proxy that has not opened sockets.
     pub fn new(config: ProxyConfig, client: Arc<C>) -> Result<Self, ProxyError> {
@@ -416,11 +619,34 @@ impl<C: MappingClient + FlowClient + 'static> Proxy<C> {
     }
 
     /// Binds TCP and UDP listeners at the configured specific address.
-    pub async fn bind(&self) -> Result<(TcpListener, Arc<UdpSocket>), ProxyError> {
-        let tcp_listener = TcpListener::bind(self.config.listen).await?;
-        let actual_listen = tcp_listener.local_addr()?;
-        let udp_socket = Arc::new(UdpSocket::bind(actual_listen).await?);
-        Ok((tcp_listener, udp_socket))
+    pub async fn bind(&self) -> Result<(BoundTcpListener, Arc<UdpSocket>), ProxyError> {
+        #[cfg(not(target_os = "windows"))]
+        {
+            let tcp_listener = TcpListener::bind(self.config.listen).await?;
+            let actual_listen = tcp_listener.local_addr()?;
+            let udp_socket = Arc::new(UdpSocket::bind(actual_listen).await?);
+            return Ok((
+                BoundTcpListener {
+                    listener: tcp_listener,
+                },
+                udp_socket,
+            ));
+        }
+        #[cfg(target_os = "windows")]
+        {
+            let tcp_listener = windows_conditional::ConditionalListener::bind(
+                self.config.listen,
+                self.config.listen_backlog,
+            )?;
+            let actual_listen = tcp_listener.local_addr();
+            let udp_socket = Arc::new(UdpSocket::bind(actual_listen).await?);
+            Ok((
+                BoundTcpListener {
+                    listener: tcp_listener,
+                },
+                udp_socket,
+            ))
+        }
     }
 
     /// Binds both transports, runs them until shutdown or task failure, then
@@ -434,15 +660,18 @@ impl<C: MappingClient + FlowClient + 'static> Proxy<C> {
     /// target a listening proxy before any redirected traffic is enabled.
     pub async fn run_bound(
         self,
-        tcp_listener: TcpListener,
+        tcp_listener: BoundTcpListener,
         udp_socket: Arc<UdpSocket>,
         mut shutdown: watch::Receiver<bool>,
     ) -> Result<(), ProxyError> {
+        // A local fanout makes a sibling task failure a coordinated shutdown
+        // rather than an abort that could strand Windows native threads.
+        let (stop, task_shutdown) = watch::channel(false);
         let udp = Arc::new(UdpAssociations::new(
             udp_socket,
             self.client.clone(),
             self.config.udp_idle_timeout,
-            shutdown.clone(),
+            task_shutdown.clone(),
         ));
         let maintenance = tokio::spawn(run_maintenance(
             self.client.clone(),
@@ -452,28 +681,32 @@ impl<C: MappingClient + FlowClient + 'static> Proxy<C> {
             self.config.idle_ttl,
             self.config.tcp_terminal_grace,
             self.config.flow_scan_batch,
-            shutdown.clone(),
+            task_shutdown.clone(),
         ));
-        let mut tcp_task =
-            tokio::spawn(run_tcp(tcp_listener, self.client.clone(), shutdown.clone()));
-        let mut udp_task = tokio::spawn(run_udp(udp.clone(), shutdown.clone()));
+        let mut tcp_task = tokio::spawn(run_tcp(
+            tcp_listener,
+            self.client.clone(),
+            task_shutdown.clone(),
+        ));
+        let mut udp_task = tokio::spawn(run_udp(udp.clone(), task_shutdown));
         let result = tokio::select! {
             _ = shutdown.changed() => {
+                let _ = stop.send(true);
                 let _ = tcp_task.await;
                 let _ = udp_task.await;
                 let _ = maintenance.await;
                 Ok(())
             },
             result = &mut tcp_task => {
-                udp_task.abort();
-                maintenance.abort();
+                let _ = stop.send(true);
                 let _ = udp_task.await;
+                let _ = maintenance.await;
                 result.map_err(|error| ProxyError::Control(error.to_string()))
             },
             result = &mut udp_task => {
-                tcp_task.abort();
-                maintenance.abort();
+                let _ = stop.send(true);
                 let _ = tcp_task.await;
+                let _ = maintenance.await;
                 result.map_err(|error| ProxyError::Control(error.to_string()))
             },
         };
@@ -489,6 +722,22 @@ impl<C: MappingClient + FlowClient + 'static> Proxy<C> {
 
 /// Accepts TCP sessions until shutdown and joins or aborts all bridges.
 async fn run_tcp<C: MappingClient + 'static>(
+    listener: BoundTcpListener,
+    client: Arc<C>,
+    shutdown: watch::Receiver<bool>,
+) {
+    #[cfg(not(target_os = "windows"))]
+    let BoundTcpListener { listener } = listener;
+    #[cfg(not(target_os = "windows"))]
+    run_tcp_tokio(listener, client, shutdown).await;
+    #[cfg(target_os = "windows")]
+    windows_conditional::run_tcp_conditional(listener.listener, client, shutdown).await;
+}
+
+/// Accepts TCP sessions through Tokio on platforms that do not use Windows
+/// conditional accept.
+#[cfg(not(target_os = "windows"))]
+async fn run_tcp_tokio<C: MappingClient + 'static>(
     listener: TcpListener,
     client: Arc<C>,
     mut shutdown: watch::Receiver<bool>,
@@ -547,8 +796,9 @@ impl Drop for TcpForwardingGuard {
 
 /// Looks up the accepted tuple, connects to the original destination, and
 /// copies bytes bidirectionally until either stream closes.
+#[cfg(any(not(target_os = "windows"), test))]
 async fn bridge_tcp<C: MappingClient + 'static>(
-    mut accepted: TcpStream,
+    accepted: TcpStream,
     client: Arc<C>,
 ) -> Result<(), ProxyError> {
     let tuple = Tuple {
@@ -569,20 +819,8 @@ async fn bridge_tcp<C: MappingClient + 'static>(
             return Err(error);
         }
     };
-    if original.protocol != TCP_PROTOCOL {
-        tracing::warn!(
-            protocol = "tcp",
-            synthetic_source = %tuple.source,
-            synthetic_destination = %tuple.destination,
-            original_destination = %original.address,
-            reason = "protocol_mismatch",
-            "TCP mapping validation failed"
-        );
-        return Err(ProxyError::InvalidMapping(
-            "TCP lookup returned a non-TCP mapping".into(),
-        ));
-    }
-    let mut outbound = match TcpStream::connect(original.address).await {
+    validate_tcp_mapping(&tuple, &original)?;
+    let outbound = match TcpStream::connect(original.address).await {
         Ok(outbound) => outbound,
         Err(error) => {
             tracing::warn!(
@@ -596,16 +834,48 @@ async fn bridge_tcp<C: MappingClient + 'static>(
             return Err(error.into());
         }
     };
+    bridge_tcp_streams(accepted, outbound, tuple, original.address).await
+}
+
+/// Validates a TCP mapping before either forwarding path obtains an outbound
+/// socket. This protects the generic mapping-client interface as well as the
+/// protocol client's protobuf validation.
+fn validate_tcp_mapping(tuple: &Tuple, original: &OriginalDestination) -> Result<(), ProxyError> {
+    if original.protocol != TCP_PROTOCOL {
+        return Err(ProxyError::InvalidMapping(
+            "TCP lookup returned a non-TCP mapping".into(),
+        ));
+    }
+    if original.address.ip().is_unspecified()
+        || original.address.port() == 0
+        || original.address.is_ipv4() != tuple.destination.is_ipv4()
+    {
+        return Err(ProxyError::InvalidMapping(
+            "TCP mapping destination has an invalid address, port, or family".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Bridges a client socket and an already validated, connected outbound socket.
+/// Windows conditional accept uses this entry point so the socket that caused
+/// `CF_ACCEPT` is never connected a second time.
+async fn bridge_tcp_streams(
+    mut accepted: TcpStream,
+    mut outbound: TcpStream,
+    tuple: Tuple,
+    original_destination: SocketAddr,
+) -> Result<(), ProxyError> {
     let mut termination = TcpForwardingGuard {
         tuple: tuple.clone(),
-        original_destination: original.address,
+        original_destination,
         completed: false,
     };
     tracing::info!(
         protocol = "tcp",
         synthetic_source = %tuple.source,
         synthetic_destination = %tuple.destination,
-        original_destination = %original.address,
+        original_destination = %original_destination,
         reason = "forwarding_started",
         "TCP forwarding started"
     );
@@ -615,7 +885,7 @@ async fn bridge_tcp<C: MappingClient + 'static>(
                 protocol = "tcp",
                 synthetic_source = %tuple.source,
                 synthetic_destination = %tuple.destination,
-                original_destination = %original.address,
+                original_destination = %original_destination,
                 client_to_destination,
                 destination_to_client,
                 reason = "stream_closed",
@@ -628,7 +898,7 @@ async fn bridge_tcp<C: MappingClient + 'static>(
                 protocol = "tcp",
                 synthetic_source = %tuple.source,
                 synthetic_destination = %tuple.destination,
-                original_destination = %original.address,
+                original_destination = %original_destination,
                 error = %error,
                 reason = "stream_error",
                 "TCP forwarding terminated with error"
@@ -1155,6 +1425,874 @@ fn unspecified_for(address: SocketAddr) -> SocketAddr {
     match address.ip() {
         IpAddr::V4(_) => SocketAddr::from(([0, 0, 0, 0], 0)),
         IpAddr::V6(_) => SocketAddr::from(([0; 16], 0)),
+    }
+}
+
+#[cfg(target_os = "windows")]
+/// Windows-only conditional-accept listener, coordinator, and worker.
+mod windows_conditional {
+    use super::*;
+    use std::{
+        collections::HashMap,
+        ffi::{c_char, c_int, c_ulong, c_void},
+        io, mem,
+        net::{SocketAddrV6, TcpStream as StdTcpStream},
+        os::windows::io::{AsRawSocket, FromRawSocket, IntoRawSocket, RawSocket},
+        ptr,
+        sync::{
+            mpsc::{self, Receiver, SyncSender},
+            Mutex as StdMutex,
+        },
+        thread::{self, JoinHandle},
+    };
+    use tokio::{net::TcpSocket, runtime::Builder, sync::mpsc as tokio_mpsc, task::JoinSet};
+
+    /// Winsock socket handle representation.
+    type Socket = usize;
+    /// Windows kernel object handle representation.
+    type Handle = *mut c_void;
+
+    /// Invalid Winsock socket sentinel.
+    const INVALID_SOCKET: Socket = !0;
+    /// Winsock socket option level.
+    const SOL_SOCKET: c_int = 0xffff;
+    /// Winsock option that enables conditional accept.
+    const SO_CONDITIONAL_ACCEPT: c_int = 0x3002;
+    /// Winsock ioctl selecting nonblocking mode.
+    const FIONBIO: c_ulong = 0x8004_667e;
+    /// Winsock result indicating no immediately accepted socket.
+    const WSAEWOULDBLOCK: c_int = 10035;
+    /// Winsock result produced by a deferred conditional request.
+    const WSATRY_AGAIN: c_int = 11002;
+    /// Result value for an event wait timeout.
+    const WAIT_TIMEOUT: u32 = 258;
+
+    /// Condition callback result authorizing the connection.
+    const CF_ACCEPT: c_int = 0;
+    /// Condition callback result rejecting the connection.
+    const CF_REJECT: c_int = 1;
+    /// Condition callback result deferring the connection.
+    const CF_DEFER: c_int = 2;
+
+    /// C representation of a Winsock address/data buffer.
+    #[repr(C)]
+    struct WsaBuf {
+        /// Byte length of the pointed-to buffer.
+        len: u32,
+        /// Address of the bytes.
+        buf: *mut c_char,
+    }
+
+    /// ABI of a Winsock conditional-accept callback.
+    type ConditionProc = unsafe extern "system" fn(
+        *mut WsaBuf,
+        *mut WsaBuf,
+        *mut c_void,
+        *mut c_void,
+        *mut WsaBuf,
+        *mut WsaBuf,
+        *mut u32,
+        usize,
+    ) -> c_int;
+
+    #[link(name = "Ws2_32")]
+    extern "system" {
+        /// Configures a native Winsock socket option.
+        fn setsockopt(
+            socket: Socket,
+            level: c_int,
+            option_name: c_int,
+            option_value: *const c_char,
+            option_len: c_int,
+        ) -> c_int;
+        /// Runs conditional accept for one queued connection.
+        fn WSAAccept(
+            socket: Socket,
+            address: *mut c_void,
+            address_length: *mut c_int,
+            condition: Option<ConditionProc>,
+            callback_data: usize,
+        ) -> Socket;
+        /// Returns the last Winsock error for the calling thread.
+        fn WSAGetLastError() -> c_int;
+        /// Closes a native Winsock socket.
+        fn closesocket(socket: Socket) -> c_int;
+        /// Configures nonblocking mode on a native socket.
+        fn ioctlsocket(socket: Socket, command: c_ulong, argument: *mut c_ulong) -> c_int;
+    }
+
+    #[link(name = "Kernel32")]
+    extern "system" {
+        /// Creates an unnamed event for cross-thread wakeups.
+        fn CreateEventW(
+            attributes: *const c_void,
+            manual_reset: i32,
+            initial_state: i32,
+            name: *const u16,
+        ) -> Handle;
+        /// Signals an event.
+        fn SetEvent(event: Handle) -> i32;
+        /// Clears a manual-reset event.
+        fn ResetEvent(event: Handle) -> i32;
+        /// Waits boundedly for an event.
+        fn WaitForSingleObject(handle: Handle, milliseconds: u32) -> u32;
+        /// Closes an owned kernel handle.
+        fn CloseHandle(handle: Handle) -> i32;
+    }
+
+    /// Closes a Winsock socket unless ownership has been transferred to a
+    /// standard or Tokio stream.
+    struct OwnedSocket(Socket);
+
+    unsafe impl Send for OwnedSocket {}
+
+    impl OwnedSocket {
+        /// Wraps a newly owned raw Winsock socket.
+        fn new(socket: Socket) -> Self {
+            Self(socket)
+        }
+
+        /// Borrows the raw socket without transferring ownership.
+        fn raw(&self) -> Socket {
+            self.0
+        }
+
+        /// Transfers sole raw-socket ownership to the caller.
+        fn into_raw(mut self) -> Socket {
+            let socket = self.0;
+            self.0 = INVALID_SOCKET;
+            socket
+        }
+    }
+
+    impl Drop for OwnedSocket {
+        /// Closes the still-owned raw socket.
+        fn drop(&mut self) {
+            if self.0 != INVALID_SOCKET {
+                // SAFETY: this type owns the valid Winsock socket exactly once.
+                unsafe {
+                    let _ = closesocket(self.0);
+                }
+            }
+        }
+    }
+
+    /// A preconnected socket that cannot be published independently from its
+    /// matching accepted client socket.
+    struct PreparedSocket {
+        /// Connected outbound socket owned until handoff.
+        socket: OwnedSocket,
+        /// Validated original destination paired with the socket.
+        destination: SocketAddr,
+    }
+
+    /// Per-request storage. Socket ownership is kept outside the callback's
+    /// lock-free decision path.
+    struct AttemptSlot {
+        /// Shared lifecycle and identity state.
+        attempt: Arc<ConditionalAttempt>,
+        /// Outbound socket available only after worker success.
+        prepared: StdMutex<Option<PreparedSocket>>,
+    }
+
+    impl AttemptSlot {
+        /// Allocates an empty handoff slot for one attempt.
+        fn new(attempt: Arc<ConditionalAttempt>) -> Self {
+            Self {
+                attempt,
+                prepared: StdMutex::new(None),
+            }
+        }
+    }
+
+    /// Exact-tuple index of live conditional attempts.
+    type AttemptTable = HashMap<Tuple, Arc<AttemptSlot>>;
+
+    /// Stable callback data shared with `WSAAccept`. The `Arc` is retained by
+    /// both the listener task and coordinator thread until the thread joins.
+    struct ConditionalContext {
+        /// Bounded pending-attempt accounting.
+        admissions: ConditionalAdmissions,
+        /// Exact-tuple attempt registry.
+        attempts: StdMutex<AttemptTable>,
+        /// Bounded nonblocking callback-to-worker queue.
+        request_sender: SyncSender<Arc<AttemptSlot>>,
+        /// Whether the callback may defer new work.
+        accepting: AtomicBool,
+        /// Number of accepted socket handoffs queued for Tokio conversion.
+        handoffs: AtomicUsize,
+        /// Generation claimed by the callback for a successful accept.
+        accepted_generation: AtomicU64,
+        /// Manual-reset coordinator wake event.
+        wake_event: Handle,
+    }
+
+    unsafe impl Send for ConditionalContext {}
+    unsafe impl Sync for ConditionalContext {}
+
+    impl ConditionalContext {
+        /// Creates the context whose address is passed to `WSAAccept`.
+        fn new(
+            backlog: usize,
+            request_sender: SyncSender<Arc<AttemptSlot>>,
+            wake_event: Handle,
+        ) -> Self {
+            Self {
+                admissions: ConditionalAdmissions::new(backlog),
+                attempts: StdMutex::new(HashMap::new()),
+                request_sender,
+                accepting: AtomicBool::new(true),
+                handoffs: AtomicUsize::new(0),
+                accepted_generation: AtomicU64::new(0),
+                wake_event,
+            }
+        }
+
+        /// Signals the coordinator after work or shutdown state changes.
+        fn wake(&self) {
+            // SAFETY: `wake_event` is created with CreateEventW and remains
+            // open until this context's final Arc is dropped after join.
+            unsafe {
+                let _ = SetEvent(self.wake_event);
+            }
+        }
+
+        /// Stops new admissions and makes every in-flight request rejectable.
+        /// Prepared outbound sockets are removed here, before the callback
+        /// observes a terminal state, so the callback never closes sockets.
+        fn stop_and_reject_pending(&self) {
+            self.accepting.store(false, Ordering::Release);
+            let attempts = self.attempts.lock().expect("conditional attempts poisoned");
+            for slot in attempts.values() {
+                slot.attempt
+                    .state
+                    .store(ConditionalAttemptState::Rejected as u8, Ordering::Release);
+                let _ = slot
+                    .prepared
+                    .lock()
+                    .expect("conditional prepared socket poisoned")
+                    .take();
+                self.admissions.release(&slot.attempt);
+            }
+            drop(attempts);
+            self.wake();
+        }
+
+        /// Reserves one bounded handoff slot before conditional acceptance.
+        fn reserve_handoff(&self) -> bool {
+            let mut current = self.handoffs.load(Ordering::Acquire);
+            loop {
+                if current >= self.admissions.limit {
+                    return false;
+                }
+                match self.handoffs.compare_exchange_weak(
+                    current,
+                    current + 1,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => return true,
+                    Err(observed) => current = observed,
+                }
+            }
+        }
+
+        /// Releases a queued handoff slot exactly once after conversion or
+        /// rejection.
+        fn release_handoff(&self) {
+            self.handoffs.fetch_sub(1, Ordering::AcqRel);
+        }
+
+        /// Removes an exact matching slot and decrements admission if needed.
+        fn remove_and_release(&self, tuple: &Tuple, generation: u64) {
+            let removed = {
+                let mut attempts = self.attempts.lock().expect("conditional attempts poisoned");
+                attempts
+                    .get(tuple)
+                    .is_some_and(|slot| slot.attempt.id.generation == generation)
+                    .then(|| attempts.remove(tuple))
+                    .flatten()
+            };
+            if let Some(slot) = removed {
+                self.admissions.release(&slot.attempt);
+            }
+        }
+    }
+
+    impl Drop for ConditionalContext {
+        /// Releases the coordinator event after every callback is impossible.
+        fn drop(&mut self) {
+            // SAFETY: no callback can still use this context because the
+            // coordinator's Arc is dropped only after its thread has stopped.
+            unsafe {
+                let _ = CloseHandle(self.wake_event);
+            }
+        }
+    }
+
+    /// Owns the native listening socket and the callback context until
+    /// `run_tcp_conditional` joins the coordinator.
+    pub(super) struct ConditionalListener {
+        /// Native socket owned by the coordinator thread.
+        socket: OwnedSocket,
+        /// Address selected before Tokio ownership conversion.
+        local_addr: SocketAddr,
+        /// Stable callback state retained through coordinator join.
+        context: Arc<ConditionalContext>,
+        /// Deferred callback requests consumed by the worker.
+        request_receiver: Receiver<Arc<AttemptSlot>>,
+    }
+
+    impl ConditionalListener {
+        /// Binds and configures a TCP socket for conditional accept before
+        /// native `listen`, then transfers it to the coordinator.
+        pub(super) fn bind(local_addr: SocketAddr, backlog: u32) -> Result<Self, ProxyError> {
+            let socket = match local_addr {
+                SocketAddr::V4(_) => TcpSocket::new_v4()?,
+                SocketAddr::V6(_) => TcpSocket::new_v6()?,
+            };
+            socket.bind(local_addr)?;
+            // SAFETY: the event is an unnamed, manual-reset event owned by the
+            // context and used only to wake its coordinator thread.
+            let wake_event = unsafe { CreateEventW(ptr::null(), 1, 0, ptr::null()) };
+            if wake_event.is_null() {
+                return Err(ProxyError::Io(io::Error::last_os_error()));
+            }
+            let (request_sender, request_receiver) = mpsc::sync_channel(backlog as usize);
+            let context = Arc::new(ConditionalContext::new(
+                backlog as usize,
+                request_sender,
+                wake_event,
+            ));
+            let enabled: c_int = 1;
+            // SAFETY: `TcpSocket` owns a bound but not-yet-listening socket.
+            // The option points to `enabled` only for this synchronous call.
+            if unsafe {
+                setsockopt(
+                    socket.as_raw_socket() as Socket,
+                    SOL_SOCKET,
+                    SO_CONDITIONAL_ACCEPT,
+                    (&enabled as *const c_int).cast::<c_char>(),
+                    mem::size_of_val(&enabled) as c_int,
+                )
+            } != 0
+            {
+                return Err(last_socket_error("enable SO_CONDITIONAL_ACCEPT"));
+            }
+            let listener = socket.listen(backlog)?;
+            let local_addr = listener.local_addr()?;
+            let listener = listener.into_std()?;
+            listener.set_nonblocking(true)?;
+            let socket = OwnedSocket::new(listener.into_raw_socket() as Socket);
+            Ok(Self {
+                socket,
+                local_addr,
+                context,
+                request_receiver,
+            })
+        }
+
+        /// Returns the address selected before raw socket ownership transfer.
+        pub(super) fn local_addr(&self) -> SocketAddr {
+            self.local_addr
+        }
+    }
+
+    /// Result sent from the preconnect worker to the coordinator. A stale
+    /// result owns its socket until the coordinator drops it.
+    enum WorkerResult {
+        /// Mapping and connect succeeded with a paired outbound socket.
+        Ready {
+            slot: Arc<AttemptSlot>,
+            prepared: PreparedSocket,
+        },
+        /// Lookup, validation, connect, timeout, or cancellation failed.
+        Rejected {
+            slot: Arc<AttemptSlot>,
+            error: ProxyError,
+        },
+    }
+
+    /// A raw client/preconnected pair that has not yet been converted into
+    /// Tokio streams. Dropping it closes both raw sockets.
+    struct SocketHandoff {
+        /// Raw client socket returned by the matching `WSAAccept`.
+        client: OwnedSocket,
+        /// Matching validated and preconnected outbound socket.
+        outbound: PreparedSocket,
+        /// Exact tuple bound to both raw sockets.
+        tuple: Tuple,
+    }
+
+    /// Starts a worker with a private current-thread runtime. It never calls
+    /// `Handle::block_on`, so it cannot nest a runtime on Tokio's worker
+    /// threads.
+    fn spawn_preconnect_worker<C: MappingClient + 'static>(
+        client: Arc<C>,
+        context: Arc<ConditionalContext>,
+        receiver: Receiver<Arc<AttemptSlot>>,
+        sender: mpsc::Sender<WorkerResult>,
+    ) -> JoinHandle<()> {
+        thread::spawn(move || {
+            let runtime = match Builder::new_current_thread().enable_all().build() {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    tracing::error!(%error, "conditional preconnect runtime initialization failed");
+                    context.stop_and_reject_pending();
+                    return;
+                }
+            };
+            while context.accepting.load(Ordering::Acquire) {
+                let slot = match receiver.recv_timeout(Duration::from_millis(10)) {
+                    Ok(slot) => slot,
+                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                };
+                if slot.attempt.state() != ConditionalAttemptState::Deferred {
+                    continue;
+                }
+                let result = runtime.block_on(preconnect_attempt(client.clone(), slot.clone()));
+                let result = match result {
+                    Ok(prepared) => WorkerResult::Ready { slot, prepared },
+                    Err(error) => WorkerResult::Rejected { slot, error },
+                };
+                if sender.send(result).is_err() {
+                    break;
+                }
+                context.wake();
+            }
+        })
+    }
+
+    /// Performs the asynchronous mapping lookup and TCP connect entirely
+    /// outside the condition callback, bounded from the first `CF_DEFER`.
+    async fn preconnect_attempt<C: MappingClient + 'static>(
+        client: Arc<C>,
+        slot: Arc<AttemptSlot>,
+    ) -> Result<PreparedSocket, ProxyError> {
+        let remaining = conditional_preconnect_budget(slot.attempt.deferred_at)?;
+        let work = async {
+            let mapping = client.get_mapping(&slot.attempt.id.tuple).await?;
+            validate_tcp_mapping(&slot.attempt.id.tuple, &mapping)?;
+            let outbound = TcpStream::connect(mapping.address).await?;
+            let outbound = outbound.into_std()?;
+            outbound.set_nonblocking(true)?;
+            Ok(PreparedSocket {
+                // SAFETY: `into_raw_socket` transfers sole ownership from the
+                // standard stream to the RAII socket wrapper.
+                socket: OwnedSocket::new(outbound.into_raw_socket() as Socket),
+                destination: mapping.address,
+            })
+        };
+        tokio::select! {
+            result = time::timeout(remaining, work) => {
+                result
+                    .map_err(|_| ProxyError::Control("conditional preconnect timed out".into()))?
+            }
+            _ = wait_for_attempt_cancellation(slot.clone()) => Err(ProxyError::Control(
+                "conditional preconnect cancelled".into(),
+            )),
+        }
+    }
+
+    /// Polls an atomic state rather than blocking the dedicated worker while
+    /// shutdown changes the request lifecycle.
+    async fn wait_for_attempt_cancellation(slot: Arc<AttemptSlot>) {
+        while slot.attempt.state() == ConditionalAttemptState::Deferred {
+            time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// Publishes only a current deferred worker completion into its slot.
+    fn apply_worker_result(context: &ConditionalContext, result: WorkerResult) {
+        let (slot, result) = match result {
+            WorkerResult::Ready { slot, prepared } => (slot, Ok(prepared)),
+            WorkerResult::Rejected { slot, error } => (slot, Err(error)),
+        };
+        let attempts = context
+            .attempts
+            .lock()
+            .expect("conditional attempts poisoned");
+        let current = attempts.get(&slot.attempt.id.tuple);
+        if !current.is_some_and(|current| {
+            current.attempt.id.generation == slot.attempt.id.generation
+                && Arc::ptr_eq(current, &slot)
+        }) || slot.attempt.state() != ConditionalAttemptState::Deferred
+        {
+            return;
+        }
+        match result {
+            Ok(prepared) => {
+                *slot
+                    .prepared
+                    .lock()
+                    .expect("conditional prepared socket poisoned") = Some(prepared);
+                if !mark_attempt_ready(&slot.attempt) {
+                    let _ = slot
+                        .prepared
+                        .lock()
+                        .expect("conditional prepared socket poisoned")
+                        .take();
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    protocol = "tcp",
+                    synthetic_source = %slot.attempt.id.tuple.source,
+                    synthetic_destination = %slot.attempt.id.tuple.destination,
+                    error = %error,
+                    "conditional TCP mapping lookup or preconnect failed"
+                );
+                slot.attempt
+                    .state
+                    .store(ConditionalAttemptState::Rejected as u8, Ordering::Release);
+            }
+        }
+    }
+
+    /// Removes a claimed slot and extracts its paired raw socket owners.
+    fn take_handoff(
+        context: &ConditionalContext,
+        generation: u64,
+        client: OwnedSocket,
+    ) -> Option<SocketHandoff> {
+        let slot = {
+            let attempts = context
+                .attempts
+                .lock()
+                .expect("conditional attempts poisoned");
+            attempts
+                .values()
+                .find(|slot| slot.attempt.id.generation == generation)
+                .cloned()
+        }?;
+        if slot.attempt.state() != ConditionalAttemptState::Claimed {
+            return None;
+        }
+        let outbound = slot
+            .prepared
+            .lock()
+            .expect("conditional prepared socket poisoned")
+            .take()?;
+        let tuple = slot.attempt.id.tuple.clone();
+        context.remove_and_release(&tuple, generation);
+        Some(SocketHandoff {
+            client,
+            outbound,
+            tuple,
+        })
+    }
+
+    /// Drives nonblocking `WSAAccept` on its own native thread. The event
+    /// wakes it promptly for worker completions and shutdown; the bounded
+    /// polling interval also services incoming connection attempts.
+    fn run_coordinator(
+        socket: OwnedSocket,
+        context: Arc<ConditionalContext>,
+        result_receiver: Receiver<WorkerResult>,
+        handoff_sender: tokio_mpsc::Sender<SocketHandoff>,
+    ) {
+        while context.accepting.load(Ordering::Acquire) {
+            while let Ok(result) = result_receiver.try_recv() {
+                apply_worker_result(&context, result);
+            }
+            context.accepted_generation.store(0, Ordering::Release);
+            // SAFETY: `socket` remains owned by this thread; the callback
+            // pointer targets the context Arc retained for the entire loop.
+            let accepted = unsafe {
+                WSAAccept(
+                    socket.raw(),
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    Some(condition_callback),
+                    Arc::as_ptr(&context) as usize,
+                )
+            };
+            if accepted != INVALID_SOCKET {
+                let client = OwnedSocket::new(accepted);
+                let generation = context.accepted_generation.load(Ordering::Acquire);
+                if generation == 0 {
+                    tracing::error!("WSAAccept returned a socket without a conditional request");
+                } else if let Some(handoff) = take_handoff(&context, generation, client) {
+                    if let Err(error) = set_nonblocking(handoff.client.raw()) {
+                        tracing::warn!(%error, "conditional accepted socket setup failed");
+                        context.release_handoff();
+                    } else {
+                        match handoff_sender.try_send(handoff) {
+                            Ok(()) => {}
+                            Err(tokio_mpsc::error::TrySendError::Full(handoff)) => {
+                                drop(handoff);
+                                context.release_handoff();
+                                tracing::warn!("conditional TCP handoff capacity exhausted");
+                            }
+                            Err(tokio_mpsc::error::TrySendError::Closed(handoff)) => {
+                                drop(handoff);
+                                context.release_handoff();
+                                break;
+                            }
+                        }
+                    }
+                } else {
+                    context.release_handoff();
+                    tracing::error!(
+                        generation,
+                        "conditional accepted socket had no matching outbound socket"
+                    );
+                }
+            } else {
+                // A deferred or rejected conditional request normally makes
+                // WSAAccept fail with one of these transient values.
+                let error = unsafe { WSAGetLastError() };
+                if error != WSAEWOULDBLOCK && error != WSATRY_AGAIN {
+                    tracing::debug!(error, "WSAAccept did not return a client socket");
+                }
+            }
+            // SAFETY: the manual-reset event belongs to the still-live
+            // context. Resetting after each bounded wait is safe because the
+            // next iteration also polls both queues.
+            unsafe {
+                let result = WaitForSingleObject(context.wake_event, 10);
+                if result != WAIT_TIMEOUT {
+                    let _ = ResetEvent(context.wake_event);
+                }
+            }
+        }
+        context.stop_and_reject_pending();
+    }
+
+    /// Receives native handoffs, converts each pair atomically into Tokio
+    /// streams, and joins all bridge tasks before returning to `run_bound`.
+    pub(super) async fn run_tcp_conditional<C: MappingClient + 'static>(
+        listener: ConditionalListener,
+        client: Arc<C>,
+        mut shutdown: watch::Receiver<bool>,
+    ) {
+        let ConditionalListener {
+            socket,
+            context,
+            request_receiver,
+            ..
+        } = listener;
+        let (worker_result_sender, worker_result_receiver) = mpsc::channel();
+        let worker = spawn_preconnect_worker(
+            client,
+            context.clone(),
+            request_receiver,
+            worker_result_sender,
+        );
+        let (handoff_sender, mut handoff_receiver) = tokio_mpsc::channel(context.admissions.limit);
+        let coordinator_context = context.clone();
+        let coordinator = thread::spawn(move || {
+            run_coordinator(
+                socket,
+                coordinator_context,
+                worker_result_receiver,
+                handoff_sender,
+            )
+        });
+        let coordinator = tokio::task::spawn_blocking(move || coordinator.join());
+        let worker = tokio::task::spawn_blocking(move || worker.join());
+        let mut sessions = JoinSet::new();
+        loop {
+            tokio::select! {
+                _ = shutdown.changed() => break,
+                handoff = handoff_receiver.recv() => {
+                    let Some(handoff) = handoff else {
+                        break;
+                    };
+                    context.release_handoff();
+                    match handoff.into_tokio() {
+                        Ok((accepted, outbound, tuple, destination)) => {
+                            sessions.spawn(async move {
+                                if let Err(error) = bridge_tcp_streams(
+                                    accepted,
+                                    outbound,
+                                    tuple,
+                                    destination,
+                                ).await {
+                                    tracing::warn!(%error, "conditional TCP forwarding session failed");
+                                }
+                            });
+                        }
+                        Err(error) => tracing::warn!(%error, "conditional TCP socket handoff failed"),
+                    }
+                }
+                Some(_) = sessions.join_next(), if !sessions.is_empty() => {}
+            }
+        }
+        context.stop_and_reject_pending();
+        sessions.abort_all();
+        while sessions.join_next().await.is_some() {}
+        if let Err(error) = coordinator.await {
+            tracing::error!(%error, "conditional coordinator join failed");
+        }
+        if let Err(error) = worker.await {
+            tracing::error!(%error, "conditional preconnect worker join failed");
+        }
+    }
+
+    impl SocketHandoff {
+        /// Converts the raw pair into Tokio streams before bridge publication.
+        fn into_tokio(self) -> Result<(TcpStream, TcpStream, Tuple, SocketAddr), ProxyError> {
+            let tuple = self.tuple;
+            let destination = self.outbound.destination;
+            // SAFETY: each OwnedSocket transfers sole ownership exactly once
+            // into its corresponding standard stream; failures drop both
+            // streams before a bridge can be published.
+            let accepted =
+                unsafe { StdTcpStream::from_raw_socket(self.client.into_raw() as RawSocket) };
+            // SAFETY: see the ownership explanation above for the paired
+            // preconnected outbound socket.
+            let outbound = unsafe {
+                StdTcpStream::from_raw_socket(self.outbound.socket.into_raw() as RawSocket)
+            };
+            accepted.set_nonblocking(true)?;
+            outbound.set_nonblocking(true)?;
+            Ok((
+                TcpStream::from_std(accepted)?,
+                TcpStream::from_std(outbound)?,
+                tuple,
+                destination,
+            ))
+        }
+    }
+
+    /// The condition callback only performs address decoding, bounded atomic
+    /// admission, a nonblocking queue operation, and event signalling. It
+    /// deliberately performs no Winsock, RPC, blocking, or re-entrant work.
+    unsafe extern "system" fn condition_callback(
+        caller_id: *mut WsaBuf,
+        _caller_data: *mut WsaBuf,
+        _caller_qos: *mut c_void,
+        _callee_qos: *mut c_void,
+        callee_id: *mut WsaBuf,
+        _callee_data: *mut WsaBuf,
+        _group: *mut u32,
+        callback_data: usize,
+    ) -> c_int {
+        // SAFETY: WSAAccept supplies the same pointer passed as callback data;
+        // the coordinator retains an Arc for all possible callback invocations.
+        let context = unsafe { &*(callback_data as *const ConditionalContext) };
+        let Some(source) = (unsafe { socket_addr_from_wsa_buf(caller_id) }) else {
+            return CF_REJECT;
+        };
+        let Some(destination) = (unsafe { socket_addr_from_wsa_buf(callee_id) }) else {
+            return CF_REJECT;
+        };
+        if source.is_ipv4() != destination.is_ipv4() {
+            return CF_REJECT;
+        }
+        let tuple = Tuple {
+            source,
+            destination,
+            protocol: TCP_PROTOCOL,
+        };
+        // `try_lock` is essential here: a contended coordinator table is a
+        // resource failure, not a reason for callback blocking.
+        let Ok(mut attempts) = context.attempts.try_lock() else {
+            return CF_REJECT;
+        };
+        if let Some(slot) = attempts.get(&tuple).cloned() {
+            match slot.attempt.state() {
+                ConditionalAttemptState::Deferred if context.accepting.load(Ordering::Acquire) => {
+                    return CF_DEFER;
+                }
+                ConditionalAttemptState::Ready => {
+                    if !context.reserve_handoff() {
+                        return CF_REJECT;
+                    }
+                    if claim_ready_attempt(&slot.attempt) {
+                        context
+                            .accepted_generation
+                            .store(slot.attempt.id.generation, Ordering::Release);
+                        return CF_ACCEPT;
+                    }
+                    context.release_handoff();
+                    return CF_REJECT;
+                }
+                ConditionalAttemptState::Claimed => return CF_REJECT,
+                ConditionalAttemptState::Deferred
+                | ConditionalAttemptState::Rejected
+                | ConditionalAttemptState::Cancelled => {
+                    let removed = attempts
+                        .remove(&tuple)
+                        .expect("existing conditional attempt");
+                    context.admissions.release(&removed.attempt);
+                    return CF_REJECT;
+                }
+            }
+        }
+        if !context.accepting.load(Ordering::Acquire) {
+            return CF_REJECT;
+        }
+        let Some(attempt) = context.admissions.reserve(tuple.clone()) else {
+            return CF_REJECT;
+        };
+        let slot = Arc::new(AttemptSlot::new(attempt.clone()));
+        // `try_send` is bounded and nonblocking. The slot is installed before
+        // the worker can produce a result, because this callback still owns the
+        // table lock and the coordinator consumes results on a different loop.
+        if context.request_sender.try_send(slot.clone()).is_err() {
+            context.admissions.release(&attempt);
+            return CF_REJECT;
+        }
+        attempts.insert(tuple, slot);
+        drop(attempts);
+        context.wake();
+        CF_DEFER
+    }
+
+    /// Decodes the callback's sockaddr bytes without invoking Winsock.
+    unsafe fn socket_addr_from_wsa_buf(buffer: *mut WsaBuf) -> Option<SocketAddr> {
+        if buffer.is_null() || unsafe { (*buffer).buf.is_null() } {
+            return None;
+        }
+        let buffer = unsafe { &*buffer };
+        let bytes =
+            unsafe { std::slice::from_raw_parts(buffer.buf.cast::<u8>(), buffer.len as usize) };
+        if bytes.len() < 2 {
+            return None;
+        }
+        let family = u16::from_ne_bytes([bytes[0], bytes[1]]);
+        let port = bytes
+            .get(2..4)
+            .map(|bytes| u16::from_be_bytes([bytes[0], bytes[1]]))?;
+        match family {
+            2 if bytes.len() >= 16 => Some(SocketAddr::from((
+                std::net::Ipv4Addr::new(bytes[4], bytes[5], bytes[6], bytes[7]),
+                port,
+            ))),
+            23 if bytes.len() >= 28 => {
+                let address = std::net::Ipv6Addr::from(<[u8; 16]>::try_from(&bytes[8..24]).ok()?);
+                let scope_id = u32::from_ne_bytes(bytes[24..28].try_into().ok()?);
+                Some(SocketAddr::V6(SocketAddrV6::new(
+                    address, port, 0, scope_id,
+                )))
+            }
+            _ => None,
+        }
+    }
+
+    /// Sets nonblocking mode before Tokio takes ownership of a raw socket.
+    fn set_nonblocking(socket: Socket) -> Result<(), ProxyError> {
+        let mut enabled: c_ulong = 1;
+        // SAFETY: socket ownership remains with the caller and `enabled`
+        // points to writable storage for this synchronous ioctl.
+        if unsafe { ioctlsocket(socket, FIONBIO, &mut enabled) } != 0 {
+            return Err(last_socket_error("set accepted socket nonblocking"));
+        }
+        Ok(())
+    }
+
+    /// Converts the calling thread's Winsock error into a typed proxy error.
+    fn last_socket_error(operation: &str) -> ProxyError {
+        // SAFETY: this is called immediately after a Winsock operation on the
+        // same thread, before another Winsock call can overwrite its status.
+        let error = unsafe { WSAGetLastError() };
+        ProxyError::Io(io::Error::new(
+            io::Error::from_raw_os_error(error).kind(),
+            format!("{operation}: {}", io::Error::from_raw_os_error(error)),
+        ))
     }
 }
 
@@ -1888,6 +3026,7 @@ mod tests {
     fn configuration_rejects_missing_credentials_and_zero_timeout() {
         let config = ProxyConfig {
             listen: "127.0.0.1:0".parse().unwrap(),
+            listen_backlog: 1024,
             control_endpoint: "https://127.0.0.1:50051".into(),
             psk_identity: String::new(),
             psk_secret: Vec::new(),
@@ -1904,6 +3043,7 @@ mod tests {
     fn configuration_rejects_wildcard_listen_address() {
         let config = ProxyConfig {
             listen: "0.0.0.0:15000".parse().unwrap(),
+            listen_backlog: 1024,
             control_endpoint: "https://127.0.0.1:50051".into(),
             psk_identity: "identity".into(),
             psk_secret: vec![1],
@@ -1924,6 +3064,7 @@ mod tests {
     fn configuration_rejects_timeout_that_overflows_nanoseconds() {
         let config = ProxyConfig {
             listen: "127.0.0.1:15000".parse().unwrap(),
+            listen_backlog: 1024,
             control_endpoint: "https://127.0.0.1:50051".into(),
             psk_identity: "identity".into(),
             psk_secret: vec![1],
@@ -1937,6 +3078,137 @@ mod tests {
             config.validate(),
             Err(ProxyError::InvalidConfiguration(message)) if message.contains("too large")
         ));
+    }
+
+    #[test]
+    fn configuration_rejects_invalid_listen_backlog() {
+        let mut config = ProxyConfig {
+            listen: "127.0.0.1:15000".parse().unwrap(),
+            listen_backlog: 0,
+            control_endpoint: "https://127.0.0.1:50051".into(),
+            psk_identity: "identity".into(),
+            psk_secret: vec![1],
+            udp_idle_timeout: Duration::from_secs(5),
+            cleanup_interval: Duration::from_secs(5),
+            idle_ttl: Duration::from_secs(60),
+            tcp_terminal_grace: Duration::from_secs(30),
+            flow_scan_batch: 256,
+        };
+        assert!(matches!(
+            config.validate(),
+            Err(ProxyError::InvalidConfiguration(message)) if message.contains("listen backlog")
+        ));
+        config.listen_backlog = i32::MAX as u32 + 1;
+        assert!(matches!(
+            config.validate(),
+            Err(ProxyError::InvalidConfiguration(message)) if message.contains("listen backlog")
+        ));
+    }
+
+    #[test]
+    fn conditional_admission_releases_exactly_once_and_generates_new_identity() {
+        let admissions = ConditionalAdmissions::new(1);
+        let tuple = Tuple {
+            source: "127.0.0.1:42010".parse().unwrap(),
+            destination: "127.0.0.1:15000".parse().unwrap(),
+            protocol: TCP_PROTOCOL,
+        };
+        let first = admissions.reserve(tuple.clone()).unwrap();
+        assert!(admissions.reserve(tuple.clone()).is_none());
+        admissions.release(&first);
+        admissions.release(&first);
+        assert_eq!(admissions.pending(), 0);
+
+        let replacement = admissions.reserve(tuple).unwrap();
+        assert!(replacement.id.generation > first.id.generation);
+        assert_ne!(replacement.id, first.id);
+    }
+
+    #[test]
+    fn conditional_stale_generation_cannot_claim_replacement_handoff() {
+        let admissions = ConditionalAdmissions::new(1);
+        let tuple = Tuple {
+            source: "127.0.0.1:42011".parse().unwrap(),
+            destination: "127.0.0.1:15000".parse().unwrap(),
+            protocol: TCP_PROTOCOL,
+        };
+        let stale = admissions.reserve(tuple.clone()).unwrap();
+        admissions.release(&stale);
+        let current = admissions.reserve(tuple).unwrap();
+
+        assert!(mark_attempt_ready(&current));
+        assert!(claim_ready_attempt(&current));
+        assert_ne!(stale.id.generation, current.id.generation);
+        assert_eq!(current.state(), ConditionalAttemptState::Claimed);
+        assert_eq!(stale.state(), ConditionalAttemptState::Deferred);
+    }
+
+    #[test]
+    fn conditional_socket_handoff_requires_ready_then_single_claim() {
+        let admissions = ConditionalAdmissions::new(1);
+        let attempt = admissions
+            .reserve(Tuple {
+                source: "127.0.0.1:42013".parse().unwrap(),
+                destination: "127.0.0.1:15000".parse().unwrap(),
+                protocol: TCP_PROTOCOL,
+            })
+            .unwrap();
+        assert!(!claim_ready_attempt(&attempt));
+        assert!(mark_attempt_ready(&attempt));
+        assert!(claim_ready_attempt(&attempt));
+        assert!(!claim_ready_attempt(&attempt));
+        assert_eq!(attempt.state(), ConditionalAttemptState::Claimed);
+    }
+
+    #[test]
+    fn conditional_timeout_and_cancellation_prevent_handoff() {
+        let admissions = ConditionalAdmissions::new(1);
+        let attempt = admissions
+            .reserve(Tuple {
+                source: "127.0.0.1:42012".parse().unwrap(),
+                destination: "127.0.0.1:15000".parse().unwrap(),
+                protocol: TCP_PROTOCOL,
+            })
+            .unwrap();
+        attempt
+            .state
+            .store(ConditionalAttemptState::Cancelled as u8, Ordering::Release);
+        assert!(!mark_attempt_ready(&attempt));
+        assert!(!claim_ready_attempt(&attempt));
+        assert_eq!(attempt.state(), ConditionalAttemptState::Cancelled);
+        assert!(conditional_preconnect_budget(
+            std::time::Instant::now() - CONTROL_RPC_TIMEOUT - Duration::from_millis(1)
+        )
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn port_zero_udp_bind_uses_the_actual_tcp_listener_address() {
+        let config = ProxyConfig {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            listen_backlog: 1,
+            control_endpoint: "https://127.0.0.1:50051".into(),
+            psk_identity: "identity".into(),
+            psk_secret: vec![1],
+            udp_idle_timeout: Duration::from_secs(5),
+            cleanup_interval: Duration::from_secs(5),
+            idle_ttl: Duration::from_secs(60),
+            tcp_terminal_grace: Duration::from_secs(30),
+            flow_scan_batch: 1,
+        };
+        let proxy = Proxy::new(
+            config,
+            Arc::new(MockClient {
+                destination: "127.0.0.1:9".parse().unwrap(),
+                protocol: TCP_PROTOCOL,
+            }),
+        )
+        .unwrap();
+        let (tcp, udp) = proxy.bind().await.unwrap();
+        let tcp_address = tcp.local_addr().unwrap();
+        let udp_address = udp.local_addr().unwrap();
+        assert_ne!(tcp_address.port(), 0);
+        assert_eq!(udp_address, tcp_address);
     }
 
     #[tokio::test]
@@ -1979,6 +3251,66 @@ mod tests {
         drop(client);
         accepted.await.unwrap();
         server.await.unwrap();
+    }
+
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn conditional_accept_reuses_the_worker_preconnected_socket() {
+        let destination_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let destination = destination_listener.local_addr().unwrap();
+        let destination_task = tokio::spawn(async move {
+            let (mut stream, _) = destination_listener.accept().await.unwrap();
+            let mut buffer = [0_u8; 4];
+            tokio::io::AsyncReadExt::read_exact(&mut stream, &mut buffer)
+                .await
+                .unwrap();
+            tokio::io::AsyncWriteExt::write_all(&mut stream, &buffer)
+                .await
+                .unwrap();
+        });
+        let proxy = Proxy::new(
+            ProxyConfig {
+                listen: "127.0.0.1:0".parse().unwrap(),
+                listen_backlog: 4,
+                control_endpoint: "https://127.0.0.1:50051".into(),
+                psk_identity: "identity".into(),
+                psk_secret: vec![1],
+                udp_idle_timeout: Duration::from_secs(5),
+                cleanup_interval: Duration::from_secs(5),
+                idle_ttl: Duration::from_secs(60),
+                tcp_terminal_grace: Duration::from_secs(30),
+                flow_scan_batch: 1,
+            },
+            Arc::new(MockClient {
+                destination,
+                protocol: TCP_PROTOCOL,
+            }),
+        )
+        .unwrap();
+        let (tcp_listener, udp_socket) = proxy.bind().await.unwrap();
+        let proxy_address = tcp_listener.local_addr().unwrap();
+        let (shutdown_sender, shutdown) = watch::channel(false);
+        let proxy_task = tokio::spawn(proxy.run_bound(tcp_listener, udp_socket, shutdown));
+        let mut client = TcpStream::connect(proxy_address).await.unwrap();
+        tokio::io::AsyncWriteExt::write_all(&mut client, b"ping")
+            .await
+            .unwrap();
+        let mut response = [0_u8; 4];
+        time::timeout(
+            Duration::from_secs(2),
+            tokio::io::AsyncReadExt::read_exact(&mut client, &mut response),
+        )
+        .await
+        .expect("conditional accept bridge timed out")
+        .unwrap();
+        assert_eq!(&response, b"ping");
+        shutdown_sender.send(true).unwrap();
+        time::timeout(Duration::from_secs(2), proxy_task)
+            .await
+            .expect("conditional accept proxy did not shut down")
+            .unwrap()
+            .unwrap();
+        destination_task.await.unwrap();
     }
 
     #[tokio::test]

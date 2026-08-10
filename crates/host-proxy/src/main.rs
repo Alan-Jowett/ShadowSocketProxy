@@ -15,6 +15,9 @@ struct Args {
     #[arg(long, default_value = "127.0.0.1:15000")]
     /// Specific local TCP/UDP listener address.
     listen: SocketAddr,
+    #[arg(long, default_value_t = 1024)]
+    /// Native TCP listen backlog and Windows conditional pending-attempt limit.
+    listen_backlog: u32,
     #[arg(long, default_value = "https://127.0.0.1:50051")]
     /// TLS-PSK control-service endpoint.
     control_endpoint: String,
@@ -75,6 +78,7 @@ async fn main() {
     };
     let config = ProxyConfig {
         listen: args.listen,
+        listen_backlog: args.listen_backlog,
         control_endpoint: args.control_endpoint.clone(),
         psk_identity: args.psk_identity.clone(),
         psk_secret: secret.clone(),

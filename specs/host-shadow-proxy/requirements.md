@@ -89,6 +89,45 @@
   expire according to the configured idle timeout.
 - **Traceability:** `Unbounded, relying on OS/resource errors`.
 
+### CHG-016 — Windows conditional TCP admission
+
+- **Before:** Tokio accepts TCP connections before the proxy has validated the
+  mapping or established the outbound connection.
+- **After:** On Windows only, the TCP listener enables
+  `SO_CONDITIONAL_ACCEPT` and uses `WSAAccept`. Its condition callback returns
+  `CF_DEFER` after a bounded, nonblocking pending-attempt reservation and
+  request enqueue. A dedicated coordinator accepts only after a separate
+  preconnect worker has completed exact mapping validation and outbound TCP
+  connection. Lookup, validation, connect, timeout, cancellation, or resource
+  failure returns `CF_REJECT`.
+- **Traceability:** `USER-REQUEST: approved and audited conditional-accept
+  design`.
+
+### CHG-017 — Conditional attempt identity and backlog policy
+
+- **Before:** TCP forwarding has no per-attempt generation or explicit native
+  backlog setting.
+- **After:** `listen_backlog` defaults to 1024, is passed to the Windows
+  native `listen` call, and limits application pending conditional attempts.
+  A request is identified by the exact caller/local tuple plus a monotonically
+  increasing generation. Repeated deferred callbacks reuse that state; stale
+  worker results are ignored and close any untransferred socket.
+- **Traceability:** `USER-REQUEST: request identity ... generation token` and
+  `listen_backlog default 1024`.
+
+### CHG-018 — Conditional listener lifecycle and bind ordering
+
+- **Before:** TCP and UDP listener lifecycle does not account for native
+  conditional callback state or preconnected socket transfer.
+- **After:** The TCP listener binds first; UDP binds the selected TCP address,
+  including port zero and the explicit address family. The callback context
+  outlives every callback and is reclaimed only after the coordinator stops.
+  Shutdown stops admission, wakes and joins native coordinator/worker threads,
+  rejects pending attempts, closes untransferred sockets, and joins forwarding
+  tasks before BPF detach.
+- **Traceability:** `USER-REQUEST: callback context ... shutdown ... TCP
+  native listener binds first`.
+
 ## Stable Requirements
 
 ### REQ-009 — Windows host proxy executable
@@ -131,16 +170,29 @@ forwarding.
 
 ### REQ-011 — TCP forwarding
 
-For TCP, after a successful mapping lookup, the proxy MUST connect to the
-mapped original destination and copy bytes in both directions. It MUST
-preserve half-close semantics and MUST close the peer when the session ends
-due to EOF or fatal I/O failure.
+For TCP, non-Windows behavior remains the existing asynchronous
+accept/lookup/connect/bridge flow. On Windows, the proxy MUST use
+`SO_CONDITIONAL_ACCEPT`/`WSAAccept` so that the condition callback defers a
+new exact caller/local tuple, and it MUST accept only after a separate worker
+validates its mapping and connects to the mapped original destination. The
+five-second control-operation budget starts at the first `CF_DEFER`. The
+accepted socket and its matching preconnected outbound socket MUST transfer as
+one handoff; the bridge MUST not connect again. Both paths MUST copy bytes in
+both directions, preserve half-close semantics, and close peers when the
+session ends due to EOF or fatal I/O failure.
 
 **Acceptance criteria**
 
 - Client-to-original and original-to-client payloads are forwarded without
   unintended transformation.
 - Outbound connect failure closes the accepted side and is observable.
+- On Windows, lookup, validation, connect, timeout, cancellation, and
+  admission/resource failures return `CF_REJECT`; only a validated,
+  preconnected socket can produce `CF_ACCEPT`.
+- The condition callback performs no Winsock, blocking, RPC, or re-entrant
+  operation.
+- Repeated deferred callbacks reuse the same tuple/generation state; a stale
+  worker completion never publishes a socket.
 - EOF in one direction shuts down that direction while allowing the other
   direction to finish.
 - Session completion closes both sockets and releases resources.
@@ -189,10 +241,13 @@ insecure operation.
 
 ### REQ-014 — CLI configuration and platform support
 
-The proxy MUST expose CLI configuration for listen endpoint, control
-endpoint, PSK identity, PSK secret source, UDP idle timeout, and operational
-settings. It MUST support Windows IPv4/IPv6 operation and document required
-build/runtime dependencies.
+The proxy MUST expose CLI configuration for listen endpoint, `listen_backlog`,
+control endpoint, PSK identity, PSK secret source, UDP idle timeout, and
+operational settings. `listen_backlog` defaults to 1024, is passed to Windows
+native `listen`, and caps application pending conditional attempts. It is not
+a guarantee of the Windows conditional backlog because
+`SO_CONDITIONAL_ACCEPT` changes backlog semantics. The proxy MUST support
+Windows IPv4/IPv6 operation and document required build/runtime dependencies.
 
 **Acceptance criteria**
 
@@ -200,6 +255,9 @@ build/runtime dependencies.
 - A shared port is documented for the configured IPv4 and/or IPv6 listener
   sockets.
 - Explicit-family and wildcard/dual-stack binding failures are reported.
+- Port zero binds UDP to the exact selected TCP address and port; explicit
+  IPv4/IPv6 family selection is retained.
+- Invalid zero or out-of-range `listen_backlog` fails before readiness.
 - Windows startup and shutdown behavior is deterministic.
 - Linux-only control-service/BPF behavior remains unaffected.
 
@@ -209,8 +267,10 @@ misleading cross-platform readiness.
 ### REQ-015 — Resource and shutdown behavior
 
 The proxy MUST rely on OS/resource errors rather than introduce
-application-level TCP or UDP-flow caps. It MUST cancel active tasks and close
-listener/flow resources during shutdown.
+application-level accepted-TCP or UDP-flow caps. `listen_backlog` is the
+approved bounded admission limit for not-yet-accepted Windows conditional
+attempts. It MUST cancel active tasks and close listener/flow resources during
+shutdown.
 
 **Acceptance criteria**
 
@@ -218,6 +278,9 @@ listener/flow resources during shutdown.
   forwarding.
 - TCP sessions and UDP associations terminate on shutdown.
 - No task retains a socket after shutdown completes.
+- Shutdown stops conditional admission, rejects pending attempts, cancels
+  workers, closes untransferred outbound sockets, and joins native
+  coordinator/worker threads and bridge tasks before BPF detachment.
 - BPF detachment occurs only after the forwarding owner has joined TCP bridges
   and UDP relays.
 
@@ -230,5 +293,7 @@ selected resource policy.
 - Adding a new control-service RPC.
 - Binding the original source address for outbound TCP/UDP sockets.
 - Direct forwarding when mapping lookup fails.
-- Application-level TCP connection or UDP association caps.
+- Application-level accepted-TCP connection or UDP association caps (the
+  approved Windows pending-attempt `listen_backlog` limit is not an accepted
+  connection cap).
 - Implementing QUIC-specific state beyond UDP forwarding and idle activity.
