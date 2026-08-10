@@ -857,6 +857,7 @@ static __always_inline int process_packet(struct __sk_buff *skb, bool ingress)
     __u8 target[16];
     __u8 direction;
     __u32 scratch_key = 0;
+    __u32 generation;
 
     if (!parse_packet(skb, &packet))
         return TC_ACT_OK;
@@ -891,10 +892,13 @@ static __always_inline int process_packet(struct __sk_buff *skb, bool ingress)
         __builtin_memset(candidate, 0, sizeof(*candidate));
         candidate_index.version = bpf_htons(MAP_ABI_VERSION);
         candidate_index.flow_id = flow_id;
-        candidate_index.generation = 1;
+        generation = (__u32)bpf_ktime_get_ns();
+        if (generation == 0)
+            generation = 1;
+        candidate_index.generation = generation;
         state_key.version = bpf_htons(MAP_ABI_VERSION);
         state_key.flow_id = flow_id;
-        state_key.generation = 1;
+        state_key.generation = generation;
         candidate->original = lookup_key;
         candidate->target = lookup_key;
         candidate->reverse = lookup_key;
@@ -905,7 +909,7 @@ static __always_inline int process_packet(struct __sk_buff *skb, bool ingress)
         candidate->reverse.source_port = target_port;
         candidate->reverse.destination_port = packet.source_port;
         candidate->flow_id = flow_id;
-        candidate->generation = 1;
+        candidate->generation = generation;
         candidate->protocol_flags = packet.protocol == IPPROTO_TCP ? 1 : 2;
         candidate->lifecycle = FLOW_CREATING;
         candidate->last_used_ns = bpf_ktime_get_ns();

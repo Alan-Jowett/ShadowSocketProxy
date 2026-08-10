@@ -36,7 +36,7 @@ struct Args {
     #[arg(long, default_value_t = 60)]
     /// Seconds of UDP inactivity before an association is discarded.
     udp_idle_timeout_secs: u64,
-    #[arg(long, default_value_t = 5)]
+    #[arg(long, default_value_t = 10)]
     /// Seconds between host-owned flow maintenance passes.
     cleanup_interval_secs: u64,
     #[arg(long, default_value_t = 60)]

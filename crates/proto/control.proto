@@ -61,6 +61,8 @@ message Flow {
   uint32 tcp_state_flags = 7;
   uint32 protocol_flags = 8;
   uint64 observed_now_ns = 9;
+  uint32 fin_seen_mask = 10;
+  uint32 fin_ack_seen_mask = 11;
 }
 
 message EnumerateFlowsRequest {

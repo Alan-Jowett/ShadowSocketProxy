@@ -21,9 +21,24 @@ use crate::{
     mapping::{FlowState, Mapping, Tuple, RUNTIME_CONFIG_ABI_VERSION},
     proto::{self, control_server::Control},
 };
+use uuid::Uuid;
 
 /// Returns nanoseconds elapsed from a process-local monotonic origin.
 fn monotonic_now_ns() -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        let mut timestamp = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: `timestamp` is a valid writable timespec and the clock id is
+        // supported on Linux.
+        if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut timestamp) } == 0 {
+            return (timestamp.tv_sec as u64)
+                .saturating_mul(1_000_000_000)
+                .saturating_add(timestamp.tv_nsec as u64);
+        }
+    }
     static START: OnceLock<Instant> = OnceLock::new();
     START.get_or_init(Instant::now).elapsed().as_nanos() as u64
 }
@@ -39,6 +54,47 @@ pub struct ControlService {
     logs: Arc<LogRing>,
     /// Release/acquire readiness flag for health checks.
     ready: Arc<AtomicBool>,
+    /// Instance nonce used to reject continuation tokens from another service.
+    token_nonce: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+/// Opaque flow enumeration cursor.
+struct FlowCursor {
+    /// Service instance that issued the cursor.
+    nonce: u64,
+    /// Monotonic timestamp when the scan started.
+    issued_ns: u64,
+    /// Last returned flow identity.
+    flow_id: u64,
+    /// Last returned flow generation.
+    generation: u32,
+}
+
+impl FlowCursor {
+    /// Encodes the cursor without exposing its fields to clients.
+    fn encode(self) -> Vec<u8> {
+        let mut token = Vec::with_capacity(32);
+        token.extend_from_slice(&self.nonce.to_be_bytes());
+        token.extend_from_slice(&self.issued_ns.to_be_bytes());
+        token.extend_from_slice(&self.flow_id.to_be_bytes());
+        token.extend_from_slice(&self.generation.to_be_bytes());
+        token.extend_from_slice(&[0; 4]);
+        token
+    }
+
+    /// Decodes and validates the fixed-width cursor representation.
+    fn decode(bytes: &[u8]) -> Result<Self, Status> {
+        if bytes.len() != 32 {
+            return Err(Status::invalid_argument("invalid flow page token"));
+        }
+        Ok(Self {
+            nonce: u64::from_be_bytes(bytes[0..8].try_into().unwrap()),
+            issued_ns: u64::from_be_bytes(bytes[8..16].try_into().unwrap()),
+            flow_id: u64::from_be_bytes(bytes[16..24].try_into().unwrap()),
+            generation: u32::from_be_bytes(bytes[24..28].try_into().unwrap()),
+        })
+    }
 }
 
 impl ControlService {
@@ -49,6 +105,7 @@ impl ControlService {
             config,
             logs,
             ready: Arc::new(AtomicBool::new(false)),
+            token_nonce: Uuid::new_v4().as_u128() as u64,
         }
     }
 
@@ -168,6 +225,8 @@ fn flow_to_proto(flow: FlowState, observed_now_ns: u64) -> proto::Flow {
         tcp_state_flags: flow.tcp_state_flags,
         protocol_flags: flow.protocol_flags,
         observed_now_ns,
+        fin_seen_mask: flow.fin_seen_mask as u32,
+        fin_ack_seen_mask: flow.fin_ack_seen_mask as u32,
     }
 }
 
@@ -489,15 +548,20 @@ impl Control for ControlService {
         if limit > 10_000 {
             return Err(Status::resource_exhausted("flow page limit is too large"));
         }
-        let offset = if request.page_token.is_empty() {
-            0
-        } else if request.page_token.len() == 8 {
-            usize::try_from(u64::from_be_bytes(
-                request.page_token.as_slice().try_into().unwrap(),
-            ))
-            .map_err(|_| Status::invalid_argument("flow page token is out of range"))?
+        let cursor = if request.page_token.is_empty() {
+            None
         } else {
-            return Err(Status::invalid_argument("invalid flow page token"));
+            let cursor = FlowCursor::decode(&request.page_token)?;
+            let now_ns = monotonic_now_ns();
+            if cursor.nonce != self.token_nonce
+                || cursor.issued_ns > now_ns
+                || now_ns.saturating_sub(cursor.issued_ns) > 60_000_000_000
+            {
+                return Err(Status::failed_precondition(
+                    "flow page token expired or belongs to another service",
+                ));
+            }
+            Some(cursor)
         };
         let mut flows = self
             .backend
@@ -506,12 +570,26 @@ impl Control for ControlService {
             .map_err(Self::map_backend_error)?;
         let observed_now_ns = monotonic_now_ns();
         flows.sort_by_key(|flow| (flow.flow_id, flow.generation));
-        let mut result = Vec::with_capacity(limit);
-        for (index, flow) in flows.into_iter().enumerate().skip(offset) {
+        let mut result: Vec<proto::Flow> = Vec::with_capacity(limit);
+        for flow in flows {
+            if cursor.is_some_and(|cursor| {
+                (flow.flow_id, flow.generation) <= (cursor.flow_id, cursor.generation)
+            }) {
+                continue;
+            }
             if result.len() >= limit {
+                let last = result.last().expect("page is non-empty");
+                let last_flow_id = last.flow_id;
+                let last_generation = last.generation;
                 return Ok(Response::new(proto::EnumerateFlowsReply {
                     flows: result,
-                    next_page_token: (index as u64).to_be_bytes().to_vec(),
+                    next_page_token: FlowCursor {
+                        nonce: self.token_nonce,
+                        issued_ns: cursor.map_or(observed_now_ns, |cursor| cursor.issued_ns),
+                        flow_id: last_flow_id,
+                        generation: last_generation,
+                    }
+                    .encode(),
                 }));
             }
             result.push(flow_to_proto(flow, observed_now_ns));
@@ -675,7 +753,7 @@ mod tests {
     use crate::{
         bpf::InMemoryBackend,
         config::RuntimeConfig,
-        mapping::{MapMaxima, Mapping, PROTOCOL_FLAG_UDP, PROTOCOL_UDP},
+        mapping::{FlowLifecycle, FlowState, MapMaxima, Mapping, PROTOCOL_FLAG_UDP, PROTOCOL_UDP},
     };
 
     fn service() -> (Arc<InMemoryBackend>, ControlService) {
@@ -754,6 +832,79 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(missing.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn flow_rpc_uses_stable_cursor_and_generation_checked_delete() {
+        let (backend, service) = service();
+        let make_flow = |flow_id| {
+            let original = Tuple {
+                source: "192.0.2.10".parse().unwrap(),
+                destination: "198.51.100.10".parse().unwrap(),
+                protocol: PROTOCOL_UDP,
+                source_port: 5000,
+                destination_port: 443,
+            };
+            FlowState {
+                flow_id,
+                generation: 7,
+                original: original.clone(),
+                target: original.clone(),
+                reverse: original,
+                last_used_ns: 1,
+                protocol_flags: PROTOCOL_FLAG_UDP,
+                tcp_state_flags: 0,
+                fin_seen_mask: 0,
+                fin_ack_seen_mask: 0,
+                lifecycle: FlowLifecycle::Active,
+                terminal_deadline_ns: 0,
+            }
+        };
+        backend.insert_flow_state(make_flow(10));
+        backend.insert_flow_state(make_flow(20));
+
+        let first = service
+            .enumerate_flows(Request::new(proto::EnumerateFlowsRequest {
+                limit: 1,
+                page_token: Vec::new(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(first.flows.len(), 1);
+        let first_id = first.flows[0].flow_id;
+        let delete = service
+            .delete_flow(Request::new(proto::DeleteFlowRequest {
+                flow_id: first_id,
+                generation: 7,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            delete.outcome,
+            proto::delete_flow_reply::Outcome::Complete as i32
+        );
+
+        let second = service
+            .enumerate_flows(Request::new(proto::EnumerateFlowsRequest {
+                limit: 1,
+                page_token: first.next_page_token,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(second.flows.len(), 1);
+        assert_ne!(second.flows[0].flow_id, first_id);
+
+        let malformed = service
+            .enumerate_flows(Request::new(proto::EnumerateFlowsRequest {
+                limit: 1,
+                page_token: vec![1, 2, 3],
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(malformed.code(), tonic::Code::InvalidArgument);
     }
 
     #[tokio::test]

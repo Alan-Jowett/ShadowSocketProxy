@@ -32,9 +32,9 @@ OpenSSL tests require a build with PSK support.
 | TC-013 | REQ-004 | Decode unknown ABI version | Explicit ABI mismatch; entry is not interpreted |
 | TC-014 | REQ-004 | Decode malformed length/address/state | Explicit malformed-entry result and status/log counter |
 | TC-015 | REQ-004 | TCP state fixture covers SYN, SYN/ACK, ACK, FIN, RST | Each state is represented and survives map round-trip |
-| TC-019 | REQ-005 | Delete failure for one entry | Failure counted/logged; other candidates still processed |
-| TC-020 | REQ-005 | Scan exceeds batch size | Cycle stops at configured bound and next cycle can continue |
-| TC-021 | REQ-005 | Re-run cleanup after deletion | No duplicate success or inconsistent state |
+| TC-019 | REQ-005 | Retired control-service maintenance | No autonomous cleanup worker or maintenance policy remains in the service |
+| TC-020 | REQ-006 | Enumerate typed flows | Bounded opaque-cursor pages return identity, generation, tuples, timestamps, and TCP lifecycle masks |
+| TC-021 | REQ-006 | Generation-safe delete | Complete, absent, stale-generation, and partial outcomes preserve newer flow indexes |
 | TC-022 | REQ-006 | Valid TLS-PSK client | Authenticated RPC succeeds |
 | TC-023 | REQ-006 | Wrong PSK identity/secret | Request rejected; no service operation occurs |
 | TC-024 | REQ-006 | Plaintext or unauthenticated client | Connection/RPC rejected |

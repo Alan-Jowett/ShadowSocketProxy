@@ -1071,9 +1071,25 @@ impl LinuxTcAdapter for AyaLinuxTcAdapter {
         let mut partial = false;
         for key in index_keys {
             match Self::with_flow_index_map(&mut state.bpf, |map| {
-                map.remove(&key).map_err(Self::map_error)
+                let current = map.get(&key, 0).map(Some).or_else(|error| match error {
+                    aya::maps::MapError::KeyNotFound | aya::maps::MapError::ElementNotFound => {
+                        Ok(None)
+                    }
+                    error => Err(Self::map_error(error)),
+                })?;
+                let Some(current) = current else {
+                    return Ok(false);
+                };
+                let current = crate::mapping::decode_flow_index(&current)
+                    .map_err(|error| Self::operation("flow-index:decode", error))?;
+                if current != expected {
+                    return Ok(false);
+                }
+                map.remove(&key).map_err(Self::map_error)?;
+                Ok(true)
             }) {
-                Ok(()) => indexes_deleted += 1,
+                Ok(true) => indexes_deleted += 1,
+                Ok(false) => {}
                 Err(_) => partial = true,
             }
         }

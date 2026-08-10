@@ -1108,6 +1108,7 @@ dependencies = [
  "async-trait",
  "aya",
  "futures-util",
+ "libc",
  "openssl",
  "prost",
  "protoc-bin-vendored",

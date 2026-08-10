@@ -84,7 +84,7 @@ change or disappear between enumeration and response are reported using
 per-entry status metadata; a backend failure fails the RPC. The service never
 returns an original tuple for a different synthetic key.
 
-### D-005 — Runtime configuration
+### D-006 — Runtime configuration
 
 Configuration is held in an atomic `ArcSwap`-style snapshot with a monotonically
 increasing revision. Set-config validates all fields against bounds and
@@ -94,7 +94,18 @@ The configuration includes dataplane idle TTL, TCP terminal grace, active-flow
 capacity, listener/target settings, and bounded log capacity. Host maintenance
 interval, scan batch, and retry policy are not control-service configuration.
 
-### D-007 — gRPC API
+### D-007 — Host-owned flow lifecycle adapter
+
+The authenticated control API exposes typed `EnumerateFlows` and `DeleteFlow`
+operations for the host-proxy. Enumeration returns bounded, opaque-cursor
+pages containing flow identity, generation, tuples, timestamps, and
+directional TCP lifecycle masks. Deletion compares both identity and
+generation before removing canonical state or tuple indexes and reports
+complete, already-absent, stale-generation, or partial outcomes. The service
+does not decide when a flow is stale, retry partial cleanup, or maintain local
+UDP associations; those policies remain host-proxy responsibilities.
+
+### D-008 — gRPC API
 
 The protobuf contract includes:
 
@@ -102,6 +113,7 @@ The protobuf contract includes:
 - `Detach`: interface list or all service-owned attachments.
 - `ListMappings`: bounded mapping page and read metadata.
 - `GetMapping`: exact synthetic 5-tuple lookup.
+- `EnumerateFlows` / `DeleteFlow`: typed host-owned flow lifecycle primitives.
 - `GetStatus`: readiness, ABI, attachment, dataplane counters, and map maxima.
 - `GetConfig` / `SetConfig`: revisioned atomic configuration.
 - `PullLogs`: cursor, limit, records, next cursor, and cursor-expired error.
@@ -111,7 +123,7 @@ All RPCs use the same authenticated server policy. Resource exhaustion,
 invalid arguments, not-found, cursor-expired, ABI mismatch, backend failure,
 and unauthenticated requests map to distinct gRPC status codes.
 
-### D-008 — TLS-PSK transport
+### D-009 — TLS-PSK transport
 
 The endpoint is TCP gRPC over a TLS-PSK-capable transport adapter. The
 implementation MUST use a TLS stack that supports configured PSK identity and
@@ -127,7 +139,7 @@ only component permitted to depend on OpenSSL; builds without PSK support fail
 startup rather than falling back to metadata authentication, plaintext, or
 mTLS.
 
-### D-009 — Log synchronization
+### D-010 — Log synchronization
 
 The bounded log ring assigns a strictly increasing sequence to each record.
 `PullLogs(cursor, limit)` returns records with sequence greater than cursor.
@@ -135,7 +147,7 @@ If the cursor is older than the oldest retained sequence, the RPC returns
 `FAILED_PRECONDITION` with a cursor-expired detail. Capacity updates retain
 the newest records and invalidate cursors that no longer exist.
 
-### D-010 — Lifecycle and shutdown
+### D-011 — Lifecycle and shutdown
 
 Startup validates configuration, prepares the TLS endpoint, and initializes
 the BPF backend before reporting readiness. Shutdown stops accepting RPCs,
@@ -159,13 +171,13 @@ maintenance cancellation and flow cleanup.
 | Requirement | Design | Validation | Implementation surfaces |
 |---|---|---|---|
 | REQ-001 | D-001, D-002, D-003 | TC-001, TC-002 | crate, ABI module, backend trait |
-| REQ-002 | D-002, D-010 | TC-003–TC-006 | attach/detach RPC, TC backend |
+| REQ-002 | D-002, D-011 | TC-003–TC-006 | attach/detach RPC, TC backend |
 | REQ-003 | D-003, D-004, D-007 | TC-007–TC-011 | protobuf, mapping service |
 | REQ-004 | D-003 | TC-012–TC-015 | ABI codec, fixtures |
 | REQ-005 | Retired by issue #12 | Host-proxy maintenance validation | no control-service worker |
-| REQ-006 | D-007, D-008 | TC-022–TC-025 | TLS adapter, auth interceptor |
-| REQ-007 | D-006, D-007 | TC-026–TC-029 | config store/RPC |
-| REQ-008 | D-009 | TC-030–TC-033 | log ring/PullLogs |
+| REQ-006 | D-007, D-009 | TC-022–TC-025 | TLS adapter, auth interceptor |
+| REQ-007 | D-006, D-008 | TC-026–TC-029 | config store/RPC |
+| REQ-008 | D-010 | TC-030–TC-033 | log ring/PullLogs |
 
 ## 5. Explicit No-Impact Decisions
 

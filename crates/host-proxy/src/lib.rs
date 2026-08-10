@@ -92,6 +92,11 @@ pub struct FlowRecord {
     pub tcp_state_flags: u32,
     /// Control-service monotonic timestamp corresponding to `last_used_ns`.
     pub observed_now_ns: u64,
+    /// Directional FIN observations, bit zero for original-to-target and bit
+    /// one for target-to-original.
+    pub fin_seen_mask: u32,
+    /// Directional FIN acknowledgements using the same direction bits.
+    pub fin_ack_seen_mask: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -201,6 +206,7 @@ impl ProxyConfig {
             || self.idle_ttl.is_zero()
             || self.tcp_terminal_grace.is_zero()
             || self.flow_scan_batch == 0
+            || self.flow_scan_batch > 10_000
         {
             return Err(ProxyError::InvalidConfiguration(
                 "maintenance settings must be nonzero".into(),
@@ -221,7 +227,9 @@ async fn run_maintenance<C: MappingClient + FlowClient + 'static>(
     mut shutdown: watch::Receiver<bool>,
 ) {
     let mut interval = time::interval(cleanup_interval);
-    let mut retry_delay = cleanup_interval.min(Duration::from_millis(100));
+    let initial_retry_delay = cleanup_interval.min(Duration::from_millis(100));
+    let mut retry_delay = initial_retry_delay;
+    let mut pending_deletes = std::collections::HashMap::<(u64, u32), FlowRecord>::new();
     loop {
         tokio::select! {
             _ = shutdown.changed() => break,
@@ -241,42 +249,55 @@ async fn run_maintenance<C: MappingClient + FlowClient + 'static>(
                     for flow in flows {
                         let age = flow.observed_now_ns.saturating_sub(flow.last_used_ns);
                         let tcp = flow.original.protocol == TCP_PROTOCOL;
-                        let terminal = tcp && (flow.tcp_state_flags & (1 << 2)) != 0
-                            && (flow.tcp_state_flags & (1 << 3)) != 0;
+                        let terminal = tcp
+                            && flow.fin_seen_mask == 0b11
+                            && flow.fin_ack_seen_mask == 0b11;
                         let expired = flow.tcp_state_flags & (1 << 4) != 0
                             || (!terminal && age >= idle_ttl.as_nanos() as u64)
                             || (terminal && age >= tcp_terminal_grace.as_nanos() as u64);
                         if expired {
-                            match client.delete_flow(flow.flow_id, flow.generation).await {
-                                Ok(report) => {
-                                    if matches!(
-                                        report.outcome,
-                                        FlowDeleteOutcome::Complete
-                                            | FlowDeleteOutcome::AlreadyAbsent
-                                    ) && flow.original.protocol == UDP_PROTOCOL
-                                    {
-                                        associations.invalidate(&flow.synthetic).await;
-                                    }
-                                    tracing::info!(
-                                    flow_id = flow.flow_id,
-                                    generation = flow.generation,
-                                    outcome = ?report.outcome,
-                                    "host maintenance flow deletion"
-                                    );
-                                }
-                                Err(error) => tracing::warn!(
-                                    flow_id = flow.flow_id,
-                                    generation = flow.generation,
-                                    %error,
-                                    "host maintenance flow deletion failed"
-                                ),
-                            }
+                            pending_deletes.insert((flow.flow_id, flow.generation), flow);
                         }
                     }
                     if next.is_empty() {
                         break;
                     }
                     token = next;
+                }
+                let pending = pending_deletes.values().cloned().collect::<Vec<_>>();
+                for flow in pending {
+                    match client.delete_flow(flow.flow_id, flow.generation).await {
+                        Ok(report) => {
+                            if matches!(
+                                report.outcome,
+                                FlowDeleteOutcome::Complete
+                                    | FlowDeleteOutcome::AlreadyAbsent
+                                    | FlowDeleteOutcome::StaleGeneration
+                            ) {
+                                pending_deletes.remove(&(flow.flow_id, flow.generation));
+                                if flow.original.protocol == UDP_PROTOCOL
+                                    && !matches!(
+                                        report.outcome,
+                                        FlowDeleteOutcome::StaleGeneration
+                                    )
+                                {
+                                    associations.invalidate(&flow.synthetic).await;
+                                }
+                            }
+                            tracing::info!(
+                                flow_id = flow.flow_id,
+                                generation = flow.generation,
+                                outcome = ?report.outcome,
+                                "host maintenance flow deletion"
+                            );
+                        }
+                        Err(error) => tracing::warn!(
+                            flow_id = flow.flow_id,
+                            generation = flow.generation,
+                            %error,
+                            "host maintenance flow deletion failed"
+                        ),
+                    }
                 }
                 if scan_failed {
                     let delay = retry_delay;
@@ -288,7 +309,7 @@ async fn run_maintenance<C: MappingClient + FlowClient + 'static>(
                         _ = time::sleep(delay) => {}
                     }
                 } else {
-                    retry_delay = cleanup_interval;
+                    retry_delay = initial_retry_delay;
                 }
             }
         }
@@ -534,20 +555,15 @@ async fn bridge_tcp<C: MappingClient + 'static>(
     Ok(())
 }
 
-/// Receives datagrams, resolves/creates associations, relays replies, and
-/// periodically removes idle associations.
+/// Receives datagrams, resolves/creates associations, and relays replies.
 async fn run_udp<C: MappingClient + 'static>(
     associations: Arc<UdpAssociations<C>>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let mut buffer = vec![0_u8; 65_535];
-    let mut reap = time::interval(associations.idle_timeout);
     loop {
         tokio::select! {
             _ = shutdown.changed() => break,
-            _ = reap.tick() => {
-                associations.reap().await;
-            }
             received = associations.socket.recv_from(&mut buffer) => {
                 let (length, client_address) = match received {
                     Ok(value) => value,
@@ -814,52 +830,6 @@ impl<C: MappingClient + 'static> UdpAssociations<C> {
                 reason = "flow_deleted",
                 "UDP association invalidated"
             );
-        }
-    }
-
-    /// Removes associations idle longer than the configured timeout.
-    async fn reap(&self) {
-        let candidates = {
-            let entries = self.entries.lock().await;
-            entries
-                .iter()
-                .map(|(tuple, association)| (tuple.clone(), association.clone()))
-                .collect::<Vec<_>>()
-        };
-        let mut expired = Vec::new();
-        for (tuple, association) in candidates {
-            let age = association.last_seen.lock().await.elapsed();
-            if age >= self.idle_timeout {
-                expired.push((tuple, association, age));
-            }
-        }
-        if expired.is_empty() {
-            return;
-        }
-        let mut entries = self.entries.lock().await;
-        for (tuple, association, _) in expired {
-            let Some(current) = entries.get(&tuple).cloned() else {
-                continue;
-            };
-            if !Arc::ptr_eq(&current, &association) {
-                continue;
-            }
-            let idle_age = current.last_seen.lock().await.elapsed();
-            if idle_age >= self.idle_timeout {
-                let association_age = current.created_at.elapsed();
-                entries.remove(&tuple);
-                tracing::info!(
-                    protocol = "udp",
-                    synthetic_source = %tuple.source,
-                    synthetic_destination = %tuple.destination,
-                    original_destination = %current.destination,
-                    association_age_ms = association_age.as_millis() as u64,
-                    idle_age_ms = idle_age.as_millis() as u64,
-                    idle_timeout_ms = self.idle_timeout.as_millis() as u64,
-                    reason = "idle_timeout",
-                    "UDP association expired"
-                );
-            }
         }
     }
 }
@@ -1216,6 +1186,8 @@ mod windows_client {
                     protocol_flags: flow.protocol_flags,
                     tcp_state_flags: flow.tcp_state_flags,
                     observed_now_ns: flow.observed_now_ns,
+                    fin_seen_mask: flow.fin_seen_mask,
+                    fin_ack_seen_mask: flow.fin_ack_seen_mask,
                 });
             }
             Ok((flows, reply.next_page_token))
@@ -1458,10 +1430,7 @@ pub use windows_client::PublicTlsPskMappingClient as TlsPskMappingClient;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{
-        collections::{HashSet, VecDeque},
-        sync::Mutex as StdMutex,
-    };
+    use std::{collections::VecDeque, sync::Mutex as StdMutex};
     use tracing::{field::Visit, Event, Subscriber};
     use tracing_subscriber::{
         layer::{Context, Layer},
@@ -1472,18 +1441,15 @@ mod tests {
     #[derive(Clone, Default)]
     struct EventRecorder {
         reasons: Arc<StdMutex<Vec<String>>>,
-        field_sets: Arc<StdMutex<Vec<HashSet<String>>>>,
     }
 
     struct FieldVisitor {
-        fields: HashSet<String>,
         reasons: Vec<String>,
     }
 
     impl FieldVisitor {
         fn new() -> Self {
             Self {
-                fields: HashSet::new(),
                 reasons: Vec::new(),
             }
         }
@@ -1491,7 +1457,6 @@ mod tests {
 
     impl Visit for FieldVisitor {
         fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-            self.fields.insert(field.name().to_owned());
             if field.name() == "reason" {
                 self.reasons.push(format!("{value:?}"));
             }
@@ -1506,7 +1471,6 @@ mod tests {
             let mut visitor = FieldVisitor::new();
             event.record(&mut visitor);
             self.reasons.lock().unwrap().extend(visitor.reasons);
-            self.field_sets.lock().unwrap().push(visitor.fields);
         }
     }
 
@@ -1526,14 +1490,6 @@ mod tests {
                 .iter()
                 .filter(|value| value.contains(reason))
                 .count()
-        }
-
-        fn has_fields(&self, required: &[&str]) -> bool {
-            self.field_sets.lock().unwrap().iter().any(|fields| {
-                required
-                    .iter()
-                    .all(|required_field| fields.contains(*required_field))
-            })
         }
     }
 
@@ -1786,19 +1742,11 @@ mod tests {
             .unwrap()
             .clone();
         *association.last_seen.lock().await = std::time::Instant::now() - Duration::from_secs(10);
-        associations.reap().await;
         shutdown_sender.send(true).unwrap();
 
         assert_eq!(recorder.count_reason("association_created"), 1);
         assert_eq!(recorder.count_reason("association_replaced"), 0);
-        assert_eq!(recorder.count_reason("idle_timeout"), 1);
-        assert!(recorder.has_fields(&[
-            "protocol",
-            "synthetic_source",
-            "synthetic_destination",
-            "original_destination",
-            "association_age_ms",
-        ]));
+        assert_eq!(recorder.count_reason("idle_timeout"), 0);
     }
 
     #[test]
