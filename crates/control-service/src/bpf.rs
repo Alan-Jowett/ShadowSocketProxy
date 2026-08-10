@@ -1307,8 +1307,8 @@ impl LinuxTcAdapter for AyaLinuxTcAdapter {
                     }
                 }
             }
-            if state_deleted || flow.is_none() {
-                if Self::with_packet_inflight_map(&mut state.bpf, |map| {
+            if (state_deleted || flow.is_none())
+                && Self::with_packet_inflight_map(&mut state.bpf, |map| {
                     map.remove(&state_key)
                         .or_else(|error| match error {
                             aya::maps::MapError::KeyNotFound
@@ -1318,9 +1318,8 @@ impl LinuxTcAdapter for AyaLinuxTcAdapter {
                         .map_err(Self::map_error)
                 })
                 .is_err()
-                {
-                    partial = true;
-                }
+            {
+                partial = true;
             }
             if state_deleted {
                 match Self::with_active_flow_releases(&mut state.bpf, |map| {
