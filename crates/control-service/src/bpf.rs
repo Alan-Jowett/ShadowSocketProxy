@@ -1112,10 +1112,40 @@ impl LinuxTcAdapter for AyaLinuxTcAdapter {
                     .map_err(Self::map_error)
             })?;
         }
-        if let Some(flow) = flow.as_ref() {
-            let current = decode_flow_state(flow)
-                .map_err(|error| Self::operation("flow-state:decode", error))?;
-            if observed_last_used_ns != 0 && current.last_used_ns != observed_last_used_ns {
+        if guard_active && observed_last_used_ns != 0 {
+            let current = Self::with_state_map(&mut state.bpf, |map| {
+                map.get(&state_key, 0)
+                    .map(Some)
+                    .or_else(|error| match error {
+                        aya::maps::MapError::KeyNotFound | aya::maps::MapError::ElementNotFound => {
+                            Ok(None)
+                        }
+                        error => Err(Self::map_error(error)),
+                    })
+            })?;
+            if current
+                .as_ref()
+                .map(|value| decode_flow_state(value))
+                .transpose()
+                .map_err(|error| Self::operation("flow-state:decode", error))?
+                .is_some_and(|current| current.last_used_ns != observed_last_used_ns)
+            {
+                let _ = Self::with_delete_guard_map(&mut state.bpf, |map| {
+                    map.remove(&state_key).map_err(Self::map_error)
+                });
+                return Ok(FlowCleanupReport {
+                    observation_mismatch: true,
+                    ..FlowCleanupReport::default()
+                });
+            }
+        }
+        if guard_active && observed_last_used_ns != 0 {
+            let guard_activity = Self::with_delete_guard_map(&mut state.bpf, |map| {
+                map.get(&state_key, 0)
+                    .map_err(Self::map_error)
+                    .map(|value| u64::from_le_bytes(value))
+            })?;
+            if guard_activity != observed_last_used_ns {
                 let _ = Self::with_delete_guard_map(&mut state.bpf, |map| {
                     map.remove(&state_key).map_err(Self::map_error)
                 });
@@ -1216,20 +1246,19 @@ impl LinuxTcAdapter for AyaLinuxTcAdapter {
         if state_deleted {
             match Self::with_active_flow_releases(&mut state.bpf, |map| {
                 let release = 0_u32.to_ne_bytes();
-                map.push(&release, 0).map_err(Self::map_error)
+                map.push(release, 0).map_err(Self::map_error)
             }) {
                 Ok(()) => {}
                 Err(_) => partial = true,
             }
         }
-        if guard_active {
-            if Self::with_delete_guard_map(&mut state.bpf, |map| {
+        if guard_active
+            && Self::with_delete_guard_map(&mut state.bpf, |map| {
                 map.remove(&state_key).map_err(Self::map_error)
             })
             .is_err()
-            {
-                partial = true;
-            }
+        {
+            partial = true;
         }
         Ok(FlowCleanupReport {
             state_deleted,

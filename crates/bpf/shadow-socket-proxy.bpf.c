@@ -785,6 +785,17 @@ static __always_inline int is_control_packet(const struct packet_info *packet,
     return 1;
 }
 
+/** Records activity from a packet blocked by a host deletion guard. */
+static __always_inline int deletion_guard_active(
+    const struct flow_state_key *state_key)
+{
+    __u64 *guard = bpf_map_lookup_elem(&ssp_flow_delete_guard_v1, state_key);
+    if (!guard)
+        return 0;
+    *guard = bpf_ktime_get_ns();
+    return 1;
+}
+
 /**
  * Updates directional SYN/FIN/ACK/RST state and terminal deadline.
  * @param state flow record mutated in place
@@ -1005,7 +1016,7 @@ static __always_inline int process_packet(struct __sk_buff *skb, bool ingress)
     state = bpf_map_lookup_elem(&ssp_flow_state_v1, &state_key);
     if (!state || state->lifecycle != FLOW_ACTIVE)
         return TC_ACT_OK;
-    if (bpf_map_lookup_elem(&ssp_flow_delete_guard_v1, &state_key))
+    if (deletion_guard_active(&state_key))
         return TC_ACT_SHOT;
 
     now = bpf_ktime_get_ns();
@@ -1016,13 +1027,13 @@ static __always_inline int process_packet(struct __sk_buff *skb, bool ingress)
     *candidate = *state;
     if (packet.protocol == IPPROTO_TCP) {
         update_tcp_state(candidate, direction, packet.tcp_flags, now);
-        if (bpf_map_lookup_elem(&ssp_flow_delete_guard_v1, &state_key))
+        if (deletion_guard_active(&state_key))
             return TC_ACT_SHOT;
         bpf_map_update_elem(&ssp_flow_state_v1, &state_key, candidate,
                             BPF_EXIST);
     } else {
         candidate->last_used_ns = now;
-        if (bpf_map_lookup_elem(&ssp_flow_delete_guard_v1, &state_key))
+        if (deletion_guard_active(&state_key))
             return TC_ACT_SHOT;
         bpf_map_update_elem(&ssp_flow_state_v1, &state_key, candidate,
                             BPF_EXIST);
