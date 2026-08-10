@@ -3,14 +3,13 @@
 //! Runs the TCP/UDP host-side forwarder and its platform-specific control
 //! service client.
 
+#[cfg(any(target_os = "windows", test))]
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::{
     collections::HashMap,
     future::Future,
     net::{IpAddr, SocketAddr},
-    sync::{
-        atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering},
-        Arc, Weak,
-    },
+    sync::{Arc, Weak},
     time::Duration,
 };
 
@@ -640,7 +639,7 @@ impl<C: MappingClient + FlowClient + 'static> Proxy<C> {
                     listener: tcp_listener,
                 },
                 udp_socket,
-            ));
+            ))
         }
         #[cfg(target_os = "windows")]
         {
