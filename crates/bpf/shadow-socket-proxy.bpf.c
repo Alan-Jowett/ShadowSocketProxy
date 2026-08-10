@@ -418,13 +418,13 @@ static __always_inline void increment_counter(__u32 index)
     }
 }
 
+static __always_inline void release_flow_slot(void);
+
 /**
  * Reserves one active-flow slot, returning failure when capacity is exhausted.
  * The increment is rolled back when the configured capacity has been reached.
  * @return 1 when a slot is reserved, otherwise 0
  */
-static __always_inline void release_flow_slot(void);
-
 static __always_inline int reserve_flow_slot(void)
 {
     __u32 config_key = 0;

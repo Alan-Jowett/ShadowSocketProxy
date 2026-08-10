@@ -1215,7 +1215,8 @@ impl LinuxTcAdapter for AyaLinuxTcAdapter {
         };
         if state_deleted {
             match Self::with_active_flow_releases(&mut state.bpf, |map| {
-                map.push(0_u32, 0).map_err(Self::map_error)
+                let release = 0_u32.to_ne_bytes();
+                map.push(&release, 0).map_err(Self::map_error)
             }) {
                 Ok(()) => {}
                 Err(_) => partial = true,
