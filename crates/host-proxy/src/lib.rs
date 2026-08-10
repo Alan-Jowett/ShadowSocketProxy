@@ -632,6 +632,10 @@ struct UdpAssociation {
     outbound: Arc<UdpSocket>,
     /// Last successful send or receive time for idle reaping.
     last_seen: Mutex<std::time::Instant>,
+    /// Signals this relay to stop when the dataplane flow is deleted.
+    cancel: watch::Sender<bool>,
+    /// Completes when the relay has stopped.
+    relay_done: Arc<tokio::sync::Notify>,
 }
 
 impl<C: MappingClient + 'static> UdpAssociations<C> {
@@ -761,6 +765,8 @@ impl<C: MappingClient + 'static> UdpAssociations<C> {
             );
             return Err(error.into());
         }
+        let (cancel, relay_shutdown) = watch::channel(false);
+        let relay_done = Arc::new(tokio::sync::Notify::new());
         let candidate = Arc::new(UdpAssociation {
             client_address,
             synthetic_source: tuple.source,
@@ -769,6 +775,8 @@ impl<C: MappingClient + 'static> UdpAssociations<C> {
             created_at: std::time::Instant::now(),
             outbound,
             last_seen: Mutex::new(std::time::Instant::now()),
+            cancel,
+            relay_done: relay_done.clone(),
         });
         let mut entries = self.entries.lock().await;
         if let Some(existing) = entries.get(&tuple) {
@@ -806,6 +814,8 @@ impl<C: MappingClient + 'static> UdpAssociations<C> {
             self.socket.clone(),
             self.idle_timeout,
             self.shutdown.clone(),
+            relay_shutdown,
+            relay_done,
         );
         Ok(candidate)
     }
@@ -841,8 +851,11 @@ impl<C: MappingClient + 'static> UdpAssociations<C> {
 
     /// Removes a locally cached association after confirmed host deletion.
     async fn invalidate(&self, tuple: &Tuple) {
-        let removed = self.entries.lock().await.remove(tuple).is_some();
-        if removed {
+        let association = self.entries.lock().await.remove(tuple);
+        if let Some(association) = association {
+            let relay_done = association.relay_done.notified();
+            let _ = association.cancel.send(true);
+            relay_done.await;
             tracing::info!(
                 protocol = "udp",
                 synthetic_source = %tuple.source,
@@ -861,6 +874,8 @@ fn spawn_udp_relay(
     client_socket: Arc<UdpSocket>,
     idle_timeout: Duration,
     mut shutdown: watch::Receiver<bool>,
+    mut cancel: watch::Receiver<bool>,
+    relay_done: Arc<tokio::sync::Notify>,
 ) {
     tokio::spawn(async move {
         let mut buffer = vec![0_u8; 65_535];
@@ -880,6 +895,11 @@ fn spawn_udp_relay(
                             reason = "proxy_shutdown",
                             "UDP relay stopped"
                         );
+                        relay_done.notify_one();
+                        return;
+                    },
+                    _ = cancel.changed() => {
+                        relay_done.notify_one();
                         return;
                     },
                     result = &mut receive => result,
@@ -956,6 +976,7 @@ fn spawn_udp_relay(
                 }
             }
         }
+        relay_done.notify_one();
     });
 }
 

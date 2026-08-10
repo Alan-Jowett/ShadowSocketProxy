@@ -991,19 +991,19 @@ static __always_inline int process_packet(struct __sk_buff *skb, bool ingress)
     if (!state || state->lifecycle != FLOW_ACTIVE)
         return TC_ACT_OK;
     if (bpf_map_lookup_elem(&ssp_flow_delete_guard_v1, &state_key))
-        return TC_ACT_OK;
+        return TC_ACT_SHOT;
 
     now = bpf_ktime_get_ns();
     direction = ingress ? 0 : 1;
     if (packet.protocol == IPPROTO_TCP) {
         update_tcp_state(state, direction, packet.tcp_flags, now);
         if (bpf_map_lookup_elem(&ssp_flow_delete_guard_v1, &state_key))
-            return TC_ACT_OK;
+            return TC_ACT_SHOT;
         bpf_map_update_elem(&ssp_flow_state_v1, &state_key, state, BPF_EXIST);
     } else {
         state->last_used_ns = now;
         if (bpf_map_lookup_elem(&ssp_flow_delete_guard_v1, &state_key))
-            return TC_ACT_OK;
+            return TC_ACT_SHOT;
         bpf_map_update_elem(&ssp_flow_state_v1, &state_key, state, BPF_EXIST);
     }
 

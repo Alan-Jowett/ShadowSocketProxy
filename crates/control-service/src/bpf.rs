@@ -1083,6 +1083,11 @@ impl LinuxTcAdapter for AyaLinuxTcAdapter {
                     error => Err(Self::map_error(error)),
                 })
         })?;
+        if flow.is_none() {
+            let _ = Self::with_delete_guard_map(&mut state.bpf, |map| {
+                map.remove(&state_key).map_err(Self::map_error)
+            });
+        }
         let guard_active = flow.is_some();
         if guard_active {
             Self::with_delete_guard_map(&mut state.bpf, |map| {
