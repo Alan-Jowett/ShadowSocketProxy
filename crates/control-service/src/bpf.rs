@@ -1143,7 +1143,7 @@ impl LinuxTcAdapter for AyaLinuxTcAdapter {
             let guard_activity = Self::with_delete_guard_map(&mut state.bpf, |map| {
                 map.get(&state_key, 0)
                     .map_err(Self::map_error)
-                    .map(|value| u64::from_le_bytes(value))
+                    .map(u64::from_le_bytes)
             })?;
             if guard_activity != observed_last_used_ns {
                 let _ = Self::with_delete_guard_map(&mut state.bpf, |map| {
