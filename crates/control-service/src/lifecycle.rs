@@ -105,9 +105,9 @@ impl<B: BpfBackend + 'static> ServiceRuntime<B> {
         #[cfg(not(target_os = "linux"))]
         {
             let _ = address;
-            return Err(RuntimeError::Transport(
+            Err(RuntimeError::Transport(
                 crate::transport::TransportError::UnsupportedTlsPsk,
-            ));
+            ))
         }
 
         #[cfg(target_os = "linux")]

@@ -80,7 +80,7 @@ impl TlsPskServer {
         #[cfg(not(target_os = "linux"))]
         {
             let _ = config;
-            return Err(TransportError::UnsupportedTlsPsk);
+            Err(TransportError::UnsupportedTlsPsk)
         }
 
         #[cfg(target_os = "linux")]

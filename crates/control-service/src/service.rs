@@ -84,6 +84,7 @@ impl FlowCursor {
     }
 
     /// Decodes and validates the fixed-width cursor representation.
+    #[allow(clippy::result_large_err)]
     fn decode(bytes: &[u8]) -> Result<Self, Status> {
         if bytes.len() != 32 {
             return Err(Status::invalid_argument("invalid flow page token"));
