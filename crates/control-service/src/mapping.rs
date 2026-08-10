@@ -411,8 +411,8 @@ pub fn decode_value(key: &[u8], value: &[u8]) -> Result<Mapping, AbiError> {
 pub fn encode_flow_index(value: &FlowIndexValue) -> [u8; FLOW_INDEX_VALUE_LEN] {
     let mut output = [0; FLOW_INDEX_VALUE_LEN];
     output[0..2].copy_from_slice(&MAP_ABI_VERSION.to_be_bytes());
-    output[4..12].copy_from_slice(&value.flow_id.to_be_bytes());
-    output[12..16].copy_from_slice(&value.generation.to_be_bytes());
+    output[4..12].copy_from_slice(&value.flow_id.to_ne_bytes());
+    output[12..16].copy_from_slice(&value.generation.to_ne_bytes());
     output
 }
 

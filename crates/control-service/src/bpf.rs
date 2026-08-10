@@ -1155,118 +1155,131 @@ impl LinuxTcAdapter for AyaLinuxTcAdapter {
                 });
             }
         }
-        let stale_generation = flow.is_none()
-            && Self::with_flow_index_map(&mut state.bpf, |map| {
-                map.iter()
-                    .map(|entry| {
-                        let (_, value) = entry.map_err(Self::map_error)?;
-                        let value = crate::mapping::decode_flow_index(&value)
-                            .map_err(|error| Self::operation("flow-index:decode", error))?;
-                        Ok(value.flow_id == flow_id && value.generation != generation)
-                    })
-                    .collect::<Result<Vec<_>, BackendError>>()
-                    .map(|values| values.into_iter().any(|matches| matches))
-            })?;
-        let mut index_keys = if let Some(flow) = flow {
-            let flow = decode_flow_state(&flow)
-                .map_err(|error| Self::operation("flow-state:decode", error))?;
-            vec![
-                encode_key(&flow.original),
-                encode_key(&flow.target),
-                encode_key(&flow.reverse),
-            ]
-        } else {
-            Self::with_flow_index_map(&mut state.bpf, |map| {
-                map.iter()
-                    .map(|entry| {
-                        let (key, value) = entry.map_err(Self::map_error)?;
-                        let value = crate::mapping::decode_flow_index(&value)
-                            .map_err(|error| Self::operation("flow-index:decode", error))?;
-                        Ok((key, value))
-                    })
-                    .collect::<Result<Vec<_>, BackendError>>()
-                    .map(|entries| {
-                        entries
-                            .into_iter()
-                            .filter_map(|(key, value)| (value == expected).then_some(key))
-                            .collect::<Vec<_>>()
-                    })
-            })?
-        };
-        index_keys.sort_unstable();
-        index_keys.dedup();
-        let mut indexes_deleted = 0;
-        let mut partial = false;
-        for key in index_keys {
-            match Self::with_flow_index_map(&mut state.bpf, |map| {
-                let current = map.get(&key, 0).map(Some).or_else(|error| match error {
-                    aya::maps::MapError::KeyNotFound | aya::maps::MapError::ElementNotFound => {
-                        Ok(None)
-                    }
-                    error => Err(Self::map_error(error)),
+        let cleanup = (|| -> Result<FlowCleanupReport, BackendError> {
+            let stale_generation = flow.is_none()
+                && Self::with_flow_index_map(&mut state.bpf, |map| {
+                    map.iter()
+                        .map(|entry| {
+                            let (_, value) = entry.map_err(Self::map_error)?;
+                            let value = crate::mapping::decode_flow_index(&value)
+                                .map_err(|error| Self::operation("flow-index:decode", error))?;
+                            Ok(value.flow_id == flow_id && value.generation != generation)
+                        })
+                        .collect::<Result<Vec<_>, BackendError>>()
+                        .map(|values| values.into_iter().any(|matches| matches))
                 })?;
-                let Some(current) = current else {
-                    return Ok(false);
-                };
-                let current = crate::mapping::decode_flow_index(&current)
-                    .map_err(|error| Self::operation("flow-index:decode", error))?;
-                if current != expected {
-                    return Ok(false);
+            let mut index_keys = if let Some(flow) = flow {
+                let flow = decode_flow_state(&flow)
+                    .map_err(|error| Self::operation("flow-state:decode", error))?;
+                vec![
+                    encode_key(&flow.original),
+                    encode_key(&flow.target),
+                    encode_key(&flow.reverse),
+                ]
+            } else {
+                Self::with_flow_index_map(&mut state.bpf, |map| {
+                    map.iter()
+                        .map(|entry| {
+                            let (key, value) = entry.map_err(Self::map_error)?;
+                            let value = crate::mapping::decode_flow_index(&value)
+                                .map_err(|error| Self::operation("flow-index:decode", error))?;
+                            Ok((key, value))
+                        })
+                        .collect::<Result<Vec<_>, BackendError>>()
+                        .map(|entries| {
+                            entries
+                                .into_iter()
+                                .filter_map(|(key, value)| (value == expected).then_some(key))
+                                .collect::<Vec<_>>()
+                        })
+                })?
+            };
+            index_keys.sort_unstable();
+            index_keys.dedup();
+            let mut indexes_deleted = 0;
+            let mut partial = false;
+            for key in index_keys {
+                match Self::with_flow_index_map(&mut state.bpf, |map| {
+                    let current = map.get(&key, 0).map(Some).or_else(|error| match error {
+                        aya::maps::MapError::KeyNotFound | aya::maps::MapError::ElementNotFound => {
+                            Ok(None)
+                        }
+                        error => Err(Self::map_error(error)),
+                    })?;
+                    let Some(current) = current else {
+                        return Ok(false);
+                    };
+                    let current = crate::mapping::decode_flow_index(&current)
+                        .map_err(|error| Self::operation("flow-index:decode", error))?;
+                    if current != expected {
+                        return Ok(false);
+                    }
+                    map.remove(&key).map_err(Self::map_error)?;
+                    Ok(true)
+                }) {
+                    Ok(true) => indexes_deleted += 1,
+                    Ok(false) => {}
+                    Err(_) => partial = true,
                 }
-                map.remove(&key).map_err(Self::map_error)?;
-                Ok(true)
+            }
+            let state_key = encode_flow_state_key(flow_id, generation);
+            let state_deleted = match Self::with_state_map(&mut state.bpf, |map| {
+                let existed =
+                    map.get(&state_key, 0)
+                        .map(|_| true)
+                        .or_else(|error| match error {
+                            aya::maps::MapError::KeyNotFound
+                            | aya::maps::MapError::ElementNotFound => Ok(false),
+                            error => Err(Self::map_error(error)),
+                        })?;
+                if existed {
+                    map.remove(&state_key).map_err(Self::map_error)?;
+                }
+                Ok(existed)
             }) {
-                Ok(true) => indexes_deleted += 1,
-                Ok(false) => {}
-                Err(_) => partial = true,
+                Ok(value) => value,
+                Err(_) => {
+                    partial = true;
+                    false
+                }
+            };
+            if state_deleted {
+                match Self::with_active_flow_releases(&mut state.bpf, |map| {
+                    let release = 0_u32.to_ne_bytes();
+                    map.push(release, 0).map_err(Self::map_error)
+                }) {
+                    Ok(()) => {}
+                    Err(_) => partial = true,
+                }
             }
-        }
-        let state_key = encode_flow_state_key(flow_id, generation);
-        let state_deleted = match Self::with_state_map(&mut state.bpf, |map| {
-            let existed = map
-                .get(&state_key, 0)
-                .map(|_| true)
-                .or_else(|error| match error {
-                    aya::maps::MapError::KeyNotFound | aya::maps::MapError::ElementNotFound => {
-                        Ok(false)
-                    }
-                    error => Err(Self::map_error(error)),
-                })?;
-            if existed {
-                map.remove(&state_key).map_err(Self::map_error)?;
-            }
-            Ok(existed)
-        }) {
-            Ok(value) => value,
-            Err(_) => {
-                partial = true;
-                false
-            }
-        };
-        if state_deleted {
-            match Self::with_active_flow_releases(&mut state.bpf, |map| {
-                let release = 0_u32.to_ne_bytes();
-                map.push(release, 0).map_err(Self::map_error)
-            }) {
-                Ok(()) => {}
-                Err(_) => partial = true,
-            }
-        }
-        if guard_active
-            && Self::with_delete_guard_map(&mut state.bpf, |map| {
+            Ok(FlowCleanupReport {
+                state_deleted,
+                indexes_deleted,
+                partial,
+                stale_generation,
+                observation_mismatch: false,
+            })
+        })();
+        let guard_cleanup = if guard_active {
+            Self::with_delete_guard_map(&mut state.bpf, |map| {
                 map.remove(&state_key).map_err(Self::map_error)
             })
-            .is_err()
-        {
-            partial = true;
+        } else {
+            Ok(())
+        };
+        match (cleanup, guard_cleanup) {
+            (Ok(mut report), Ok(())) => Ok(report),
+            (Ok(mut report), Err(error)) => {
+                report.partial = true;
+                tracing::warn!(error = %error, "flow deletion guard cleanup failed");
+                Ok(report)
+            }
+            (Err(error), Ok(())) => Err(error),
+            (Err(error), Err(guard_error)) => Err(Self::operation(
+                "flow-delete:guard-cleanup",
+                format!("{error}; guard cleanup failed: {guard_error}"),
+            )),
         }
-        Ok(FlowCleanupReport {
-            state_deleted,
-            indexes_deleted,
-            partial,
-            stale_generation,
-            observation_mismatch: false,
-        })
     }
 
     /// Encodes and writes the validated runtime settings to the BPF map.

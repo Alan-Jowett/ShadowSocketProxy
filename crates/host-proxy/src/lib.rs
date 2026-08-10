@@ -804,10 +804,28 @@ impl<C: MappingClient + 'static> UdpAssociations<C> {
             cancel,
             relay_done: relay_done.clone(),
         });
-        let mut entries = self.entries.lock().await;
+        let entries = self.entries.lock().await;
         if let Some(existing) = entries.get(&tuple) {
             if existing.destination == destination {
                 return Ok(existing.clone());
+            }
+        }
+        drop(entries);
+        spawn_udp_relay(
+            candidate.clone(),
+            self.socket.clone(),
+            self.idle_timeout,
+            self.shutdown.clone(),
+            relay_shutdown,
+            relay_done,
+        );
+        let mut entries = self.entries.lock().await;
+        if let Some(existing) = entries.get(&tuple) {
+            if existing.destination == destination {
+                let existing = existing.clone();
+                drop(entries);
+                Self::stop_association(candidate).await;
+                return Ok(existing);
             }
         }
         let source = tuple.source;
@@ -838,14 +856,6 @@ impl<C: MappingClient + 'static> UdpAssociations<C> {
                 "UDP association created"
             ),
         }
-        spawn_udp_relay(
-            candidate.clone(),
-            self.socket.clone(),
-            self.idle_timeout,
-            self.shutdown.clone(),
-            relay_shutdown,
-            relay_done,
-        );
         Ok(candidate)
     }
 
