@@ -91,6 +91,8 @@ pub struct FlowCleanupReport {
     pub partial: bool,
     /// True when no requested generation exists but another generation does.
     pub stale_generation: bool,
+    /// True when the flow changed after the host enumerated it.
+    pub observation_mismatch: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -140,6 +142,7 @@ pub trait BpfBackend: Send + Sync {
         &self,
         _flow_id: u64,
         _generation: u32,
+        _observed_last_used_ns: u64,
     ) -> Result<FlowCleanupReport, BackendError> {
         Err(BackendError::Unsupported)
     }
@@ -405,9 +408,10 @@ impl BpfBackend for InMemoryBackend {
         &self,
         flow_id: u64,
         generation: u32,
+        observed_last_used_ns: u64,
     ) -> Result<FlowCleanupReport, BackendError> {
         let mut state = self.state.lock().unwrap();
-        let Some(_) = state.flow_states.remove(&(flow_id, generation)) else {
+        let Some(current) = state.flow_states.get(&(flow_id, generation)) else {
             return Ok(FlowCleanupReport {
                 stale_generation: state.flow_states.keys().any(|(id, other_generation)| {
                     *id == flow_id && *other_generation != generation
@@ -415,6 +419,13 @@ impl BpfBackend for InMemoryBackend {
                 ..FlowCleanupReport::default()
             });
         };
+        if observed_last_used_ns != 0 && current.last_used_ns != observed_last_used_ns {
+            return Ok(FlowCleanupReport {
+                observation_mismatch: true,
+                ..FlowCleanupReport::default()
+            });
+        }
+        state.flow_states.remove(&(flow_id, generation));
         let expected = FlowIndexValue {
             flow_id,
             generation,
@@ -426,6 +437,7 @@ impl BpfBackend for InMemoryBackend {
             indexes_deleted: before - state.flow_indexes.len(),
             partial: false,
             stale_generation: false,
+            observation_mismatch: false,
         })
     }
 
@@ -469,6 +481,7 @@ pub trait LinuxTcAdapter: Send + Sync {
         &self,
         _flow_id: u64,
         _generation: u32,
+        _observed_last_used_ns: u64,
     ) -> Result<FlowCleanupReport, BackendError> {
         Err(BackendError::Unsupported)
     }
@@ -528,6 +541,10 @@ impl LinuxTcAdapter for UnsupportedLinuxTcAdapter {
 pub const FLOW_INDEX_MAP_NAME_V1: &str = "ssp_flow_index_v1";
 /// Name of the v1 native flow-state map.
 pub const FLOW_STATE_MAP_NAME_V1: &str = "ssp_flow_state_v1";
+/// Name of the active-flow reservation counter map.
+pub const ACTIVE_FLOWS_MAP_NAME_V1: &str = "ssp_tc_active_flows_v1";
+/// Name of the persisted flow-generation allocator map.
+pub const FLOW_GENERATION_MAP_NAME_V1: &str = "ssp_flow_generation_v1";
 /// Name of the v3 runtime configuration map.
 pub const RUNTIME_CONFIG_MAP_NAME_V3: &str = "ssp_runtime_config_v3";
 /// Name of the v1 packet-counter map.
@@ -663,6 +680,20 @@ impl AyaLinuxTcAdapter {
         operation(&mut map)
     }
 
+    /// Borrows the active-flow reservation counter.
+    fn with_active_flows_map<T>(
+        bpf: &mut aya::Ebpf,
+        operation: impl FnOnce(
+            &mut aya::maps::Array<&mut aya::maps::MapData, [u8; 8]>,
+        ) -> Result<T, BackendError>,
+    ) -> Result<T, BackendError> {
+        let map = bpf
+            .map_mut(ACTIVE_FLOWS_MAP_NAME_V1)
+            .ok_or_else(|| Self::operation("map", "active-flow counter map is missing"))?;
+        let mut map = aya::maps::Array::try_from(map).map_err(Self::map_error)?;
+        operation(&mut map)
+    }
+
     /// Borrows the runtime configuration map for one fallible operation.
     fn with_runtime_map<T>(
         bpf: &mut aya::Ebpf,
@@ -753,6 +784,13 @@ impl LinuxTcAdapter for AyaLinuxTcAdapter {
         }
         Self::with_flow_index_map(&mut bpf, |_| Ok(()))?;
         Self::with_state_map(&mut bpf, |_| Ok(()))?;
+        Self::with_active_flows_map(&mut bpf, |_| Ok(()))?;
+        if bpf.map_mut(FLOW_GENERATION_MAP_NAME_V1).is_none() {
+            return Err(Self::operation(
+                "map",
+                format!("required map {FLOW_GENERATION_MAP_NAME_V1} is missing"),
+            ));
+        }
         Self::with_runtime_map(&mut bpf, |_| Ok(()))?;
         Self::with_counters_map(&mut bpf, |_| Ok(()))?;
 
@@ -985,7 +1023,7 @@ impl LinuxTcAdapter for AyaLinuxTcAdapter {
         };
         let index = crate::mapping::decode_flow_index(&index)
             .map_err(|error| Self::operation("flow-index:decode", error))?;
-        let report = self.delete_flow(index.flow_id, index.generation).await?;
+        let report = self.delete_flow(index.flow_id, index.generation, 0).await?;
         Ok(report.state_deleted || report.indexes_deleted != 0)
     }
 
@@ -1009,6 +1047,7 @@ impl LinuxTcAdapter for AyaLinuxTcAdapter {
         &self,
         flow_id: u64,
         generation: u32,
+        observed_last_used_ns: u64,
     ) -> Result<FlowCleanupReport, BackendError> {
         let mut state = self.state.lock().unwrap();
         let state = state.as_mut().ok_or(BackendError::NotAttached)?;
@@ -1027,6 +1066,16 @@ impl LinuxTcAdapter for AyaLinuxTcAdapter {
                     error => Err(Self::map_error(error)),
                 })
         })?;
+        if let Some(flow) = flow.as_ref() {
+            let current = decode_flow_state(flow)
+                .map_err(|error| Self::operation("flow-state:decode", error))?;
+            if observed_last_used_ns != 0 && current.last_used_ns != observed_last_used_ns {
+                return Ok(FlowCleanupReport {
+                    observation_mismatch: true,
+                    ..FlowCleanupReport::default()
+                });
+            }
+        }
         let stale_generation = flow.is_none()
             && Self::with_flow_index_map(&mut state.bpf, |map| {
                 map.iter()
@@ -1115,11 +1164,26 @@ impl LinuxTcAdapter for AyaLinuxTcAdapter {
                 false
             }
         };
+        if state_deleted {
+            match Self::with_active_flows_map(&mut state.bpf, |map| {
+                let current = map.get(&0, 0).map_err(Self::map_error)?;
+                let current = u64::from_le_bytes(current);
+                if current != 0 {
+                    map.set(0, (current - 1).to_le_bytes(), 0)
+                        .map_err(Self::map_error)?;
+                }
+                Ok(())
+            }) {
+                Ok(()) => {}
+                Err(_) => partial = true,
+            }
+        }
         Ok(FlowCleanupReport {
             state_deleted,
             indexes_deleted,
             partial,
             stale_generation,
+            observation_mismatch: false,
         })
     }
 
@@ -1419,8 +1483,11 @@ impl BpfBackend for LinuxBpfBackend {
         &self,
         flow_id: u64,
         generation: u32,
+        observed_last_used_ns: u64,
     ) -> Result<FlowCleanupReport, BackendError> {
-        self.adapter.delete_flow(flow_id, generation).await
+        self.adapter
+            .delete_flow(flow_id, generation, observed_last_used_ns)
+            .await
     }
 
     /// Writes configuration only after an ELF has been attached.
@@ -1531,7 +1598,7 @@ mod tests {
             .await
             .unwrap()
             .is_some());
-        let report = backend.delete_flow(9, 1).await.unwrap();
+        let report = backend.delete_flow(9, 1, 0).await.unwrap();
         assert_eq!(report.indexes_deleted, 3);
         assert!(backend.list_flow_states().await.unwrap().is_empty());
     }

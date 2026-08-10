@@ -78,6 +78,7 @@ message EnumerateFlowsReply {
 message DeleteFlowRequest {
   uint64 flow_id = 1;
   uint32 generation = 2;
+  uint64 observed_last_used_ns = 3;
 }
 
 message DeleteFlowReply {
@@ -86,6 +87,7 @@ message DeleteFlowReply {
     ALREADY_ABSENT = 1;
     STALE_GENERATION = 2;
     PARTIAL = 3;
+    OBSERVATION_MISMATCH = 4;
   }
   Outcome outcome = 1;
   uint64 flow_id = 2;

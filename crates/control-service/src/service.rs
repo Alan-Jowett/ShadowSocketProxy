@@ -609,10 +609,16 @@ impl Control for ControlService {
         let request = request.into_inner();
         let report = self
             .backend
-            .delete_flow(request.flow_id, request.generation)
+            .delete_flow(
+                request.flow_id,
+                request.generation,
+                request.observed_last_used_ns,
+            )
             .await
             .map_err(Self::map_backend_error)?;
-        let outcome = if report.partial {
+        let outcome = if report.observation_mismatch {
+            proto::delete_flow_reply::Outcome::ObservationMismatch
+        } else if report.partial {
             proto::delete_flow_reply::Outcome::Partial
         } else if report.stale_generation {
             proto::delete_flow_reply::Outcome::StaleGeneration
@@ -878,6 +884,7 @@ mod tests {
             .delete_flow(Request::new(proto::DeleteFlowRequest {
                 flow_id: first_id,
                 generation: 7,
+                observed_last_used_ns: 1,
             }))
             .await
             .unwrap()

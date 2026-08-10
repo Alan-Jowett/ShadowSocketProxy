@@ -160,15 +160,18 @@ Malformed, expired, or over-limit tokens are explicit request errors.
 
 ### D-HP-MAINT-003 — Generation-safe cleanup primitive
 
-`DeleteFlow` accepts flow identity and generation and performs the adapter's
-canonical state-plus-index cleanup as one backend operation. It returns
-complete removal, already absent, stale generation, or partial cleanup
-outcomes and never deletes a newer generation when the supplied generation no
-longer matches. A partial result includes the state/index removal counts and a
-retryable indication; host-proxy retries the same identity/generation. An
-already-absent result is idempotent success. Host-proxy invalidates a matching
-local UDP association only for complete or already-absent results, never for a
-stale-generation, partial, or transport-error result.
+`DeleteFlow` accepts flow identity, generation, and the enumerated
+`last_used_ns` observation and performs the adapter's canonical state-plus-index
+cleanup as one backend operation. It returns complete removal, already absent,
+stale generation, observation mismatch, or partial cleanup outcomes and never
+deletes a newer or concurrently active flow when the supplied identity,
+generation, or observation no longer matches. A partial result includes the
+state/index removal counts and a retryable indication; host-proxy retries the
+same identity/generation/observation. Observation mismatch causes the host to
+discard the pending deletion and wait for a fresh enumeration. An already-
+absent result is idempotent success. Host-proxy invalidates a matching local
+UDP association only for complete or already-absent results, never for a
+stale-generation, observation mismatch, partial, or transport-error result.
 
 ### D-HP-MAINT-004 — Host maintenance loop
 

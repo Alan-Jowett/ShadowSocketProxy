@@ -108,6 +108,8 @@ pub enum FlowDeleteOutcome {
     AlreadyAbsent,
     /// A newer generation exists and was protected.
     StaleGeneration,
+    /// The flow changed after enumeration and was not deleted.
+    ObservationMismatch,
     /// Some state or indexes remain and the operation may be retried.
     Partial,
 }
@@ -151,6 +153,7 @@ pub trait FlowClient: Send + Sync {
         &self,
         flow_id: u64,
         generation: u32,
+        observed_last_used_ns: u64,
     ) -> Result<FlowDeleteReport, ProxyError>;
 }
 
@@ -217,10 +220,12 @@ impl ProxyConfig {
 }
 
 /// Runs serialized host-owned flow maintenance until shutdown.
+#[allow(clippy::too_many_arguments)]
 async fn run_maintenance<C: MappingClient + FlowClient + 'static>(
     client: Arc<C>,
     associations: Arc<UdpAssociations<C>>,
     cleanup_interval: Duration,
+    udp_idle_timeout: Duration,
     idle_ttl: Duration,
     tcp_terminal_grace: Duration,
     flow_scan_batch: u32,
@@ -252,8 +257,13 @@ async fn run_maintenance<C: MappingClient + FlowClient + 'static>(
                         let terminal = tcp
                             && flow.fin_seen_mask == 0b11
                             && flow.fin_ack_seen_mask == 0b11;
+                        let idle_threshold = if flow.original.protocol == UDP_PROTOCOL {
+                            udp_idle_timeout
+                        } else {
+                            idle_ttl
+                        };
                         let expired = flow.tcp_state_flags & (1 << 4) != 0
-                            || (!terminal && age >= idle_ttl.as_nanos() as u64)
+                            || (!terminal && age >= idle_threshold.as_nanos() as u64)
                             || (terminal && age >= tcp_terminal_grace.as_nanos() as u64);
                         if expired {
                             pending_deletes.insert((flow.flow_id, flow.generation), flow);
@@ -266,19 +276,28 @@ async fn run_maintenance<C: MappingClient + FlowClient + 'static>(
                 }
                 let pending = pending_deletes.values().cloned().collect::<Vec<_>>();
                 for flow in pending {
-                    match client.delete_flow(flow.flow_id, flow.generation).await {
+                    match client
+                        .delete_flow(
+                            flow.flow_id,
+                            flow.generation,
+                            flow.last_used_ns,
+                        )
+                        .await
+                    {
                         Ok(report) => {
                             if matches!(
                                 report.outcome,
                                 FlowDeleteOutcome::Complete
                                     | FlowDeleteOutcome::AlreadyAbsent
                                     | FlowDeleteOutcome::StaleGeneration
+                                    | FlowDeleteOutcome::ObservationMismatch
                             ) {
                                 pending_deletes.remove(&(flow.flow_id, flow.generation));
                                 if flow.original.protocol == UDP_PROTOCOL
-                                    && !matches!(
+                                    && matches!(
                                         report.outcome,
-                                        FlowDeleteOutcome::StaleGeneration
+                                        FlowDeleteOutcome::Complete
+                                            | FlowDeleteOutcome::AlreadyAbsent
                                     )
                                 {
                                     associations.invalidate(&flow.synthetic).await;
@@ -364,6 +383,7 @@ impl<C: MappingClient + FlowClient + 'static> Proxy<C> {
             self.client.clone(),
             udp.clone(),
             self.config.cleanup_interval,
+            self.config.udp_idle_timeout,
             self.config.idle_ttl,
             self.config.tcp_terminal_grace,
             self.config.flow_scan_batch,
@@ -1005,6 +1025,7 @@ impl FlowClient for TlsPskMappingClient {
         &self,
         _flow_id: u64,
         _generation: u32,
+        _observed_last_used_ns: u64,
     ) -> Result<FlowDeleteReport, ProxyError> {
         Err(ProxyError::UnsupportedPlatform)
     }
@@ -1198,6 +1219,7 @@ mod windows_client {
             &self,
             flow_id: u64,
             generation: u32,
+            observed_last_used_ns: u64,
         ) -> Result<FlowDeleteReport, ProxyError> {
             let reply = self
                 .client
@@ -1206,6 +1228,7 @@ mod windows_client {
                 .delete_flow(proto::DeleteFlowRequest {
                     flow_id,
                     generation,
+                    observed_last_used_ns,
                 })
                 .await
                 .map_err(|error| ProxyError::Control(error.to_string()))?
@@ -1221,6 +1244,9 @@ mod windows_client {
                     FlowDeleteOutcome::StaleGeneration
                 }
                 proto::delete_flow_reply::Outcome::Partial => FlowDeleteOutcome::Partial,
+                proto::delete_flow_reply::Outcome::ObservationMismatch => {
+                    FlowDeleteOutcome::ObservationMismatch
+                }
             };
             Ok(FlowDeleteReport {
                 flow_id: reply.flow_id,
@@ -1310,8 +1336,10 @@ mod windows_client {
             &self,
             flow_id: u64,
             generation: u32,
+            observed_last_used_ns: u64,
         ) -> Result<FlowDeleteReport, ProxyError> {
-            self.delete_flow(flow_id, generation).await
+            self.delete_flow(flow_id, generation, observed_last_used_ns)
+                .await
         }
     }
 
@@ -1524,6 +1552,7 @@ mod tests {
             &self,
             _flow_id: u64,
             _generation: u32,
+            _observed_last_used_ns: u64,
         ) -> Result<FlowDeleteReport, ProxyError> {
             Ok(FlowDeleteReport {
                 flow_id: 0,
@@ -1564,6 +1593,7 @@ mod tests {
             &self,
             _flow_id: u64,
             _generation: u32,
+            _observed_last_used_ns: u64,
         ) -> Result<FlowDeleteReport, ProxyError> {
             Ok(FlowDeleteReport {
                 flow_id: 0,

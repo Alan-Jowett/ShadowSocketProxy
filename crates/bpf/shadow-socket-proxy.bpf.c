@@ -318,6 +318,14 @@ struct {
     __type(value, __u64);
 } ssp_tc_active_flows_v1 SEC(".maps");
 
+/** Persisted generation allocator for flow incarnations. */
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u64);
+} ssp_flow_generation_v1 SEC(".maps");
+
 /**
  * Copies exactly four bytes without relying on unbounded packet pointers.
  * @param to destination buffer with four writable bytes
@@ -858,6 +866,7 @@ static __always_inline int process_packet(struct __sk_buff *skb, bool ingress)
     __u8 direction;
     __u32 scratch_key = 0;
     __u32 generation;
+    __u64 *generation_counter;
 
     if (!parse_packet(skb, &packet))
         return TC_ACT_OK;
@@ -892,7 +901,11 @@ static __always_inline int process_packet(struct __sk_buff *skb, bool ingress)
         __builtin_memset(candidate, 0, sizeof(*candidate));
         candidate_index.version = bpf_htons(MAP_ABI_VERSION);
         candidate_index.flow_id = flow_id;
-        generation = (__u32)bpf_ktime_get_ns();
+        generation_counter =
+            bpf_map_lookup_elem(&ssp_flow_generation_v1, &scratch_key);
+        if (!generation_counter)
+            return TC_ACT_SHOT;
+        generation = (__u32)__sync_fetch_and_add(generation_counter, 1);
         if (generation == 0)
             generation = 1;
         candidate_index.generation = generation;
