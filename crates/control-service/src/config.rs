@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 ShadowSocketProxy contributors
-//! Validates and publishes the runtime settings shared by gRPC, maintenance,
-//! and the BPF map writer.
+//! Validates and publishes runtime settings shared by gRPC and the BPF map
+//! writer.
 
 use std::{
     net::{IpAddr, SocketAddr},
@@ -51,12 +51,8 @@ pub struct RuntimeConfig {
     pub schema_version: u16,
     /// Monotonic revision assigned when the store publishes a configuration.
     pub revision: u64,
-    /// Delay between maintenance scans.
-    pub cleanup_interval: Duration,
     /// Age after which an otherwise active flow or mapping is eligible for cleanup.
     pub idle_ttl: Duration,
-    /// Maximum number of map records examined by one cleanup pass.
-    pub map_scan_batch: usize,
     /// Maximum number of log records retained by the bounded ring.
     pub log_capacity: usize,
     /// Requested active-flow capacity, bounded by the loaded map maxima.
@@ -77,9 +73,7 @@ impl Default for RuntimeConfig {
         Self {
             schema_version: RUNTIME_CONFIG_ABI_VERSION,
             revision: 1,
-            cleanup_interval: Duration::from_secs(10),
             idle_ttl: Duration::from_secs(60),
-            map_scan_batch: 256,
             log_capacity: 1024,
             active_flow_capacity: 4096,
             tcp_terminal_grace: Duration::from_secs(30),
@@ -95,24 +89,15 @@ impl Default for RuntimeConfig {
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 /// Validation failures that prevent an unsafe or ABI-incompatible configuration.
 pub enum ConfigError {
-    #[error("cleanup interval must be non-zero")]
-    /// Maintenance cannot run with a zero interval.
-    ZeroCleanupInterval,
     #[error("runtime config schema version is unsupported")]
     /// The requested runtime-config ABI is not understood.
     UnsupportedSchemaVersion,
     #[error("idle TTL must be non-zero")]
     /// Flow cleanup requires a non-zero idle lifetime.
     ZeroIdleTtl,
-    #[error("map scan batch must be between 1 and 100000")]
-    /// The scan batch is outside the supported 1..=100000 range.
-    InvalidBatch,
     #[error("log capacity must be between 1 and 100000")]
     /// The log ring capacity is outside the supported 1..=100000 range.
     InvalidLogCapacity,
-    #[error("cleanup interval must not exceed idle TTL")]
-    /// A cleanup interval longer than the idle TTL could miss expiration.
-    IntervalExceedsTtl,
     #[error("active flow capacity must be between 1 and the ELF maximum")]
     /// Active-flow capacity is zero or exceeds the state-map maximum.
     InvalidFlowCapacity,
@@ -154,20 +139,11 @@ impl RuntimeConfig {
         if self.schema_version != RUNTIME_CONFIG_ABI_VERSION {
             return Err(ConfigError::UnsupportedSchemaVersion);
         }
-        if self.cleanup_interval.is_zero() {
-            return Err(ConfigError::ZeroCleanupInterval);
-        }
         if self.idle_ttl.is_zero() {
             return Err(ConfigError::ZeroIdleTtl);
         }
-        if self.map_scan_batch == 0 || self.map_scan_batch > 100_000 {
-            return Err(ConfigError::InvalidBatch);
-        }
         if self.log_capacity == 0 || self.log_capacity > 100_000 {
             return Err(ConfigError::InvalidLogCapacity);
-        }
-        if self.cleanup_interval > self.idle_ttl {
-            return Err(ConfigError::IntervalExceedsTtl);
         }
         if self.active_flow_capacity == 0 || self.active_flow_capacity > maxima.flow_state {
             return Err(ConfigError::InvalidFlowCapacity);
@@ -190,14 +166,15 @@ impl RuntimeConfig {
         }
         validate_target(self.ipv4_target, true)?;
         validate_target(self.ipv6_target, false)?;
-        if self.cleanup_interval.as_secs() > 365 * 24 * 60 * 60
-            || self.idle_ttl.as_secs() > 365 * 24 * 60 * 60
-            || self.tcp_terminal_grace.as_secs() > 365 * 24 * 60 * 60
-        {
-            return Err(ConfigError::DurationOverflow);
-        }
+        bpf_duration_nanos(self.idle_ttl)?;
+        bpf_duration_nanos(self.tcp_terminal_grace)?;
         Ok(())
     }
+}
+
+/// Converts a host duration to the fixed-width BPF nanosecond representation.
+pub fn bpf_duration_nanos(duration: Duration) -> Result<u64, ConfigError> {
+    u64::try_from(duration.as_nanos()).map_err(|_| ConfigError::DurationOverflow)
 }
 
 /// Checks optional target pairing, family, port, and address specificity.
@@ -284,8 +261,8 @@ mod tests {
         assert_eq!(updated.revision, 2);
 
         let mut invalid = (*updated).clone();
-        invalid.map_scan_batch = 0;
-        assert_eq!(store.update(invalid), Err(ConfigError::InvalidBatch));
+        invalid.idle_ttl = Duration::ZERO;
+        assert_eq!(store.update(invalid), Err(ConfigError::ZeroIdleTtl));
         assert_eq!(store.snapshot().revision, 2);
     }
 
@@ -318,5 +295,17 @@ mod tests {
         let address = "192.0.2.10:50051".parse().unwrap();
         let descriptor = ListenerDescriptor::from_socket_addr(address);
         assert_eq!(descriptor.socket_addr(), address);
+    }
+
+    #[test]
+    fn rejects_duration_that_cannot_fit_bpf_nanoseconds() {
+        let config = RuntimeConfig {
+            idle_ttl: Duration::from_secs(u64::MAX),
+            ..RuntimeConfig::default()
+        };
+        assert!(matches!(
+            ConfigStore::new(config),
+            Err(ConfigError::DurationOverflow)
+        ));
     }
 }

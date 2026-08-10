@@ -5,8 +5,9 @@
 
 use std::{
     collections::HashMap,
+    future::Future,
     net::{IpAddr, SocketAddr},
-    sync::Arc,
+    sync::{Arc, Weak},
     time::Duration,
 };
 
@@ -15,7 +16,7 @@ use thiserror::Error;
 use tokio::{
     io,
     net::{TcpListener, TcpStream, UdpSocket},
-    sync::{watch, Mutex},
+    sync::{watch, Mutex, Notify},
     task::JoinSet,
     time,
 };
@@ -29,6 +30,8 @@ pub mod proto {
 const TCP_PROTOCOL: u8 = 6;
 /// IP protocol number used in UDP mapping lookups.
 const UDP_PROTOCOL: u8 = 17;
+/// Upper bound for a host-issued control RPC or maintenance operation.
+const CONTROL_RPC_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 /// Socket tuple sent to the control service for mapping lookup.
@@ -73,12 +76,88 @@ pub enum ProxyError {
     UnsupportedPlatform,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+/// BPF-agnostic flow record returned by host maintenance enumeration.
+pub struct FlowRecord {
+    /// Opaque flow identity.
+    pub flow_id: u64,
+    /// Generation paired with the identity.
+    pub generation: u32,
+    /// Synthetic tuple used by the proxy.
+    pub synthetic: Tuple,
+    /// Original tuple restored by the proxy.
+    pub original: Tuple,
+    /// Last dataplane activity timestamp.
+    pub last_used_ns: u64,
+    /// Protocol flags observed by the dataplane.
+    pub protocol_flags: u32,
+    /// TCP lifecycle flags observed by the dataplane.
+    pub tcp_state_flags: u32,
+    /// Control-service monotonic timestamp corresponding to `last_used_ns`.
+    pub observed_now_ns: u64,
+    /// Directional FIN observations, bit zero for original-to-target and bit
+    /// one for target-to-original.
+    pub fin_seen_mask: u32,
+    /// Directional FIN acknowledgements using the same direction bits.
+    pub fin_ack_seen_mask: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Result category for a generation-checked flow deletion.
+pub enum FlowDeleteOutcome {
+    /// State and indexes were removed.
+    Complete,
+    /// No matching state or indexes remained.
+    AlreadyAbsent,
+    /// A newer generation exists and was protected.
+    StaleGeneration,
+    /// The flow changed after enumeration and was not deleted.
+    ObservationMismatch,
+    /// Some state or indexes remain and the operation may be retried.
+    Partial,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// BPF-agnostic result returned by flow deletion.
+pub struct FlowDeleteReport {
+    /// Requested flow identity.
+    pub flow_id: u64,
+    /// Requested flow generation.
+    pub generation: u32,
+    /// Deletion outcome.
+    pub outcome: FlowDeleteOutcome,
+    /// Number of tuple indexes removed.
+    pub indexes_deleted: u32,
+    /// Whether canonical state was removed.
+    pub state_deleted: bool,
+    /// Whether the caller should retry.
+    pub retryable: bool,
+}
+
 #[async_trait]
 /// Lookup interface used by both TCP and UDP forwarding paths.
 pub trait MappingClient: Send + Sync {
     /// Resolves a proxy tuple to its original destination or returns a typed
     /// lookup/control error.
     async fn get_mapping(&self, tuple: &Tuple) -> Result<OriginalDestination, ProxyError>;
+}
+
+#[async_trait]
+/// Typed flow lifecycle operations used by host-owned maintenance.
+pub trait FlowClient: Send + Sync {
+    /// Enumerates one bounded page of active flows.
+    async fn enumerate_flows(
+        &self,
+        page_token: Vec<u8>,
+        limit: u32,
+    ) -> Result<(Vec<FlowRecord>, Vec<u8>), ProxyError>;
+    /// Deletes one flow only when its identity and generation still match.
+    async fn delete_flow(
+        &self,
+        flow_id: u64,
+        generation: u32,
+        observed_last_used_ns: u64,
+    ) -> Result<FlowDeleteReport, ProxyError>;
 }
 
 #[derive(Clone)]
@@ -94,6 +173,14 @@ pub struct ProxyConfig {
     pub psk_secret: Vec<u8>,
     /// Inactivity duration after which a UDP association is reaped.
     pub udp_idle_timeout: Duration,
+    /// Interval between host-owned flow maintenance passes.
+    pub cleanup_interval: Duration,
+    /// Idle age used for incomplete TCP and UDP flows.
+    pub idle_ttl: Duration,
+    /// Grace age for TCP flows after both FIN acknowledgements.
+    pub tcp_terminal_grace: Duration,
+    /// Maximum flow records requested per enumeration page.
+    pub flow_scan_batch: u32,
 }
 
 impl ProxyConfig {
@@ -121,7 +208,195 @@ impl ProxyConfig {
                 "UDP idle timeout must be nonzero".into(),
             ));
         }
+        for (name, duration) in [
+            ("UDP idle timeout", self.udp_idle_timeout),
+            ("cleanup interval", self.cleanup_interval),
+            ("idle TTL", self.idle_ttl),
+            ("TCP terminal grace", self.tcp_terminal_grace),
+        ] {
+            duration_to_nanos(duration, name)?;
+        }
+        if self.cleanup_interval.is_zero()
+            || self.idle_ttl.is_zero()
+            || self.tcp_terminal_grace.is_zero()
+            || self.flow_scan_batch == 0
+            || self.flow_scan_batch > 10_000
+        {
+            return Err(ProxyError::InvalidConfiguration(
+                "maintenance settings must be nonzero".into(),
+            ));
+        }
         Ok(())
+    }
+}
+
+/// Converts timeout settings to the dataplane's bounded nanosecond domain.
+fn duration_to_nanos(duration: Duration, name: &str) -> Result<u64, ProxyError> {
+    u64::try_from(duration.as_nanos()).map_err(|_| {
+        ProxyError::InvalidConfiguration(format!("{name} is too large to represent in nanoseconds"))
+    })
+}
+
+/// Runs a control operation with a local deadline and cooperative shutdown.
+async fn control_operation<T>(
+    shutdown: &mut watch::Receiver<bool>,
+    operation: impl Future<Output = Result<T, ProxyError>>,
+) -> Result<Option<T>, ProxyError> {
+    tokio::select! {
+        _ = shutdown.changed() => Ok(None),
+        result = time::timeout(CONTROL_RPC_TIMEOUT, operation) => {
+            match result {
+                Ok(result) => result.map(Some),
+                Err(_) => Err(ProxyError::Control("control RPC timed out".into())),
+            }
+        }
+    }
+}
+
+/// Runs serialized host-owned flow maintenance until shutdown.
+#[allow(clippy::too_many_arguments)]
+async fn run_maintenance<C: MappingClient + FlowClient + 'static>(
+    client: Arc<C>,
+    associations: Arc<UdpAssociations<C>>,
+    cleanup_interval: Duration,
+    udp_idle_timeout: Duration,
+    idle_ttl: Duration,
+    tcp_terminal_grace: Duration,
+    flow_scan_batch: u32,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let initial_retry_delay = cleanup_interval.min(Duration::from_millis(100));
+    let mut retry_delay = initial_retry_delay;
+    let mut pending_deletes = std::collections::HashMap::<(u64, u32), FlowRecord>::new();
+    let udp_idle_timeout_ns =
+        duration_to_nanos(udp_idle_timeout, "UDP idle timeout").expect("validated configuration");
+    let idle_ttl_ns = duration_to_nanos(idle_ttl, "idle TTL").expect("validated configuration");
+    let tcp_terminal_grace_ns = duration_to_nanos(tcp_terminal_grace, "TCP terminal grace")
+        .expect("validated configuration");
+    let mut next_run = time::Instant::now();
+    'maintenance: loop {
+        let sleep = time::sleep_until(next_run);
+        tokio::pin!(sleep);
+        tokio::select! {
+            _ = shutdown.changed() => break,
+            _ = &mut sleep => {
+                let mut token = Vec::new();
+                let mut pass_failed = false;
+                loop {
+                    let page = control_operation(
+                        &mut shutdown,
+                        client.enumerate_flows(token, flow_scan_batch),
+                    )
+                    .await;
+                    let page = match page {
+                        Ok(Some(page)) => page,
+                        Ok(None) => break 'maintenance,
+                        Err(error) => {
+                            tracing::warn!(%error, "host maintenance flow enumeration failed");
+                            pass_failed = true;
+                            break;
+                        }
+                    };
+                    let (flows, next) = page;
+                    for flow in flows {
+                        let age = flow.observed_now_ns.saturating_sub(flow.last_used_ns);
+                        let tcp = flow.original.protocol == TCP_PROTOCOL;
+                        if flow.original.protocol == UDP_PROTOCOL {
+                            associations
+                                .observe_flow(&flow.synthetic, flow.flow_id, flow.generation)
+                                .await;
+                        }
+                        let terminal = tcp
+                            && flow.fin_seen_mask == 0b11
+                            && flow.fin_ack_seen_mask == 0b11;
+                        let idle_threshold = if flow.original.protocol == UDP_PROTOCOL {
+                            udp_idle_timeout_ns
+                        } else {
+                            idle_ttl_ns
+                        };
+                        let expired = flow.tcp_state_flags & (1 << 4) != 0
+                            || (!terminal && age >= idle_threshold)
+                            || (terminal && age >= tcp_terminal_grace_ns);
+                        if expired {
+                            pending_deletes.insert((flow.flow_id, flow.generation), flow);
+                        }
+                    }
+                    if next.is_empty() {
+                        break;
+                    }
+                    token = next;
+                }
+                let pending = pending_deletes.values().cloned().collect::<Vec<_>>();
+                for flow in pending {
+                    match control_operation(
+                        &mut shutdown,
+                        client.delete_flow(
+                            flow.flow_id,
+                            flow.generation,
+                            flow.last_used_ns,
+                        ),
+                    )
+                    .await
+                    {
+                        Ok(Some(report)) => {
+                            if matches!(
+                                report.outcome,
+                                FlowDeleteOutcome::Complete
+                                    | FlowDeleteOutcome::AlreadyAbsent
+                                    | FlowDeleteOutcome::StaleGeneration
+                                    | FlowDeleteOutcome::ObservationMismatch
+                            ) {
+                                pending_deletes.remove(&(flow.flow_id, flow.generation));
+                                if flow.original.protocol == UDP_PROTOCOL
+                                    && matches!(
+                                        report.outcome,
+                                        FlowDeleteOutcome::Complete
+                                            | FlowDeleteOutcome::AlreadyAbsent
+                                    )
+                                {
+                                    associations
+                                        .invalidate(
+                                            &flow.synthetic,
+                                            flow.flow_id,
+                                            flow.generation,
+                                        )
+                                        .await;
+                                }
+                            }
+                            if report.retryable {
+                                pass_failed = true;
+                            }
+                            tracing::info!(
+                                flow_id = flow.flow_id,
+                                generation = flow.generation,
+                                outcome = ?report.outcome,
+                                "host maintenance flow deletion"
+                            );
+                        }
+                        Ok(None) => break 'maintenance,
+                        Err(error) => {
+                            pass_failed = true;
+                            tracing::warn!(
+                                flow_id = flow.flow_id,
+                                generation = flow.generation,
+                                %error,
+                                "host maintenance flow deletion failed"
+                            );
+                        }
+                    }
+                }
+                if pass_failed {
+                    let delay = retry_delay;
+                    retry_delay = retry_delay
+                        .saturating_mul(2)
+                        .min(cleanup_interval);
+                    next_run = time::Instant::now() + delay;
+                } else {
+                    retry_delay = initial_retry_delay;
+                    next_run = time::Instant::now() + cleanup_interval;
+                }
+            }
+        }
     }
 }
 
@@ -133,7 +408,7 @@ pub struct Proxy<C> {
     client: Arc<C>,
 }
 
-impl<C: MappingClient + 'static> Proxy<C> {
+impl<C: MappingClient + FlowClient + 'static> Proxy<C> {
     /// Validates configuration and creates a proxy that has not opened sockets.
     pub fn new(config: ProxyConfig, client: Arc<C>) -> Result<Self, ProxyError> {
         config.validate()?;
@@ -169,6 +444,16 @@ impl<C: MappingClient + 'static> Proxy<C> {
             self.config.udp_idle_timeout,
             shutdown.clone(),
         ));
+        let maintenance = tokio::spawn(run_maintenance(
+            self.client.clone(),
+            udp.clone(),
+            self.config.cleanup_interval,
+            self.config.udp_idle_timeout,
+            self.config.idle_ttl,
+            self.config.tcp_terminal_grace,
+            self.config.flow_scan_batch,
+            shutdown.clone(),
+        ));
         let mut tcp_task =
             tokio::spawn(run_tcp(tcp_listener, self.client.clone(), shutdown.clone()));
         let mut udp_task = tokio::spawn(run_udp(udp.clone(), shutdown.clone()));
@@ -176,15 +461,18 @@ impl<C: MappingClient + 'static> Proxy<C> {
             _ = shutdown.changed() => {
                 let _ = tcp_task.await;
                 let _ = udp_task.await;
+                let _ = maintenance.await;
                 Ok(())
             },
             result = &mut tcp_task => {
                 udp_task.abort();
+                maintenance.abort();
                 let _ = udp_task.await;
                 result.map_err(|error| ProxyError::Control(error.to_string()))
             },
             result = &mut udp_task => {
                 tcp_task.abort();
+                maintenance.abort();
                 let _ = tcp_task.await;
                 result.map_err(|error| ProxyError::Control(error.to_string()))
             },
@@ -352,20 +640,15 @@ async fn bridge_tcp<C: MappingClient + 'static>(
     Ok(())
 }
 
-/// Receives datagrams, resolves/creates associations, relays replies, and
-/// periodically removes idle associations.
+/// Receives datagrams, resolves/creates associations, and relays replies.
 async fn run_udp<C: MappingClient + 'static>(
     associations: Arc<UdpAssociations<C>>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let mut buffer = vec![0_u8; 65_535];
-    let mut reap = time::interval(associations.idle_timeout);
     loop {
         tokio::select! {
             _ = shutdown.changed() => break,
-            _ = reap.tick() => {
-                associations.reap().await;
-            }
             received = associations.socket.recv_from(&mut buffer) => {
                 let (length, client_address) = match received {
                     Ok(value) => value,
@@ -374,8 +657,13 @@ async fn run_udp<C: MappingClient + 'static>(
                         continue;
                     }
                 };
-                if let Err(error) = associations.forward(client_address, &buffer[..length]).await {
-                    associations.report_failure(&error).await;
+                tokio::select! {
+                    _ = shutdown.changed() => break,
+                    result = associations.forward(client_address, &buffer[..length]) => {
+                        if let Err(error) = result {
+                            associations.report_failure(&error).await;
+                        }
+                    }
                 }
             }
         }
@@ -383,13 +671,16 @@ async fn run_udp<C: MappingClient + 'static>(
 }
 
 /// Shared UDP association table and lifecycle coordination state.
+type AssociationTable = HashMap<Tuple, Arc<UdpAssociation>>;
+
+/// Coordinates cached UDP associations and their relay lifetimes.
 struct UdpAssociations<C> {
     /// Client-facing UDP socket bound to the proxy listener.
     socket: Arc<UdpSocket>,
     /// Mapping service used to resolve each client tuple.
     client: Arc<C>,
     /// Associations keyed by client tuple.
-    entries: Mutex<HashMap<Tuple, Arc<UdpAssociation>>>,
+    entries: Arc<Mutex<AssociationTable>>,
     /// Lifetime used by relay timeouts and periodic reaping.
     idle_timeout: Duration,
     /// Watch receiver used to stop relay tasks.
@@ -400,6 +691,10 @@ struct UdpAssociations<C> {
 
 /// One connected outbound UDP socket paired with its originating client.
 struct UdpAssociation {
+    /// Synthetic tuple identifying this cache entry.
+    key: Tuple,
+    /// Weak cache reference used when the relay expires on its own.
+    entries: Weak<Mutex<AssociationTable>>,
     /// Client endpoint receiving relayed responses.
     client_address: SocketAddr,
     /// Synthetic client tuple used for the control-service mapping.
@@ -414,6 +709,20 @@ struct UdpAssociation {
     outbound: Arc<UdpSocket>,
     /// Last successful send or receive time for idle reaping.
     last_seen: Mutex<std::time::Instant>,
+    /// Wakes the relay when client-to-destination activity extends its lease.
+    activity: Notify,
+    /// Dataplane flow incarnation associated with this relay, when observed.
+    flow_identity: Mutex<Option<(u64, u32)>>,
+    /// Signals this relay to stop when the dataplane flow is deleted.
+    cancel: watch::Sender<bool>,
+    /// Becomes true when the relay has released its socket.
+    relay_done: watch::Sender<bool>,
+}
+
+/// Extends an association lease after successful traffic in either direction.
+async fn touch_association(association: &UdpAssociation) {
+    *association.last_seen.lock().await = std::time::Instant::now();
+    association.activity.notify_one();
 }
 
 impl<C: MappingClient + 'static> UdpAssociations<C> {
@@ -427,34 +736,73 @@ impl<C: MappingClient + 'static> UdpAssociations<C> {
         Self {
             socket,
             client,
-            entries: Mutex::new(HashMap::new()),
+            entries: Arc::new(Mutex::new(HashMap::new())),
             idle_timeout,
             shutdown,
             last_failure_log: Mutex::new(None),
         }
     }
 
-    /// Resolves a tuple, replaces stale destinations, sends the datagram, and
-    /// refreshes association activity.
+    /// Reuses an active association, resolving only when it is absent or a
+    /// destination-specific send failure requires one retry.
     async fn forward(&self, client_address: SocketAddr, payload: &[u8]) -> Result<(), ProxyError> {
         let tuple = Tuple {
             source: client_address,
             destination: self.socket.local_addr()?,
             protocol: UDP_PROTOCOL,
         };
-        let mapping = match self.client.get_mapping(&tuple).await {
-            Ok(mapping) => mapping,
-            Err(error) => {
-                tracing::warn!(
-                    protocol = "udp",
-                    synthetic_source = %tuple.source,
-                    synthetic_destination = %tuple.destination,
-                    error = %error,
-                    "UDP mapping lookup failed"
-                );
-                return Err(error);
-            }
+        let association = self.entries.lock().await.get(&tuple).cloned();
+        let association = match association {
+            Some(association) => association,
+            None => self.resolve_association(&tuple, client_address).await?,
         };
+        if let Err(error) = association.outbound.send(payload).await {
+            tracing::warn!(
+                protocol = "udp",
+                synthetic_source = %tuple.source,
+                synthetic_destination = %tuple.destination,
+                original_destination = %association.destination,
+                error = %error,
+                "UDP datagram send failed"
+            );
+            if !matches!(
+                error.kind(),
+                io::ErrorKind::ConnectionRefused
+                    | io::ErrorKind::TimedOut
+                    | io::ErrorKind::NetworkUnreachable
+                    | io::ErrorKind::HostUnreachable
+            ) {
+                return Err(error.into());
+            }
+            let old = self.entries.lock().await.remove(&tuple);
+            if let Some(old) = old {
+                Self::stop_association(old).await;
+            }
+            let replacement = self.resolve_association(&tuple, client_address).await?;
+            replacement.outbound.send(payload).await?;
+            touch_association(&replacement).await;
+            return Ok(());
+        }
+        touch_association(&association).await;
+        Ok(())
+    }
+
+    /// Performs the one mapping lookup needed to create an association.
+    async fn resolve_association(
+        &self,
+        tuple: &Tuple,
+        client_address: SocketAddr,
+    ) -> Result<Arc<UdpAssociation>, ProxyError> {
+        let mapping = self.client.get_mapping(tuple).await.map_err(|error| {
+            tracing::warn!(
+                protocol = "udp",
+                synthetic_source = %tuple.source,
+                synthetic_destination = %tuple.destination,
+                error = %error,
+                "UDP mapping lookup failed"
+            );
+            error
+        })?;
         if mapping.protocol != UDP_PROTOCOL {
             tracing::warn!(
                 protocol = "udp",
@@ -468,36 +816,8 @@ impl<C: MappingClient + 'static> UdpAssociations<C> {
                 "UDP lookup returned a non-UDP mapping".into(),
             ));
         }
-        let existing = self.entries.lock().await.get(&tuple).cloned();
-        let association = if let Some(existing) = existing {
-            if existing.destination == mapping.address {
-                existing
-            } else {
-                self.replace_association(
-                    tuple.clone(),
-                    client_address,
-                    mapping,
-                    existing.destination,
-                )
-                .await?
-            }
-        } else {
-            self.insert_association(tuple.clone(), client_address, mapping, None)
-                .await?
-        };
-        if let Err(error) = association.outbound.send(payload).await {
-            tracing::warn!(
-                protocol = "udp",
-                synthetic_source = %tuple.source,
-                synthetic_destination = %tuple.destination,
-                original_destination = %association.destination,
-                error = %error,
-                "UDP datagram send failed"
-            );
-            return Err(error.into());
-        }
-        *association.last_seen.lock().await = std::time::Instant::now();
-        Ok(())
+        self.insert_association(tuple.clone(), client_address, mapping, None)
+            .await
     }
 
     /// Binds and connects a new outbound UDP socket, publishing it atomically
@@ -535,7 +855,11 @@ impl<C: MappingClient + 'static> UdpAssociations<C> {
             );
             return Err(error.into());
         }
+        let (cancel, relay_shutdown) = watch::channel(false);
+        let (relay_done, _) = watch::channel(false);
         let candidate = Arc::new(UdpAssociation {
+            key: tuple.clone(),
+            entries: Arc::downgrade(&self.entries),
             client_address,
             synthetic_source: tuple.source,
             synthetic_destination: tuple.destination,
@@ -543,17 +867,42 @@ impl<C: MappingClient + 'static> UdpAssociations<C> {
             created_at: std::time::Instant::now(),
             outbound,
             last_seen: Mutex::new(std::time::Instant::now()),
+            activity: Notify::new(),
+            flow_identity: Mutex::new(None),
+            cancel,
+            relay_done,
         });
-        let mut entries = self.entries.lock().await;
+        let entries = self.entries.lock().await;
         if let Some(existing) = entries.get(&tuple) {
             if existing.destination == destination {
                 return Ok(existing.clone());
             }
         }
+        drop(entries);
+        spawn_udp_relay(
+            candidate.clone(),
+            self.socket.clone(),
+            self.idle_timeout,
+            self.shutdown.clone(),
+            relay_shutdown,
+            candidate.relay_done.clone(),
+        );
+        let mut entries = self.entries.lock().await;
+        if let Some(existing) = entries.get(&tuple) {
+            if existing.destination == destination {
+                let existing = existing.clone();
+                drop(entries);
+                Self::stop_association(candidate).await;
+                return Ok(existing);
+            }
+        }
         let source = tuple.source;
         let proxy = tuple.destination;
-        entries.insert(tuple, candidate.clone());
+        let previous = entries.insert(tuple, candidate.clone());
         drop(entries);
+        if let Some(previous) = previous {
+            Self::stop_association(previous).await;
+        }
         match previous_destination {
             Some(previous_destination) => tracing::info!(
                 protocol = "udp",
@@ -575,25 +924,7 @@ impl<C: MappingClient + 'static> UdpAssociations<C> {
                 "UDP association created"
             ),
         }
-        spawn_udp_relay(
-            candidate.clone(),
-            self.socket.clone(),
-            self.idle_timeout,
-            self.shutdown.clone(),
-        );
         Ok(candidate)
-    }
-
-    /// Rebuilds an association when the mapping destination changes.
-    async fn replace_association(
-        &self,
-        tuple: Tuple,
-        client_address: SocketAddr,
-        mapping: OriginalDestination,
-        previous_destination: SocketAddr,
-    ) -> Result<Arc<UdpAssociation>, ProxyError> {
-        self.insert_association(tuple, client_address, mapping, Some(previous_destination))
-            .await
     }
 
     /// Logs forwarding failures at most once per second.
@@ -609,14 +940,19 @@ impl<C: MappingClient + 'static> UdpAssociations<C> {
         }
     }
 
-    /// Drops all association entries; relay tasks exit via their watch signal.
+    /// Cancels every association and waits for relay tasks to release sockets.
     async fn shutdown(&self) {
-        let count = {
+        let associations = {
             let mut entries = self.entries.lock().await;
-            let count = entries.len();
-            entries.clear();
-            count
+            entries
+                .drain()
+                .map(|(_, association)| association)
+                .collect::<Vec<_>>()
         };
+        let count = associations.len();
+        for association in associations {
+            Self::stop_association(association).await;
+        }
         tracing::info!(
             protocol = "udp",
             association_count = count,
@@ -625,51 +961,69 @@ impl<C: MappingClient + 'static> UdpAssociations<C> {
         );
     }
 
-    /// Removes associations idle longer than the configured timeout.
-    async fn reap(&self) {
-        let candidates = {
-            let entries = self.entries.lock().await;
-            entries
-                .iter()
-                .map(|(tuple, association)| (tuple.clone(), association.clone()))
-                .collect::<Vec<_>>()
+    /// Removes a locally cached association after confirmed host deletion.
+    async fn invalidate(&self, tuple: &Tuple, flow_id: u64, generation: u32) {
+        let association = self.entries.lock().await.get(tuple).cloned();
+        let Some(association) = association else {
+            return;
         };
-        let mut expired = Vec::new();
-        for (tuple, association) in candidates {
-            let age = association.last_seen.lock().await.elapsed();
-            if age >= self.idle_timeout {
-                expired.push((tuple, association, age));
-            }
-        }
-        if expired.is_empty() {
+        if *association.flow_identity.lock().await != Some((flow_id, generation)) {
             return;
         }
-        let mut entries = self.entries.lock().await;
-        for (tuple, association, _) in expired {
-            let Some(current) = entries.get(&tuple).cloned() else {
-                continue;
-            };
-            if !Arc::ptr_eq(&current, &association) {
-                continue;
-            }
-            let idle_age = current.last_seen.lock().await.elapsed();
-            if idle_age >= self.idle_timeout {
-                let association_age = current.created_at.elapsed();
-                entries.remove(&tuple);
-                tracing::info!(
-                    protocol = "udp",
-                    synthetic_source = %tuple.source,
-                    synthetic_destination = %tuple.destination,
-                    original_destination = %current.destination,
-                    association_age_ms = association_age.as_millis() as u64,
-                    idle_age_ms = idle_age.as_millis() as u64,
-                    idle_timeout_ms = self.idle_timeout.as_millis() as u64,
-                    reason = "idle_timeout",
-                    "UDP association expired"
-                );
+        let association = {
+            let mut entries = self.entries.lock().await;
+            entries
+                .get(tuple)
+                .is_some_and(|current| Arc::ptr_eq(current, &association))
+                .then(|| entries.remove(tuple))
+                .flatten()
+        };
+        if let Some(association) = association {
+            Self::stop_association(association).await;
+            tracing::info!(
+                protocol = "udp",
+                synthetic_source = %tuple.source,
+                synthetic_destination = %tuple.destination,
+                reason = "flow_deleted",
+                "UDP association invalidated"
+            );
+        }
+    }
+
+    /// Records the flow incarnation currently backing a UDP association.
+    async fn observe_flow(&self, tuple: &Tuple, flow_id: u64, generation: u32) {
+        if let Some(association) = self.entries.lock().await.get(tuple).cloned() {
+            *association.flow_identity.lock().await = Some((flow_id, generation));
+        }
+    }
+
+    /// Cancels an association relay and waits until it has released its socket.
+    async fn stop_association(association: Arc<UdpAssociation>) {
+        let mut relay_done = association.relay_done.subscribe();
+        if *relay_done.borrow() {
+            return;
+        }
+        let _ = association.cancel.send(true);
+        while !*relay_done.borrow() {
+            if relay_done.changed().await.is_err() {
+                return;
             }
         }
     }
+}
+
+/// Removes an association when its relay exits and signals waiters.
+async fn finish_udp_relay(association: &Arc<UdpAssociation>, relay_done: &watch::Sender<bool>) {
+    if let Some(entries) = association.entries.upgrade() {
+        let mut entries = entries.lock().await;
+        if entries
+            .get(&association.key)
+            .is_some_and(|current| Arc::ptr_eq(current, association))
+        {
+            entries.remove(&association.key);
+        }
+    }
+    let _ = relay_done.send(true);
 }
 
 /// Spawns the reply loop for one outbound association until timeout, I/O error,
@@ -679,29 +1033,47 @@ fn spawn_udp_relay(
     client_socket: Arc<UdpSocket>,
     idle_timeout: Duration,
     mut shutdown: watch::Receiver<bool>,
+    mut cancel: watch::Receiver<bool>,
+    relay_done: watch::Sender<bool>,
 ) {
     tokio::spawn(async move {
         let mut buffer = vec![0_u8; 65_535];
         loop {
-            let result = {
-                let receive = time::timeout(idle_timeout, association.outbound.recv(&mut buffer));
-                tokio::pin!(receive);
-                tokio::select! {
-                    _ = shutdown.changed() => {
-                        tracing::info!(
-                            protocol = "udp",
-                            synthetic_source = %association.synthetic_source,
-                            synthetic_destination = %association.synthetic_destination,
-                            client_address = %association.client_address,
-                            original_destination = %association.destination,
-                            association_age_ms = association.created_at.elapsed().as_millis() as u64,
-                            reason = "proxy_shutdown",
-                            "UDP relay stopped"
-                        );
-                        return;
-                    },
-                    result = &mut receive => result,
-                }
+            let deadline = *association.last_seen.lock().await + idle_timeout;
+            let idle = time::sleep_until(deadline.into());
+            let activity = association.activity.notified();
+            tokio::pin!(idle);
+            tokio::pin!(activity);
+            let result = tokio::select! {
+                _ = shutdown.changed() => {
+                    tracing::info!(
+                        protocol = "udp",
+                        synthetic_source = %association.synthetic_source,
+                        synthetic_destination = %association.synthetic_destination,
+                        client_address = %association.client_address,
+                        original_destination = %association.destination,
+                        association_age_ms = association.created_at.elapsed().as_millis() as u64,
+                        reason = "proxy_shutdown",
+                        "UDP relay stopped"
+                    );
+                    finish_udp_relay(&association, &relay_done).await;
+                    return;
+                },
+                _ = cancel.changed() => {
+                    finish_udp_relay(&association, &relay_done).await;
+                    return;
+                },
+                _ = &mut activity => continue,
+                _ = &mut idle => {
+                    if std::time::Instant::now()
+                        .saturating_duration_since(*association.last_seen.lock().await)
+                        < idle_timeout
+                    {
+                        continue;
+                    }
+                    Err(())
+                },
+                result = association.outbound.recv(&mut buffer) => Ok(result),
             };
             match result {
                 Ok(Ok(length)) => {
@@ -732,7 +1104,7 @@ fn spawn_udp_relay(
                         );
                         break;
                     }
-                    *association.last_seen.lock().await = std::time::Instant::now();
+                    touch_association(&association).await;
                 }
                 Ok(Err(error)) => {
                     tracing::warn!(
@@ -758,7 +1130,7 @@ fn spawn_udp_relay(
                     );
                     break;
                 }
-                Err(_) => {
+                Err(()) => {
                     tracing::info!(
                         protocol = "udp",
                         synthetic_source = %association.synthetic_source,
@@ -774,6 +1146,7 @@ fn spawn_udp_relay(
                 }
             }
         }
+        finish_udp_relay(&association, &relay_done).await;
     });
 }
 
@@ -826,6 +1199,29 @@ impl MappingClient for TlsPskMappingClient {
     }
 }
 
+#[cfg(not(all(target_os = "windows", feature = "tls-psk")))]
+#[async_trait]
+impl FlowClient for TlsPskMappingClient {
+    /// Reports that typed flow operations are unavailable without TLS support.
+    async fn enumerate_flows(
+        &self,
+        _page_token: Vec<u8>,
+        _limit: u32,
+    ) -> Result<(Vec<FlowRecord>, Vec<u8>), ProxyError> {
+        Err(ProxyError::UnsupportedPlatform)
+    }
+
+    /// Reports that typed flow operations are unavailable without TLS support.
+    async fn delete_flow(
+        &self,
+        _flow_id: u64,
+        _generation: u32,
+        _observed_last_used_ns: u64,
+    ) -> Result<FlowDeleteReport, ProxyError> {
+        Err(ProxyError::UnsupportedPlatform)
+    }
+}
+
 #[cfg(all(target_os = "windows", feature = "tls-psk"))]
 /// Windows TLS-PSK control-service client, compiled only with `tls-psk`.
 mod windows_client {
@@ -839,6 +1235,23 @@ mod windows_client {
     use tokio_openssl::SslStream;
     use tonic::transport::Endpoint;
     use tower::service_fn;
+
+    /// Adds a gRPC deadline and enforces the same deadline locally.
+    async fn bounded_rpc<T>(
+        operation: impl Future<Output = Result<T, tonic::Status>>,
+    ) -> Result<T, ProxyError> {
+        time::timeout(CONTROL_RPC_TIMEOUT, operation)
+            .await
+            .map_err(|_| ProxyError::Control("control RPC timed out".into()))?
+            .map_err(|error| ProxyError::Control(error.to_string()))
+    }
+
+    /// Builds a tonic request carrying the server-visible deadline.
+    fn rpc_request<T>(message: T) -> tonic::Request<T> {
+        let mut request = tonic::Request::new(message);
+        request.set_timeout(CONTROL_RPC_TIMEOUT);
+        request
+    }
 
     #[derive(Clone)]
     /// Reusable TLS-PSK gRPC channel for mapping lookups.
@@ -892,23 +1305,21 @@ mod windows_client {
                     "BPF ELF path and interface are required".into(),
                 ));
             }
-            let mut client = self.client.lock().await;
-            let attached = client
-                .attach(proto::InterfaceRequest {
-                    elf_path: elf_path.into(),
-                    interfaces: vec![interface.into()],
-                })
+            let mut client = time::timeout(CONTROL_RPC_TIMEOUT, self.client.lock())
                 .await
-                .map_err(|error| ProxyError::Control(error.to_string()))?
-                .into_inner();
+                .map_err(|_| ProxyError::Control("control client lock timed out".into()))?;
+            let attached = bounded_rpc(client.attach(rpc_request(proto::InterfaceRequest {
+                elf_path: elf_path.into(),
+                interfaces: vec![interface.into()],
+            })))
+            .await?
+            .into_inner();
             if !attached.success {
                 return Err(ProxyError::Control(attached.message));
             }
             let configured = async {
-                let mut config = client
-                    .get_config(proto::Empty {})
-                    .await
-                    .map_err(|error| ProxyError::Control(error.to_string()))?
+                let mut config = bounded_rpc(client.get_config(rpc_request(proto::Empty {})))
+                    .await?
                     .into_inner()
                     .config
                     .ok_or_else(|| {
@@ -924,22 +1335,19 @@ mod windows_client {
                         config.ipv6_target_port = proxy.port() as u32;
                     }
                 }
-                client
-                    .set_config(proto::SetConfigRequest {
-                        config: Some(config),
-                    })
-                    .await
-                    .map_err(|error| ProxyError::Control(error.to_string()))?;
+                bounded_rpc(client.set_config(rpc_request(proto::SetConfigRequest {
+                    config: Some(config),
+                })))
+                .await?;
                 Ok(())
             }
             .await;
             if let Err(error) = configured {
-                let rollback = client
-                    .detach(proto::DetachRequest {
-                        interfaces: vec![interface.into()],
-                        all: false,
-                    })
-                    .await;
+                let rollback = bounded_rpc(client.detach(rpc_request(proto::DetachRequest {
+                    interfaces: vec![interface.into()],
+                    all: false,
+                })))
+                .await;
                 return match rollback {
                     Ok(_) => Err(error),
                     Err(rollback_error) => Err(ProxyError::Control(format!(
@@ -952,16 +1360,102 @@ mod windows_client {
 
         /// Detaches BPF classifiers associated with one interface.
         pub async fn detach(&self, interface: &str) -> Result<(), ProxyError> {
-            self.client
-                .lock()
+            let mut client = time::timeout(CONTROL_RPC_TIMEOUT, self.client.lock())
                 .await
-                .detach(proto::DetachRequest {
-                    interfaces: vec![interface.into()],
-                    all: false,
-                })
-                .await
-                .map_err(|error| ProxyError::Control(error.to_string()))?;
+                .map_err(|_| ProxyError::Control("control client lock timed out".into()))?;
+            bounded_rpc(client.detach(rpc_request(proto::DetachRequest {
+                interfaces: vec![interface.into()],
+                all: false,
+            })))
+            .await?;
             Ok(())
+        }
+
+        /// Enumerates one bounded page of typed flow records.
+        pub async fn enumerate_flows(
+            &self,
+            page_token: Vec<u8>,
+            limit: u32,
+        ) -> Result<(Vec<FlowRecord>, Vec<u8>), ProxyError> {
+            let mut client = time::timeout(CONTROL_RPC_TIMEOUT, self.client.lock())
+                .await
+                .map_err(|_| ProxyError::Control("control client lock timed out".into()))?;
+            let reply = bounded_rpc(client.enumerate_flows(rpc_request(
+                proto::EnumerateFlowsRequest { limit, page_token },
+            )))
+            .await?
+            .into_inner();
+            let mut flows = Vec::with_capacity(reply.flows.len());
+            for flow in reply.flows {
+                let synthetic = tuple_from_proto(flow.synthetic.ok_or_else(|| {
+                    ProxyError::InvalidMapping("flow synthetic tuple missing".into())
+                })?)?;
+                let original = tuple_from_proto(flow.original.ok_or_else(|| {
+                    ProxyError::InvalidMapping("flow original tuple missing".into())
+                })?)?;
+                if synthetic.protocol != flow.protocol as u8
+                    || original.protocol != flow.protocol as u8
+                {
+                    return Err(ProxyError::InvalidMapping(
+                        "flow protocol does not match tuples".into(),
+                    ));
+                }
+                flows.push(FlowRecord {
+                    flow_id: flow.flow_id,
+                    generation: flow.generation,
+                    synthetic,
+                    original,
+                    last_used_ns: flow.last_used_ns,
+                    protocol_flags: flow.protocol_flags,
+                    tcp_state_flags: flow.tcp_state_flags,
+                    observed_now_ns: flow.observed_now_ns,
+                    fin_seen_mask: flow.fin_seen_mask,
+                    fin_ack_seen_mask: flow.fin_ack_seen_mask,
+                });
+            }
+            Ok((flows, reply.next_page_token))
+        }
+
+        /// Deletes one generation-checked flow and converts its typed outcome.
+        pub async fn delete_flow(
+            &self,
+            flow_id: u64,
+            generation: u32,
+            observed_last_used_ns: u64,
+        ) -> Result<FlowDeleteReport, ProxyError> {
+            let mut client = time::timeout(CONTROL_RPC_TIMEOUT, self.client.lock())
+                .await
+                .map_err(|_| ProxyError::Control("control client lock timed out".into()))?;
+            let reply = bounded_rpc(client.delete_flow(rpc_request(proto::DeleteFlowRequest {
+                flow_id,
+                generation,
+                observed_last_used_ns,
+            })))
+            .await?
+            .into_inner();
+            let outcome = match proto::delete_flow_reply::Outcome::try_from(reply.outcome)
+                .map_err(|_| ProxyError::Control("unknown flow deletion outcome".into()))?
+            {
+                proto::delete_flow_reply::Outcome::Complete => FlowDeleteOutcome::Complete,
+                proto::delete_flow_reply::Outcome::AlreadyAbsent => {
+                    FlowDeleteOutcome::AlreadyAbsent
+                }
+                proto::delete_flow_reply::Outcome::StaleGeneration => {
+                    FlowDeleteOutcome::StaleGeneration
+                }
+                proto::delete_flow_reply::Outcome::Partial => FlowDeleteOutcome::Partial,
+                proto::delete_flow_reply::Outcome::ObservationMismatch => {
+                    FlowDeleteOutcome::ObservationMismatch
+                }
+            };
+            Ok(FlowDeleteReport {
+                flow_id: reply.flow_id,
+                generation: reply.generation,
+                outcome,
+                indexes_deleted: reply.indexes_deleted,
+                state_deleted: reply.state_deleted,
+                retryable: reply.retryable,
+            })
         }
     }
 
@@ -980,20 +1474,23 @@ mod windows_client {
                     destination_port: tuple.destination.port() as u32,
                 }),
             };
-            let mapping = self
-                .client
-                .lock()
+            let mut client = time::timeout(CONTROL_RPC_TIMEOUT, self.client.lock())
                 .await
-                .get_mapping(request)
-                .await
-                .map_err(|error| {
-                    if error.code() == tonic::Code::NotFound {
-                        ProxyError::MappingNotFound
-                    } else {
-                        ProxyError::Control(error.to_string())
-                    }
-                })?
-                .into_inner();
+                .map_err(|_| ProxyError::Control("control client lock timed out".into()))?;
+            let mapping = time::timeout(
+                CONTROL_RPC_TIMEOUT,
+                client.get_mapping(rpc_request(request)),
+            )
+            .await
+            .map_err(|_| ProxyError::Control("control RPC timed out".into()))?
+            .map_err(|error| {
+                if error.code() == tonic::Code::NotFound {
+                    ProxyError::MappingNotFound
+                } else {
+                    ProxyError::Control(error.to_string())
+                }
+            })?
+            .into_inner();
             let synthetic = mapping
                 .synthetic
                 .ok_or_else(|| ProxyError::InvalidMapping("missing synthetic tuple".into()))?;
@@ -1023,6 +1520,29 @@ mod windows_client {
                 address: address.destination,
                 protocol: address.protocol,
             })
+        }
+    }
+
+    #[async_trait]
+    impl FlowClient for TlsPskMappingClient {
+        /// Delegates typed flow enumeration to the authenticated channel.
+        async fn enumerate_flows(
+            &self,
+            page_token: Vec<u8>,
+            limit: u32,
+        ) -> Result<(Vec<FlowRecord>, Vec<u8>), ProxyError> {
+            self.enumerate_flows(page_token, limit).await
+        }
+
+        /// Delegates generation-checked flow deletion to the authenticated channel.
+        async fn delete_flow(
+            &self,
+            flow_id: u64,
+            generation: u32,
+            observed_last_used_ns: u64,
+        ) -> Result<FlowDeleteReport, ProxyError> {
+            self.delete_flow(flow_id, generation, observed_last_used_ns)
+                .await
         }
     }
 
@@ -1142,8 +1662,11 @@ pub use windows_client::PublicTlsPskMappingClient as TlsPskMappingClient;
 mod tests {
     use super::*;
     use std::{
-        collections::{HashSet, VecDeque},
-        sync::Mutex as StdMutex,
+        collections::VecDeque,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Mutex as StdMutex,
+        },
     };
     use tracing::{field::Visit, Event, Subscriber};
     use tracing_subscriber::{
@@ -1155,18 +1678,15 @@ mod tests {
     #[derive(Clone, Default)]
     struct EventRecorder {
         reasons: Arc<StdMutex<Vec<String>>>,
-        field_sets: Arc<StdMutex<Vec<HashSet<String>>>>,
     }
 
     struct FieldVisitor {
-        fields: HashSet<String>,
         reasons: Vec<String>,
     }
 
     impl FieldVisitor {
         fn new() -> Self {
             Self {
-                fields: HashSet::new(),
                 reasons: Vec::new(),
             }
         }
@@ -1174,9 +1694,14 @@ mod tests {
 
     impl Visit for FieldVisitor {
         fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-            self.fields.insert(field.name().to_owned());
             if field.name() == "reason" {
                 self.reasons.push(format!("{value:?}"));
+            }
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            if field.name() == "reason" {
+                self.reasons.push(value.to_owned());
             }
         }
     }
@@ -1189,7 +1714,6 @@ mod tests {
             let mut visitor = FieldVisitor::new();
             event.record(&mut visitor);
             self.reasons.lock().unwrap().extend(visitor.reasons);
-            self.field_sets.lock().unwrap().push(visitor.fields);
         }
     }
 
@@ -1200,23 +1724,6 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|value| value.contains(reason))
-        }
-
-        fn count_reason(&self, reason: &str) -> usize {
-            self.reasons
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|value| value.contains(reason))
-                .count()
-        }
-
-        fn has_fields(&self, required: &[&str]) -> bool {
-            self.field_sets.lock().unwrap().iter().any(|fields| {
-                required
-                    .iter()
-                    .all(|required_field| fields.contains(*required_field))
-            })
         }
     }
 
@@ -1237,8 +1744,107 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl FlowClient for MockClient {
+        async fn enumerate_flows(
+            &self,
+            _page_token: Vec<u8>,
+            _limit: u32,
+        ) -> Result<(Vec<FlowRecord>, Vec<u8>), ProxyError> {
+            Ok((Vec::new(), Vec::new()))
+        }
+
+        async fn delete_flow(
+            &self,
+            _flow_id: u64,
+            _generation: u32,
+            _observed_last_used_ns: u64,
+        ) -> Result<FlowDeleteReport, ProxyError> {
+            Ok(FlowDeleteReport {
+                flow_id: 0,
+                generation: 0,
+                outcome: FlowDeleteOutcome::AlreadyAbsent,
+                indexes_deleted: 0,
+                state_deleted: false,
+                retryable: false,
+            })
+        }
+    }
+
     struct SequenceClient {
         destinations: StdMutex<VecDeque<SocketAddr>>,
+    }
+
+    #[derive(Default)]
+    struct RetryClient {
+        enumerate_calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl MappingClient for RetryClient {
+        async fn get_mapping(&self, _tuple: &Tuple) -> Result<OriginalDestination, ProxyError> {
+            Err(ProxyError::MappingNotFound)
+        }
+    }
+
+    #[async_trait]
+    impl FlowClient for RetryClient {
+        async fn enumerate_flows(
+            &self,
+            _page_token: Vec<u8>,
+            _limit: u32,
+        ) -> Result<(Vec<FlowRecord>, Vec<u8>), ProxyError> {
+            if self.enumerate_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                Err(ProxyError::Control("transient failure".into()))
+            } else {
+                Ok((Vec::new(), Vec::new()))
+            }
+        }
+
+        async fn delete_flow(
+            &self,
+            _flow_id: u64,
+            _generation: u32,
+            _observed_last_used_ns: u64,
+        ) -> Result<FlowDeleteReport, ProxyError> {
+            Ok(FlowDeleteReport {
+                flow_id: 0,
+                generation: 0,
+                outcome: FlowDeleteOutcome::AlreadyAbsent,
+                indexes_deleted: 0,
+                state_deleted: false,
+                retryable: false,
+            })
+        }
+    }
+
+    struct HangingClient;
+
+    #[async_trait]
+    impl MappingClient for HangingClient {
+        async fn get_mapping(&self, _tuple: &Tuple) -> Result<OriginalDestination, ProxyError> {
+            std::future::pending().await
+        }
+    }
+
+    #[async_trait]
+    impl FlowClient for HangingClient {
+        async fn enumerate_flows(
+            &self,
+            _page_token: Vec<u8>,
+            _limit: u32,
+        ) -> Result<(Vec<FlowRecord>, Vec<u8>), ProxyError> {
+            std::future::pending().await
+        }
+
+        async fn delete_flow(
+            &self,
+            _flow_id: u64,
+            _generation: u32,
+            _observed_last_used_ns: u64,
+        ) -> Result<FlowDeleteReport, ProxyError> {
+            std::future::pending().await
+        }
     }
 
     #[async_trait]
@@ -1251,6 +1857,33 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl FlowClient for SequenceClient {
+        async fn enumerate_flows(
+            &self,
+            _page_token: Vec<u8>,
+            _limit: u32,
+        ) -> Result<(Vec<FlowRecord>, Vec<u8>), ProxyError> {
+            Ok((Vec::new(), Vec::new()))
+        }
+
+        async fn delete_flow(
+            &self,
+            _flow_id: u64,
+            _generation: u32,
+            _observed_last_used_ns: u64,
+        ) -> Result<FlowDeleteReport, ProxyError> {
+            Ok(FlowDeleteReport {
+                flow_id: 0,
+                generation: 0,
+                outcome: FlowDeleteOutcome::AlreadyAbsent,
+                indexes_deleted: 0,
+                state_deleted: false,
+                retryable: false,
+            })
+        }
+    }
+
     #[test]
     fn configuration_rejects_missing_credentials_and_zero_timeout() {
         let config = ProxyConfig {
@@ -1259,6 +1892,10 @@ mod tests {
             psk_identity: String::new(),
             psk_secret: Vec::new(),
             udp_idle_timeout: Duration::ZERO,
+            cleanup_interval: Duration::from_secs(5),
+            idle_ttl: Duration::from_secs(60),
+            tcp_terminal_grace: Duration::from_secs(30),
+            flow_scan_batch: 256,
         };
         assert!(config.validate().is_err());
     }
@@ -1271,11 +1908,34 @@ mod tests {
             psk_identity: "identity".into(),
             psk_secret: vec![1],
             udp_idle_timeout: Duration::from_secs(5),
+            cleanup_interval: Duration::from_secs(5),
+            idle_ttl: Duration::from_secs(60),
+            tcp_terminal_grace: Duration::from_secs(30),
+            flow_scan_batch: 256,
         };
         assert!(matches!(
             config.validate(),
             Err(ProxyError::InvalidConfiguration(message))
                 if message.contains("listen address must be specific")
+        ));
+    }
+
+    #[test]
+    fn configuration_rejects_timeout_that_overflows_nanoseconds() {
+        let config = ProxyConfig {
+            listen: "127.0.0.1:15000".parse().unwrap(),
+            control_endpoint: "https://127.0.0.1:50051".into(),
+            psk_identity: "identity".into(),
+            psk_secret: vec![1],
+            udp_idle_timeout: Duration::from_secs(5),
+            cleanup_interval: Duration::from_secs(5),
+            idle_ttl: Duration::from_secs(u64::MAX),
+            tcp_terminal_grace: Duration::from_secs(30),
+            flow_scan_batch: 256,
+        };
+        assert!(matches!(
+            config.validate(),
+            Err(ProxyError::InvalidConfiguration(message)) if message.contains("too large")
         ));
     }
 
@@ -1366,11 +2026,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn udp_lifecycle_events_capture_replacement_and_expiry() {
-        let recorder = EventRecorder::default();
-        let subscriber = tracing_subscriber::registry().with(recorder.clone());
-        let _default = tracing::subscriber::set_default(subscriber);
-
+    async fn udp_association_cache_reuses_active_destination() {
         let first_destination = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let second_destination = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let proxy_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
@@ -1408,20 +2064,150 @@ mod tests {
             .get(&tuple)
             .unwrap()
             .clone();
-        *association.last_seen.lock().await = std::time::Instant::now() - Duration::from_secs(10);
-        associations.reap().await;
+        assert_eq!(
+            association.destination,
+            first_destination.local_addr().unwrap()
+        );
+        assert_eq!(associations.entries.lock().await.len(), 1);
         shutdown_sender.send(true).unwrap();
+        associations.shutdown().await;
+    }
 
-        assert_eq!(recorder.count_reason("association_created"), 1);
-        assert_eq!(recorder.count_reason("association_replaced"), 1);
-        assert_eq!(recorder.count_reason("idle_timeout"), 1);
-        assert!(recorder.has_fields(&[
-            "protocol",
-            "synthetic_source",
-            "synthetic_destination",
-            "original_destination",
-            "association_age_ms",
-        ]));
+    #[tokio::test]
+    async fn outbound_udp_activity_extends_the_association_lease() {
+        let destination = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let proxy_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let (shutdown_sender, shutdown) = watch::channel(false);
+        let associations = UdpAssociations::new(
+            proxy_socket.clone(),
+            Arc::new(MockClient {
+                destination: destination.local_addr().unwrap(),
+                protocol: UDP_PROTOCOL,
+            }),
+            Duration::from_millis(50),
+            shutdown,
+        );
+        let client_address: SocketAddr = "127.0.0.1:42001".parse().unwrap();
+        let tuple = Tuple {
+            source: client_address,
+            destination: proxy_socket.local_addr().unwrap(),
+            protocol: UDP_PROTOCOL,
+        };
+
+        associations.forward(client_address, b"one").await.unwrap();
+        time::sleep(Duration::from_millis(35)).await;
+        associations.forward(client_address, b"two").await.unwrap();
+        time::sleep(Duration::from_millis(35)).await;
+        assert!(associations.entries.lock().await.contains_key(&tuple));
+
+        time::timeout(Duration::from_millis(250), async {
+            loop {
+                if !associations.entries.lock().await.contains_key(&tuple) {
+                    return;
+                }
+                time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("association should expire after outbound activity stops");
+        shutdown_sender.send(true).unwrap();
+        associations.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn association_shutdown_waits_for_relay_socket_cleanup() {
+        let destination = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let proxy_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let (_shutdown_sender, shutdown) = watch::channel(false);
+        let associations = UdpAssociations::new(
+            proxy_socket,
+            Arc::new(MockClient {
+                destination: destination.local_addr().unwrap(),
+                protocol: UDP_PROTOCOL,
+            }),
+            Duration::from_secs(5),
+            shutdown,
+        );
+        let client_address: SocketAddr = "127.0.0.1:42002".parse().unwrap();
+        associations
+            .forward(client_address, b"request")
+            .await
+            .unwrap();
+        let association = associations
+            .entries
+            .lock()
+            .await
+            .values()
+            .next()
+            .unwrap()
+            .clone();
+
+        associations.shutdown().await;
+        assert!(associations.entries.lock().await.is_empty());
+        assert!(*association.relay_done.borrow());
+    }
+
+    #[tokio::test]
+    async fn maintenance_retry_backoff_controls_the_next_scan() {
+        let client = Arc::new(RetryClient::default());
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let (shutdown_sender, shutdown) = watch::channel(false);
+        let associations = Arc::new(UdpAssociations::new(
+            socket,
+            client.clone(),
+            Duration::from_millis(300),
+            shutdown_sender.subscribe(),
+        ));
+        let maintenance = tokio::spawn(run_maintenance(
+            client.clone(),
+            associations,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            1,
+            shutdown,
+        ));
+
+        time::timeout(Duration::from_millis(200), async {
+            while client.enumerate_calls.load(Ordering::SeqCst) < 2 {
+                time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("retry backoff should run before the fixed cleanup interval");
+        shutdown_sender.send(true).unwrap();
+        maintenance.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn maintenance_shutdown_cancels_a_hanging_control_operation() {
+        let client = Arc::new(HangingClient);
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let (shutdown_sender, shutdown) = watch::channel(false);
+        let associations = Arc::new(UdpAssociations::new(
+            socket,
+            client.clone(),
+            Duration::from_secs(1),
+            shutdown_sender.subscribe(),
+        ));
+        let maintenance = tokio::spawn(run_maintenance(
+            client,
+            associations,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            1,
+            shutdown,
+        ));
+
+        tokio::task::yield_now().await;
+        shutdown_sender.send(true).unwrap();
+        time::timeout(Duration::from_millis(100), maintenance)
+            .await
+            .expect("shutdown cancels the pending maintenance RPC")
+            .unwrap();
     }
 
     #[test]

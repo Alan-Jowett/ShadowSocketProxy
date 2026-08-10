@@ -32,33 +32,33 @@ OpenSSL tests require a build with PSK support.
 | TC-013 | REQ-004 | Decode unknown ABI version | Explicit ABI mismatch; entry is not interpreted |
 | TC-014 | REQ-004 | Decode malformed length/address/state | Explicit malformed-entry result and status/log counter |
 | TC-015 | REQ-004 | TCP state fixture covers SYN, SYN/ACK, ACK, FIN, RST | Each state is represented and survives map round-trip |
-| TC-016 | REQ-005 | Active entry inside TTL | Entry retained |
-| TC-017 | REQ-005 | Idle entry beyond TTL | Entry deleted and counted |
-| TC-018 | REQ-005 | Future timestamp/clock regression | Entry retained and anomaly surfaced |
-| TC-019 | REQ-005 | Delete failure for one entry | Failure counted/logged; other candidates still processed |
-| TC-020 | REQ-005 | Scan exceeds batch size | Cycle stops at configured bound and next cycle can continue |
-| TC-021 | REQ-005 | Re-run cleanup after deletion | No duplicate success or inconsistent state |
+| TC-019 | REQ-005 | Retired control-service maintenance | No autonomous cleanup worker or maintenance policy remains in the service |
+| TC-020 | REQ-006 | Enumerate typed flows | Bounded opaque-cursor pages return identity, generation, tuples, timestamps, and TCP lifecycle masks |
+| TC-021 | REQ-006 | Generation-safe delete | Complete, absent, stale-generation, and partial outcomes preserve newer flow indexes |
 | TC-022 | REQ-006 | Valid TLS-PSK client | Authenticated RPC succeeds |
 | TC-023 | REQ-006 | Wrong PSK identity/secret | Request rejected; no service operation occurs |
 | TC-024 | REQ-006 | Plaintext or unauthenticated client | Connection/RPC rejected |
 | TC-025 | REQ-006 | Unsupported TLS-PSK backend configuration | Startup fails and readiness is false |
 | TC-026 | REQ-007 | Valid multi-field config update | One revision publishes all fields atomically |
 | TC-027 | REQ-007 | Zero, overflow, contradictory, or oversized values | Update rejected; prior revision remains |
-| TC-028 | REQ-007 | Concurrent maintenance and config update | Each maintenance cycle observes one complete revision |
 | TC-029 | REQ-007 | Log-capacity reduction | New bounded capacity applies without unbounded allocation |
 | TC-030 | REQ-008 | Pull records after valid cursor | Ordered records and next cursor returned |
 | TC-031 | REQ-008 | Pull with cursor at current tail | Empty result, not an error |
 | TC-032 | REQ-008 | Pull before oldest retained record | Explicit cursor-expired status |
 | TC-033 | REQ-008 | Concurrent append and pull | No duplicate or reordered sequence values |
-| TC-034 | REQ-002/005 | Shutdown with active maintenance and attachments | Maintenance cancels; detach is attempted; failures are reported |
 | TC-035 | REQ-003/005 | Mapping disappears between list and cleanup | No wrong tuple returned; delete is treated as already absent or explicit race |
 | TC-036 | REQ-006/007 | Unauthorized config/attach while authorized read is active | Unauthorized mutation is rejected and authorized read remains isolated |
+| TC-037 | REQ-005 | Packet/delete quiescence and guard failure | In-flight packet updates drain before observation verification; guard expiry and host commit atomically select abort or cleanup, and post-insertion failures remove or expire the guard without blackholing a later packet. |
+| TC-038 | REQ-005 | Replaced generation and release repair | State-first cleanup does not remove an index or release capacity for a newer generation sharing the tuple; a release journal retries failed publication without double release. |
+| TC-039 | REQ-007 | Concurrent attach and set-config | Serialization leaves the BPF map's runtime fields equal to the final published snapshot. |
+| TC-040 | REQ-007 | Unrepresentable duration | A duration that cannot fit the fixed-width nanosecond ABI is rejected before publication or map write. |
 
 ## 3. Property and Invariant Checks
 
 - Tuple conversion is bijective for all IPv4/IPv6 address encodings used by the
   ABI.
-- Maintenance never deletes an entry with `now - last_seen < idle_ttl`.
+- The control-service never autonomously deletes a flow; host-proxy owns cleanup
+  policy and uses generation-safe typed deletion.
 - Configuration revisions are strictly increasing and snapshots are internally
   consistent.
 - Attachment ownership prevents detaching another service instance's links.

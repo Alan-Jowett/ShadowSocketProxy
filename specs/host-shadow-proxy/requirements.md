@@ -32,10 +32,12 @@
 ### CHG-011 — UDP forwarding and response relay
 
 - **Before:** Redirected UDP datagrams are not handled by a host proxy.
-- **After:** For each received UDP datagram, query the original tuple, send it
-  to the original destination, and relay response datagrams to the originating
-  client. Maintain per-flow associations with an idle timeout; QUIC remains
-  UDP treatment without TCP-state assumptions.
+- **After:** The first received UDP datagram for an active association queries
+  the original tuple, sends it to the original destination, and relays response
+  datagrams to the originating client. Subsequent datagrams reuse that
+  association until expiry, invalidation, or the controlled
+  destination-specific retry path. Maintain per-flow associations with an idle
+  timeout; QUIC remains UDP treatment without TCP-state assumptions.
 - **Traceability:** `USER-REQUEST: For UDP forward the packet to original
   address.` User clarification: `Forward requests and relay responses
   (Recommended)` and `Yes, bounded per-flow associations with idle timeout
@@ -108,10 +110,12 @@ BPF tuple-rewrite semantics.
 
 ### REQ-010 — Exact original-destination lookup
 
-For every accepted TCP connection and received UDP datagram, the proxy MUST
-construct the observed synthetic 5-tuple and call the authenticated
-`GetMapping` RPC. The returned original tuple MUST be associated with the
-same synthetic tuple and address family.
+For every accepted TCP connection and the first datagram of each active UDP
+association, the proxy MUST construct the observed synthetic 5-tuple and call
+the authenticated `GetMapping` RPC. Subsequent UDP datagrams MUST reuse only
+the association for that exact tuple until expiry, invalidation, or the
+controlled destination-specific retry path. The returned original tuple MUST
+be associated with the same synthetic tuple and address family.
 
 **Acceptance criteria**
 
@@ -149,6 +153,8 @@ being sent to an incorrect destination.
 For UDP, the proxy MUST send each mapped datagram to the original destination
 and relay responses to the originating client using a per-flow association.
 Associations MUST expire after the configured idle timeout.
+Successful outbound sends as well as received replies count as association
+activity, so continuous one-way traffic does not expire the association.
 
 **Acceptance criteria**
 
@@ -158,6 +164,7 @@ Associations MUST expire after the configured idle timeout.
 - Missing mappings drop the datagram without a direct-send fallback.
 - Idle associations are removed and no response is sent to an expired
   association.
+- Outbound and inbound successful traffic both extend an association lease.
 - Send/receive failures are surfaced through bounded logs.
 
 **Invariant impact:** Maintains client-flow ownership and prevents cross-flow
@@ -211,6 +218,8 @@ listener/flow resources during shutdown.
   forwarding.
 - TCP sessions and UDP associations terminate on shutdown.
 - No task retains a socket after shutdown completes.
+- BPF detachment occurs only after the forwarding owner has joined TCP bridges
+  and UDP relays.
 
 **Invariant impact:** Prevents unbounded lifetime leaks while preserving the
 selected resource policy.

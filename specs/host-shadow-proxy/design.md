@@ -43,10 +43,12 @@ ports       = observed source/destination ports
 For UDP, derive the same tuple from `recv_from()`'s peer address and the
 bound local address, with protocol UDP. Address family is preserved.
 
-Each lookup sends an exact `GetMapping` request. Returned mappings are
-validated for the same synthetic tuple, matching protocol and family, and a
-non-unspecified original destination. A mapping is never cached across a
-different synthetic key.
+TCP and the first datagram of an active UDP association send an exact
+`GetMapping` request. Returned mappings are validated for the same synthetic
+tuple, matching protocol and family, and a non-unspecified original
+destination. A UDP mapping is never cached across a different synthetic key;
+an existing association is reused until expiry, explicit invalidation, or the
+controlled destination-specific retry path.
 
 ### D-013 — Windows TLS-PSK gRPC client
 
@@ -77,12 +79,14 @@ UDP tuple. Each entry stores the client address, an outbound UDP socket
 connected to the mapped original destination, last activity, and cancellation
 state.
 
-The receive loop performs an authenticated mapping lookup for every client
-datagram. A per-association task relays responses only to that entry's client.
-An existing outbound association is reused only when the fresh lookup returns
-the same original destination; a changed mapping creates or replaces only the
-affected association. An idle reaper removes entries after the configured
-timeout. A missing mapping drops the datagram.
+The receive loop performs an authenticated mapping lookup only while creating
+or replacing an association. A per-association task relays responses only to
+that entry's client. An existing outbound association is reused for its exact
+synthetic tuple without another lookup; expiry, host flow invalidation, or a
+controlled destination-specific failure permits re-resolution. Both successful
+outbound sends and successful replies update the association activity time.
+An idle reaper removes entries after the configured timeout. A missing mapping
+drops the datagram.
 
 UDP forwarding failures are logged through a one-second rate limiter so a
 persistent control-plane or network failure cannot flood the host logs.
@@ -111,6 +115,11 @@ wildcard. This is required because UDP tuple lookup needs the actual local
 destination address; Tokio's basic `recv_from` API does not expose the
 destination address selected by the host for wildcard receives. The supported
 runtime target is Windows.
+
+At Ctrl-C, the runtime signals forwarding shutdown, joins TCP bridge,
+maintenance, and UDP relay work, and only then issues the bounded detach RPC.
+All control RPCs carry a tonic deadline and are locally bounded so shutdown
+cannot wait indefinitely on a hung control channel.
 
 ## 3. Invariants
 

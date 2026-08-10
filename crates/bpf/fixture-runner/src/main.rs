@@ -48,6 +48,8 @@ mod linux {
     const TCP_ACK_BIT: u32 = 1 << 2;
     /// State bit set after observing FIN.
     const TCP_FIN_BIT: u32 = 1 << 3;
+    /// State bit set after observing a reset.
+    const TCP_RST_BIT: u32 = 1 << 4;
     /// Wire TCP FIN flag.
     const TCP_FLAG_FIN: u8 = 0x01;
     /// Wire TCP SYN flag.
@@ -90,6 +92,8 @@ mod linux {
     const ETH_P_IPV6: u16 = 0x86dd;
     /// Expected classifier return value for pass-through packets.
     const TC_ACT_OK: u32 = 0;
+    /// Expected classifier return value when deletion has committed.
+    const TC_ACT_SHOT: u32 = 2;
     /// Upper bound used when validating fixture selection.
     const MAX_FIXTURES: usize = 64;
     /// ELF program name for ingress rewriting.
@@ -106,6 +110,16 @@ mod linux {
     const COUNTERS_MAP_NAME: &str = "ssp_tc_counters_v1";
     /// ELF map tracking active-flow slot usage.
     const ACTIVE_FLOWS_MAP_NAME: &str = "ssp_tc_active_flows_v1";
+    /// ELF queue carrying generation-addressed capacity releases.
+    const ACTIVE_FLOW_RELEASES_MAP_NAME: &str = "ssp_tc_active_flow_releases_v1";
+    /// ELF journal making capacity release publication retryable.
+    const ACTIVE_FLOW_RELEASE_PENDING_MAP_NAME: &str = "ssp_tc_active_flow_release_pending_v1";
+    /// ELF map tracking packet updates participating in deletion quiescence.
+    const FLOW_PACKET_INFLIGHT_MAP_NAME: &str = "ssp_flow_packet_inflight_v1";
+    /// ELF map tracking expiring host deletion guards.
+    const FLOW_DELETE_GUARD_MAP_NAME: &str = "ssp_flow_delete_guard_v1";
+    /// ELF map arbitrating guard expiration against host deletion commit.
+    const FLOW_DELETE_OUTCOME_MAP_NAME: &str = "ssp_flow_delete_outcome_v1";
 
     /// Maximum packet bytes stored by a fixture buffer.
     const PACKET_CAPACITY: usize = 256;
@@ -136,6 +150,8 @@ mod linux {
     type RuntimeConfigValue = [u8; RUNTIME_CONFIG_VALUE_LEN];
     /// Fixed-width native-endian counter slot.
     type CounterWord = [u8; WORD_LEN];
+    /// Fixed-width native-endian deletion outcome value.
+    type DeleteOutcomeWord = [u8; 4];
 
     #[derive(Clone, Copy)]
     /// Address family and its 16-byte ABI representation.
@@ -216,6 +232,14 @@ mod linux {
             name: "rst",
             run: run_rst_fixture,
         },
+        FixtureDef {
+            name: "deletion-commit",
+            run: run_deletion_commit_fixture,
+        },
+        FixtureDef {
+            name: "deletion-abort",
+            run: run_deletion_abort_fixture,
+        },
     ];
 
     /// Parses fixture selection, configures memlock, runs requested fixtures,
@@ -292,6 +316,11 @@ mod linux {
                 RUNTIME_CONFIG_MAP_NAME,
                 COUNTERS_MAP_NAME,
                 ACTIVE_FLOWS_MAP_NAME,
+                ACTIVE_FLOW_RELEASES_MAP_NAME,
+                ACTIVE_FLOW_RELEASE_PENDING_MAP_NAME,
+                FLOW_PACKET_INFLIGHT_MAP_NAME,
+                FLOW_DELETE_GUARD_MAP_NAME,
+                FLOW_DELETE_OUTCOME_MAP_NAME,
             ] {
                 if bpf.map_mut(map_name).is_none() {
                     eprintln!("required map {map_name} is missing");
@@ -363,6 +392,42 @@ mod linux {
             })
         }
 
+        /// Writes a host deletion guard deadline for the selected generation.
+        fn insert_delete_guard(&mut self, key: &FlowStateKey, deadline_ns: u64) -> RunnerResult {
+            self.with_delete_guard_map(|map| {
+                map.insert(key, deadline_ns.to_le_bytes(), 0)
+                    .map_err(|error| {
+                        eprintln!("failed to seed deletion guard: {error}");
+                    })
+            })
+        }
+
+        /// Writes a host deletion outcome for the selected generation.
+        fn insert_delete_outcome(&mut self, key: &FlowStateKey, outcome: u32) -> RunnerResult {
+            self.with_delete_outcome_map(|map| {
+                map.insert(key, outcome.to_ne_bytes(), 0).map_err(|error| {
+                    eprintln!("failed to seed deletion outcome: {error}");
+                })
+            })
+        }
+
+        /// Reads a host deletion guard if it remains installed.
+        fn lookup_delete_guard(&mut self, key: &FlowStateKey) -> RunnerResult<Option<CounterWord>> {
+            self.with_delete_guard_map(|map| {
+                optional_lookup(map, key, "failed to read deletion guard")
+            })
+        }
+
+        /// Reads a host deletion outcome if one has been recorded.
+        fn lookup_delete_outcome(
+            &mut self,
+            key: &FlowStateKey,
+        ) -> RunnerResult<Option<DeleteOutcomeWord>> {
+            self.with_delete_outcome_map(|map| {
+                optional_lookup(map, key, "failed to read deletion outcome")
+            })
+        }
+
         /// Executes a classifier against one packet and returns its TC action.
         fn run_program(
             &mut self,
@@ -370,6 +435,18 @@ mod linux {
             program_name: &str,
             input: &PacketBuffer,
             expected: &PacketBuffer,
+        ) -> RunnerResult {
+            self.run_program_with_action(label, program_name, input, expected, TC_ACT_OK)
+        }
+
+        /// Executes a classifier and checks its packet bytes and exact action.
+        fn run_program_with_action(
+            &mut self,
+            label: &str,
+            program_name: &str,
+            input: &PacketBuffer,
+            expected: &PacketBuffer,
+            expected_action: u32,
         ) -> RunnerResult {
             let mut output = [0u8; PACKET_CAPACITY];
             let result = {
@@ -403,10 +480,10 @@ mod linux {
                 }
             };
 
-            if result.return_value != TC_ACT_OK {
+            if result.return_value != expected_action {
                 eprintln!(
-                    "{label} returned unexpected TC action {}",
-                    result.return_value
+                    "{label} returned unexpected TC action {}, expected {expected_action}",
+                    result.return_value,
                 );
                 return Err(());
             }
@@ -475,6 +552,46 @@ mod linux {
             };
             let mut map = HashMap::try_from(map).map_err(|error| {
                 eprintln!("failed to open flow-index map: {error}");
+            })?;
+            operation(&mut map)
+        }
+
+        /// Borrows the deletion-guard map for one fallible closure.
+        fn with_delete_guard_map<T>(
+            &mut self,
+            operation: impl FnOnce(
+                &mut HashMap<&mut MapData, FlowStateKey, CounterWord>,
+            ) -> RunnerResult<T>,
+        ) -> RunnerResult<T> {
+            let map = match self.bpf.map_mut(FLOW_DELETE_GUARD_MAP_NAME) {
+                Some(map) => map,
+                None => {
+                    eprintln!("required map {FLOW_DELETE_GUARD_MAP_NAME} is missing");
+                    return Err(());
+                }
+            };
+            let mut map = HashMap::try_from(map).map_err(|error| {
+                eprintln!("failed to open deletion-guard map: {error}");
+            })?;
+            operation(&mut map)
+        }
+
+        /// Borrows the deletion-outcome map for one fallible closure.
+        fn with_delete_outcome_map<T>(
+            &mut self,
+            operation: impl FnOnce(
+                &mut HashMap<&mut MapData, FlowStateKey, DeleteOutcomeWord>,
+            ) -> RunnerResult<T>,
+        ) -> RunnerResult<T> {
+            let map = match self.bpf.map_mut(FLOW_DELETE_OUTCOME_MAP_NAME) {
+                Some(map) => map,
+                None => {
+                    eprintln!("required map {FLOW_DELETE_OUTCOME_MAP_NAME} is missing");
+                    return Err(());
+                }
+            };
+            let mut map = HashMap::try_from(map).map_err(|error| {
+                eprintln!("failed to open deletion-outcome map: {error}");
             })?;
             operation(&mut map)
         }
@@ -596,7 +713,7 @@ mod linux {
             .map(|value| value.to_string_lossy())
             .unwrap_or_else(|| "ssp-bpf-fixture-runner".into());
         eprintln!(
-            "usage: {} <bpf-elf> --fixture <name> [--fixture <name> ...]\nfixtures: target-miss, flow-create, forward-rewrite, reverse-rewrite,\n          control-bypass, fin-ack-teardown, rst",
+            "usage: {} <bpf-elf> --fixture <name> [--fixture <name> ...]\nfixtures: target-miss, flow-create, forward-rewrite, reverse-rewrite,\n          control-bypass, fin-ack-teardown, rst, deletion-commit,\n          deletion-abort",
             program
         );
     }
@@ -1653,7 +1770,7 @@ mod linux {
         )
     }
 
-    /// Verifies a TCP RST marks the flow removable immediately.
+    /// Verifies a TCP RST remains available for host-owned lifecycle cleanup.
     fn run_rst_fixture(elf_path: &Path) -> RunnerResult {
         let mut config = init_runtime_config();
         let client = parse_ip("192.0.2.10")?;
@@ -1721,7 +1838,179 @@ mod linux {
             &egress_expected,
         )?;
         assert_counter_values(&mut fixture, 0, 0, 0)?;
-        assert_zero_counts(&mut fixture)
+        expect_equal_u64(
+            "rst flow-index count",
+            fixture.count_flow_index_entries()? as u64,
+            3,
+        )?;
+        expect_equal_u64(
+            "rst flow-state count",
+            fixture.count_flow_state_entries()? as u64,
+            1,
+        )?;
+        expect_equal_u64("rst active-flow count", fixture.read_active_flows()?, 1)?;
+        let original_key = make_tuple_key(&client, &original_destination, PROTOCOL_TCP, 40005, 443);
+        let state_key = make_flow_state_key(tuple_hash(&original_key), 1);
+        let state = fixture.lookup_flow_state(&state_key)?;
+        expect_true("rst flow state remains for host cleanup", state.is_some())?;
+        expect_equal_u64(
+            "rst flow state flags",
+            read_u32_ne(&state.unwrap(), 132) as u64,
+            (TCP_SYN_BIT | TCP_RST_BIT) as u64,
+        )
+    }
+
+    /// Verifies a committed host deletion blocks a packet before state mutation.
+    fn run_deletion_commit_fixture(elf_path: &Path) -> RunnerResult {
+        let mut config = init_runtime_config();
+        let client = parse_ip("192.0.2.10")?;
+        let original_destination = parse_ip("198.51.100.20")?;
+        let target = parse_ip("203.0.113.30")?;
+        set_ipv4_target(&mut config, &target);
+
+        let mut fixture = create_fixture(elf_path, &config)?;
+        let mut syn = PacketBuffer::default();
+        let mut syn_expected = PacketBuffer::default();
+        build_ipv4_tcp_packet(
+            &mut syn,
+            &client,
+            &original_destination,
+            40006,
+            443,
+            TCP_FLAG_SYN,
+            100,
+            0,
+        );
+        build_ipv4_tcp_packet(
+            &mut syn_expected,
+            &client,
+            &target,
+            40006,
+            TARGET_PORT_V4,
+            TCP_FLAG_SYN,
+            100,
+            0,
+        );
+        fixture.run_program(
+            "deletion-commit ingress syn",
+            INGRESS_PROGRAM_NAME,
+            &syn,
+            &syn_expected,
+        )?;
+
+        let original_key = make_tuple_key(&client, &original_destination, PROTOCOL_TCP, 40006, 443);
+        let state_key = make_flow_state_key(tuple_hash(&original_key), 1);
+        fixture.insert_delete_outcome(&state_key, 2)?;
+        let mut ack = PacketBuffer::default();
+        build_ipv4_tcp_packet(
+            &mut ack,
+            &client,
+            &original_destination,
+            40006,
+            443,
+            TCP_FLAG_ACK,
+            101,
+            1,
+        );
+        fixture.run_program_with_action(
+            "deletion-commit ingress ack",
+            INGRESS_PROGRAM_NAME,
+            &ack,
+            &ack,
+            TC_ACT_SHOT,
+        )?;
+        let state = fixture.lookup_flow_state(&state_key)?;
+        expect_true(
+            "committed deletion keeps state until host removal",
+            state.is_some(),
+        )?;
+        expect_equal_u64(
+            "committed deletion blocks tcp state update",
+            read_u32_ne(&state.unwrap(), 132) as u64,
+            TCP_SYN_BIT as u64,
+        )
+    }
+
+    /// Verifies guard expiration wins the outcome race and allows packet progress.
+    fn run_deletion_abort_fixture(elf_path: &Path) -> RunnerResult {
+        let mut config = init_runtime_config();
+        let client = parse_ip("192.0.2.10")?;
+        let original_destination = parse_ip("198.51.100.20")?;
+        let target = parse_ip("203.0.113.30")?;
+        set_ipv4_target(&mut config, &target);
+
+        let mut fixture = create_fixture(elf_path, &config)?;
+        let mut syn = PacketBuffer::default();
+        let mut syn_expected = PacketBuffer::default();
+        build_ipv4_tcp_packet(
+            &mut syn,
+            &client,
+            &original_destination,
+            40007,
+            443,
+            TCP_FLAG_SYN,
+            100,
+            0,
+        );
+        build_ipv4_tcp_packet(
+            &mut syn_expected,
+            &client,
+            &target,
+            40007,
+            TARGET_PORT_V4,
+            TCP_FLAG_SYN,
+            100,
+            0,
+        );
+        fixture.run_program(
+            "deletion-abort ingress syn",
+            INGRESS_PROGRAM_NAME,
+            &syn,
+            &syn_expected,
+        )?;
+
+        let original_key = make_tuple_key(&client, &original_destination, PROTOCOL_TCP, 40007, 443);
+        let state_key = make_flow_state_key(tuple_hash(&original_key), 1);
+        fixture.insert_delete_guard(&state_key, 0)?;
+        let mut ack = PacketBuffer::default();
+        let mut ack_expected = PacketBuffer::default();
+        build_ipv4_tcp_packet(
+            &mut ack,
+            &client,
+            &original_destination,
+            40007,
+            443,
+            TCP_FLAG_ACK,
+            101,
+            1,
+        );
+        build_ipv4_tcp_packet(
+            &mut ack_expected,
+            &client,
+            &target,
+            40007,
+            TARGET_PORT_V4,
+            TCP_FLAG_ACK,
+            101,
+            1,
+        );
+        fixture.run_program(
+            "deletion-abort ingress ack",
+            INGRESS_PROGRAM_NAME,
+            &ack,
+            &ack_expected,
+        )?;
+        expect_true(
+            "expired guard is removed",
+            fixture.lookup_delete_guard(&state_key)?.is_none(),
+        )?;
+        let outcome = fixture.lookup_delete_outcome(&state_key)?;
+        expect_true("expired guard records aborted outcome", outcome.is_some())?;
+        expect_equal_u64(
+            "expired guard abort value",
+            u32::from_ne_bytes(outcome.unwrap()) as u64,
+            1,
+        )
     }
 
     /// Resolves a stable fixture name from the registry.

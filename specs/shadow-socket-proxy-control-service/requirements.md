@@ -52,16 +52,12 @@
 - **Traceability:** User clarification: the BPF program updates last-seen for
   each tuple and tracks explicit TCP state. User selection: TCP, UDP, and QUIC.
 
-### CHG-005 — Periodic stale-flow maintenance
+### CHG-005 — Retired control-service maintenance
 
-- **Before:** No user-mode process removes stale flow mappings.
-- **After:** A periodic maintenance task deletes mappings that have been idle
-  longer than the configured interval/TTL. The task reports deletion and
-  decode errors, continues processing independent entries, and never treats a
-  failed deletion as successful cleanup.
-- **Traceability:** `USER-REQUEST: Perform periodic maintenance of the BPF
-  hash-table (delete stale entries etc).` User clarification: user mode cleans
-  connections idle longer than a configured interval.
+The original control-service-owned maintenance worker and its policy were
+retired by issue #12. Host-proxy now owns maintenance scheduling, policy,
+retry, and flow deletion decisions; the control-service exposes typed flow
+enumeration and deletion adapters only.
 
 ### CHG-006 — Host control and runtime configuration API
 
@@ -69,9 +65,10 @@
   configuration exists.
 - **After:** A TCP gRPC endpoint secured with the requested TLS shared-PSK
   policy exposes attach, detach, mapping, health/status, and configuration
-  operations. Cleanup interval, idle TTL, map scan batch size, and bounded log
-  capacity can be updated through authenticated configuration RPCs and are
-  applied atomically after validation.
+  operations. Dataplane idle TTL, TCP terminal grace, active-flow capacity,
+  and bounded log capacity can be updated through authenticated configuration
+  RPCs and are applied atomically after validation. Host maintenance policy is
+  configured only by host-proxy.
 - **Traceability:** User clarifications: host sends attach/detach commands;
   TCP endpoint secured with TLS shared PSK; all operational values are exposed
   through gRPC and are runtime-configurable.
@@ -102,7 +99,7 @@ integration contract.
 - The placeholder ELF/map ABI is versioned and documented.
 
 **Invariant impact:** Preserves separation between packet processing in BPF and
-control/maintenance in user mode.
+control in user mode.
 
 ### REQ-002 — TC attachment lifecycle
 
@@ -154,22 +151,17 @@ applying TCP-only state assumptions.
 **Invariant impact:** Makes stale cleanup and tuple restoration deterministic
 across BPF and user-mode versions.
 
-### REQ-005 — Stale-entry maintenance
+### REQ-005 — Retired control-service maintenance
 
-The service MUST periodically scan the BPF hash table and delete entries whose
-last-seen activity is older than the configured idle TTL. Cleanup MUST be
-bounded by the configured scan batch size, continue after independent entry
-errors, and expose counts/errors through service status and logs.
-
-**Acceptance criteria**
-
-- Idle entries are deleted; recently active entries are retained.
-- Repeated maintenance is idempotent.
-- Read, decode, clock, and delete failures are not silently converted to
-  successful cleanup.
-
-**Invariant impact:** Prevents stale flow-map state from redirecting new or
-  unrelated traffic while preserving active mappings.
+This former requirement is retired by issue #12. Host-proxy owns stale-flow
+policy and cleanup; the control-service provides typed, generation-safe flow
+enumeration and deletion operations. The adapter MUST freeze a requested flow
+generation, wait for packet-side in-flight updates to quiesce, atomically
+commit against guard expiry, and verify the enumerated observation before
+deletion. It MUST remove indexes only while they still encode that generation,
+persist capacity release before deleting canonical state, and publish that
+generation-addressed release idempotently until BPF consumes it once. It MUST
+remove or safely expire every deletion guard and outcome on all outcomes.
 
 ### REQ-006 — Authenticated host control
 
@@ -190,16 +182,20 @@ and report incompatibility if it cannot implement the requested PSK policy.
 
 ### REQ-007 — Atomic runtime configuration
 
-The service MUST expose authenticated get/set configuration RPCs for cleanup
-interval, idle TTL, map scan batch size, and bounded log capacity. Invalid
+The service MUST expose authenticated get/set configuration RPCs for dataplane
+idle TTL, TCP terminal grace, active-flow capacity, listener/target settings,
+and bounded log capacity. Host maintenance interval, scan batch size, and
+retry policy are host-proxy settings, not control-service settings. Invalid
 values MUST be rejected without partially applying the update.
 
 **Acceptance criteria**
 
 - A valid update becomes visible as one coherent configuration revision.
 - Invalid, zero, overflowing, or internally contradictory values are rejected.
-- Concurrent maintenance observes either the old or new complete configuration,
-  never a mixture.
+- Concurrent dataplane configuration writes observe either the old or new
+  complete revision, never a mixture.
+- Concurrent attach and configuration transactions leave the BPF runtime map
+  consistent with the revision published to readers.
 
 **Invariant impact:** Preserves predictable maintenance and resource behavior
 under concurrent host control.

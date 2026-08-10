@@ -36,6 +36,18 @@ struct Args {
     #[arg(long, default_value_t = 60)]
     /// Seconds of UDP inactivity before an association is discarded.
     udp_idle_timeout_secs: u64,
+    #[arg(long, default_value_t = 10)]
+    /// Seconds between host-owned flow maintenance passes.
+    cleanup_interval_secs: u64,
+    #[arg(long, default_value_t = 60)]
+    /// Seconds before an incomplete flow is considered idle.
+    idle_ttl_secs: u64,
+    #[arg(long, default_value_t = 30)]
+    /// Seconds of grace after a completed TCP close.
+    tcp_terminal_grace_secs: u64,
+    #[arg(long, default_value_t = 256)]
+    /// Maximum number of flows requested in one maintenance page.
+    flow_scan_batch: u32,
 }
 
 /// Selects the inline secret or reads and trims the configured secret file.
@@ -67,6 +79,10 @@ async fn main() {
         psk_identity: args.psk_identity.clone(),
         psk_secret: secret.clone(),
         udp_idle_timeout: Duration::from_secs(args.udp_idle_timeout_secs),
+        cleanup_interval: Duration::from_secs(args.cleanup_interval_secs),
+        idle_ttl: Duration::from_secs(args.idle_ttl_secs),
+        tcp_terminal_grace: Duration::from_secs(args.tcp_terminal_grace_secs),
+        flow_scan_batch: args.flow_scan_batch,
     };
     if let Err(error) = config.validate() {
         eprintln!("invalid configuration: {error}");
@@ -86,7 +102,8 @@ async fn main() {
         "host proxy: connected to control service at {}",
         args.control_endpoint
     );
-    let proxy = Proxy::new(config, Arc::new(client.clone())).expect("validated configuration");
+    let proxy =
+        Proxy::new(config.clone(), Arc::new(client.clone())).expect("validated configuration");
     let (tcp_listener, udp_socket) = match proxy.bind().await {
         Ok(listeners) => listeners,
         Err(error) => {
@@ -114,20 +131,32 @@ async fn main() {
     );
     let control = client.clone();
     let (shutdown, receiver) = watch::channel(false);
+    let mut proxy_task = tokio::spawn(proxy.run_bound(tcp_listener, udp_socket, receiver));
     let result = tokio::select! {
-        result = proxy.run_bound(tcp_listener, udp_socket, receiver) => {
-            result
-        }
+        result = &mut proxy_task => result
+            .map_err(|error| shadow_socket_proxy_host::ProxyError::Control(error.to_string()))
+            .and_then(|result| result),
         result = tokio::signal::ctrl_c() => {
-            if let Err(error) = result {
-                Err(shadow_socket_proxy_host::ProxyError::Io(error))
-            } else {
-                let _ = shutdown.send(true);
-                Ok(())
+            match result {
+                Err(error) => Err(shadow_socket_proxy_host::ProxyError::Io(error)),
+                Ok(()) => {
+                    let _ = shutdown.send(true);
+                    proxy_task
+                        .await
+                        .map_err(|error| shadow_socket_proxy_host::ProxyError::Control(error.to_string()))
+                        .and_then(|result| result)
+                }
             }
         }
     };
-    if let Err(error) = control.detach(&args.interface).await {
+    if let Err(error) = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        control.detach(&args.interface),
+    )
+    .await
+    .map_err(|_| shadow_socket_proxy_host::ProxyError::Control("control detach timed out".into()))
+    .and_then(|result| result)
+    {
         tracing::error!(interface = %args.interface, error = %error, "control-service detach failed");
         eprintln!("control service detachment failed: {error}");
         std::process::exit(1);
