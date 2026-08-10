@@ -543,6 +543,8 @@ pub const FLOW_INDEX_MAP_NAME_V1: &str = "ssp_flow_index_v1";
 pub const FLOW_STATE_MAP_NAME_V1: &str = "ssp_flow_state_v1";
 /// Name of the active-flow reservation counter map.
 pub const ACTIVE_FLOWS_MAP_NAME_V1: &str = "ssp_tc_active_flows_v1";
+/// Name of the atomic active-flow release queue.
+pub const ACTIVE_FLOW_RELEASES_MAP_NAME_V1: &str = "ssp_tc_active_flow_releases_v1";
 /// Name of the persisted flow-generation allocator map.
 pub const FLOW_GENERATION_MAP_NAME_V1: &str = "ssp_flow_generation_v1";
 /// Name of the transient host-deletion guard map.
@@ -696,6 +698,20 @@ impl AyaLinuxTcAdapter {
         operation(&mut map)
     }
 
+    /// Borrows the active-flow release queue.
+    fn with_active_flow_releases<T>(
+        bpf: &mut aya::Ebpf,
+        operation: impl FnOnce(
+            &mut aya::maps::Queue<&mut aya::maps::MapData, [u8; 4]>,
+        ) -> Result<T, BackendError>,
+    ) -> Result<T, BackendError> {
+        let map = bpf
+            .map_mut(ACTIVE_FLOW_RELEASES_MAP_NAME_V1)
+            .ok_or_else(|| Self::operation("map", "active-flow release queue is missing"))?;
+        let mut map = aya::maps::Queue::try_from(map).map_err(Self::map_error)?;
+        operation(&mut map)
+    }
+
     /// Borrows the transient flow-deletion guard map.
     fn with_delete_guard_map<T>(
         bpf: &mut aya::Ebpf,
@@ -801,6 +817,7 @@ impl LinuxTcAdapter for AyaLinuxTcAdapter {
         Self::with_flow_index_map(&mut bpf, |_| Ok(()))?;
         Self::with_state_map(&mut bpf, |_| Ok(()))?;
         Self::with_active_flows_map(&mut bpf, |_| Ok(()))?;
+        Self::with_active_flow_releases(&mut bpf, |_| Ok(()))?;
         if bpf.map_mut(FLOW_GENERATION_MAP_NAME_V1).is_none() {
             return Err(Self::operation(
                 "map",
@@ -1197,14 +1214,8 @@ impl LinuxTcAdapter for AyaLinuxTcAdapter {
             }
         };
         if state_deleted {
-            match Self::with_active_flows_map(&mut state.bpf, |map| {
-                let current = map.get(&0, 0).map_err(Self::map_error)?;
-                let current = u64::from_le_bytes(current);
-                if current != 0 {
-                    map.set(0, (current - 1).to_le_bytes(), 0)
-                        .map_err(Self::map_error)?;
-                }
-                Ok(())
+            match Self::with_active_flow_releases(&mut state.bpf, |map| {
+                map.push(0_u32, 0).map_err(Self::map_error)
             }) {
                 Ok(()) => {}
                 Err(_) => partial = true,

@@ -429,8 +429,8 @@ pub fn decode_flow_index(bytes: &[u8]) -> Result<FlowIndexValue, AbiError> {
         return Err(AbiError::UnsupportedVersion(version));
     }
     Ok(FlowIndexValue {
-        flow_id: u64::from_be_bytes(bytes[4..12].try_into().unwrap()),
-        generation: u32::from_be_bytes(bytes[12..16].try_into().unwrap()),
+        flow_id: u64::from_ne_bytes(bytes[4..12].try_into().unwrap()),
+        generation: u32::from_ne_bytes(bytes[12..16].try_into().unwrap()),
     })
 }
 
@@ -438,8 +438,8 @@ pub fn decode_flow_index(bytes: &[u8]) -> Result<FlowIndexValue, AbiError> {
 pub fn encode_flow_state_key(flow_id: u64, generation: u32) -> [u8; FLOW_STATE_KEY_LEN] {
     let mut output = [0; FLOW_STATE_KEY_LEN];
     output[0..2].copy_from_slice(&MAP_ABI_VERSION.to_be_bytes());
-    output[4..12].copy_from_slice(&flow_id.to_be_bytes());
-    output[12..16].copy_from_slice(&generation.to_be_bytes());
+    output[4..12].copy_from_slice(&flow_id.to_ne_bytes());
+    output[12..16].copy_from_slice(&generation.to_ne_bytes());
     output
 }
 
@@ -456,15 +456,15 @@ pub fn encode_flow_state(state: &FlowState) -> [u8; FLOW_STATE_VALUE_LEN] {
     output[..KEY_LEN].copy_from_slice(&encode_key(&state.original));
     output[KEY_LEN..KEY_LEN * 2].copy_from_slice(&encode_key(&state.target));
     output[KEY_LEN * 2..KEY_LEN * 3].copy_from_slice(&encode_key(&state.reverse));
-    output[120..128].copy_from_slice(&state.last_used_ns.to_be_bytes());
-    output[128..132].copy_from_slice(&state.protocol_flags.to_be_bytes());
-    output[132..136].copy_from_slice(&state.tcp_state_flags.to_be_bytes());
+    output[120..128].copy_from_slice(&state.last_used_ns.to_ne_bytes());
+    output[128..132].copy_from_slice(&state.protocol_flags.to_ne_bytes());
+    output[132..136].copy_from_slice(&state.tcp_state_flags.to_ne_bytes());
     output[136] = state.fin_seen_mask;
     output[137] = state.fin_ack_seen_mask;
     output[138] = state.lifecycle as u8;
-    output[140..148].copy_from_slice(&state.terminal_deadline_ns.to_be_bytes());
-    output[148..156].copy_from_slice(&state.flow_id.to_be_bytes());
-    output[156..160].copy_from_slice(&state.generation.to_be_bytes());
+    output[140..148].copy_from_slice(&state.terminal_deadline_ns.to_ne_bytes());
+    output[148..156].copy_from_slice(&state.flow_id.to_ne_bytes());
+    output[156..160].copy_from_slice(&state.generation.to_ne_bytes());
     output
 }
 
@@ -480,15 +480,15 @@ pub fn decode_flow_state(bytes: &[u8]) -> Result<FlowState, AbiError> {
         original: decode_key(&bytes[..KEY_LEN])?,
         target: decode_key(&bytes[KEY_LEN..KEY_LEN * 2])?,
         reverse: decode_key(&bytes[KEY_LEN * 2..KEY_LEN * 3])?,
-        last_used_ns: u64::from_be_bytes(bytes[120..128].try_into().unwrap()),
-        protocol_flags: u32::from_be_bytes(bytes[128..132].try_into().unwrap()),
-        tcp_state_flags: u32::from_be_bytes(bytes[132..136].try_into().unwrap()),
+        last_used_ns: u64::from_ne_bytes(bytes[120..128].try_into().unwrap()),
+        protocol_flags: u32::from_ne_bytes(bytes[128..132].try_into().unwrap()),
+        tcp_state_flags: u32::from_ne_bytes(bytes[132..136].try_into().unwrap()),
         fin_seen_mask: bytes[136],
         fin_ack_seen_mask: bytes[137],
         lifecycle: FlowLifecycle::try_from(bytes[138])?,
-        terminal_deadline_ns: u64::from_be_bytes(bytes[140..148].try_into().unwrap()),
-        flow_id: u64::from_be_bytes(bytes[148..156].try_into().unwrap()),
-        generation: u32::from_be_bytes(bytes[156..160].try_into().unwrap()),
+        terminal_deadline_ns: u64::from_ne_bytes(bytes[140..148].try_into().unwrap()),
+        flow_id: u64::from_ne_bytes(bytes[148..156].try_into().unwrap()),
+        generation: u32::from_ne_bytes(bytes[156..160].try_into().unwrap()),
     };
     state.validate()?;
     Ok(state)

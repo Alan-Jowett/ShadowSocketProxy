@@ -6,7 +6,7 @@
 use std::{
     collections::HashMap,
     net::{IpAddr, SocketAddr},
-    sync::Arc,
+    sync::{Arc, Weak},
     time::Duration,
 };
 
@@ -254,6 +254,11 @@ async fn run_maintenance<C: MappingClient + FlowClient + 'static>(
                     for flow in flows {
                         let age = flow.observed_now_ns.saturating_sub(flow.last_used_ns);
                         let tcp = flow.original.protocol == TCP_PROTOCOL;
+                        if flow.original.protocol == UDP_PROTOCOL {
+                            associations
+                                .observe_flow(&flow.synthetic, flow.flow_id, flow.generation)
+                                .await;
+                        }
                         let terminal = tcp
                             && flow.fin_seen_mask == 0b11
                             && flow.fin_ack_seen_mask == 0b11;
@@ -300,7 +305,13 @@ async fn run_maintenance<C: MappingClient + FlowClient + 'static>(
                                             | FlowDeleteOutcome::AlreadyAbsent
                                     )
                                 {
-                                    associations.invalidate(&flow.synthetic).await;
+                                    associations
+                                        .invalidate(
+                                            &flow.synthetic,
+                                            flow.flow_id,
+                                            flow.generation,
+                                        )
+                                        .await;
                                 }
                             }
                             tracing::info!(
@@ -601,13 +612,16 @@ async fn run_udp<C: MappingClient + 'static>(
 }
 
 /// Shared UDP association table and lifecycle coordination state.
+type AssociationTable = HashMap<Tuple, Arc<UdpAssociation>>;
+
+/// Coordinates cached UDP associations and their relay lifetimes.
 struct UdpAssociations<C> {
     /// Client-facing UDP socket bound to the proxy listener.
     socket: Arc<UdpSocket>,
     /// Mapping service used to resolve each client tuple.
     client: Arc<C>,
     /// Associations keyed by client tuple.
-    entries: Mutex<HashMap<Tuple, Arc<UdpAssociation>>>,
+    entries: Arc<Mutex<AssociationTable>>,
     /// Lifetime used by relay timeouts and periodic reaping.
     idle_timeout: Duration,
     /// Watch receiver used to stop relay tasks.
@@ -618,6 +632,10 @@ struct UdpAssociations<C> {
 
 /// One connected outbound UDP socket paired with its originating client.
 struct UdpAssociation {
+    /// Synthetic tuple identifying this cache entry.
+    key: Tuple,
+    /// Weak cache reference used when the relay expires on its own.
+    entries: Weak<Mutex<AssociationTable>>,
     /// Client endpoint receiving relayed responses.
     client_address: SocketAddr,
     /// Synthetic client tuple used for the control-service mapping.
@@ -632,6 +650,8 @@ struct UdpAssociation {
     outbound: Arc<UdpSocket>,
     /// Last successful send or receive time for idle reaping.
     last_seen: Mutex<std::time::Instant>,
+    /// Dataplane flow incarnation associated with this relay, when observed.
+    flow_identity: Mutex<Option<(u64, u32)>>,
     /// Signals this relay to stop when the dataplane flow is deleted.
     cancel: watch::Sender<bool>,
     /// Completes when the relay has stopped.
@@ -649,7 +669,7 @@ impl<C: MappingClient + 'static> UdpAssociations<C> {
         Self {
             socket,
             client,
-            entries: Mutex::new(HashMap::new()),
+            entries: Arc::new(Mutex::new(HashMap::new())),
             idle_timeout,
             shutdown,
             last_failure_log: Mutex::new(None),
@@ -687,7 +707,9 @@ impl<C: MappingClient + 'static> UdpAssociations<C> {
             ) {
                 return Err(error.into());
             }
-            self.entries.lock().await.remove(&tuple);
+            if let Some(old) = self.entries.lock().await.remove(&tuple) {
+                Self::stop_association(old).await;
+            }
             let replacement = self.resolve_association(&tuple, client_address).await?;
             replacement.outbound.send(payload).await?;
             *replacement.last_seen.lock().await = std::time::Instant::now();
@@ -768,6 +790,8 @@ impl<C: MappingClient + 'static> UdpAssociations<C> {
         let (cancel, relay_shutdown) = watch::channel(false);
         let relay_done = Arc::new(tokio::sync::Notify::new());
         let candidate = Arc::new(UdpAssociation {
+            key: tuple.clone(),
+            entries: Arc::downgrade(&self.entries),
             client_address,
             synthetic_source: tuple.source,
             synthetic_destination: tuple.destination,
@@ -775,6 +799,7 @@ impl<C: MappingClient + 'static> UdpAssociations<C> {
             created_at: std::time::Instant::now(),
             outbound,
             last_seen: Mutex::new(std::time::Instant::now()),
+            flow_identity: Mutex::new(None),
             cancel,
             relay_done: relay_done.clone(),
         });
@@ -786,8 +811,11 @@ impl<C: MappingClient + 'static> UdpAssociations<C> {
         }
         let source = tuple.source;
         let proxy = tuple.destination;
-        entries.insert(tuple, candidate.clone());
+        let previous = entries.insert(tuple, candidate.clone());
         drop(entries);
+        if let Some(previous) = previous {
+            Self::stop_association(previous).await;
+        }
         match previous_destination {
             Some(previous_destination) => tracing::info!(
                 protocol = "udp",
@@ -850,12 +878,24 @@ impl<C: MappingClient + 'static> UdpAssociations<C> {
     }
 
     /// Removes a locally cached association after confirmed host deletion.
-    async fn invalidate(&self, tuple: &Tuple) {
-        let association = self.entries.lock().await.remove(tuple);
+    async fn invalidate(&self, tuple: &Tuple, flow_id: u64, generation: u32) {
+        let association = self.entries.lock().await.get(tuple).cloned();
+        let Some(association) = association else {
+            return;
+        };
+        if *association.flow_identity.lock().await != Some((flow_id, generation)) {
+            return;
+        }
+        let association = {
+            let mut entries = self.entries.lock().await;
+            entries
+                .get(tuple)
+                .is_some_and(|current| Arc::ptr_eq(current, &association))
+                .then(|| entries.remove(tuple))
+                .flatten()
+        };
         if let Some(association) = association {
-            let relay_done = association.relay_done.notified();
-            let _ = association.cancel.send(true);
-            relay_done.await;
+            Self::stop_association(association).await;
             tracing::info!(
                 protocol = "udp",
                 synthetic_source = %tuple.source,
@@ -865,6 +905,37 @@ impl<C: MappingClient + 'static> UdpAssociations<C> {
             );
         }
     }
+
+    /// Records the flow incarnation currently backing a UDP association.
+    async fn observe_flow(&self, tuple: &Tuple, flow_id: u64, generation: u32) {
+        if let Some(association) = self.entries.lock().await.get(tuple).cloned() {
+            *association.flow_identity.lock().await = Some((flow_id, generation));
+        }
+    }
+
+    /// Cancels an association relay and waits until it has released its socket.
+    async fn stop_association(association: Arc<UdpAssociation>) {
+        let relay_done = association.relay_done.notified();
+        let _ = association.cancel.send(true);
+        relay_done.await;
+    }
+}
+
+/// Removes an association when its relay exits and signals waiters.
+async fn finish_udp_relay(
+    association: &Arc<UdpAssociation>,
+    relay_done: &Arc<tokio::sync::Notify>,
+) {
+    if let Some(entries) = association.entries.upgrade() {
+        let mut entries = entries.lock().await;
+        if entries
+            .get(&association.key)
+            .is_some_and(|current| Arc::ptr_eq(current, association))
+        {
+            entries.remove(&association.key);
+        }
+    }
+    relay_done.notify_one();
 }
 
 /// Spawns the reply loop for one outbound association until timeout, I/O error,
@@ -895,11 +966,11 @@ fn spawn_udp_relay(
                             reason = "proxy_shutdown",
                             "UDP relay stopped"
                         );
-                        relay_done.notify_one();
+                        finish_udp_relay(&association, &relay_done).await;
                         return;
                     },
                     _ = cancel.changed() => {
-                        relay_done.notify_one();
+                        finish_udp_relay(&association, &relay_done).await;
                         return;
                     },
                     result = &mut receive => result,
@@ -976,7 +1047,7 @@ fn spawn_udp_relay(
                 }
             }
         }
-        relay_done.notify_one();
+        finish_udp_relay(&association, &relay_done).await;
     });
 }
 

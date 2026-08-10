@@ -64,6 +64,9 @@
 /** Looks up a key in a BPF map; NULL means no flow/config entry exists. */
 static void *(*bpf_map_lookup_elem)(void *map, const void *key) =
     (void *)BPF_FUNC_map_lookup_elem;
+/** Atomically consumes one host-requested active-flow release. */
+static long (*bpf_map_pop_elem)(void *map, void *value) =
+    (void *)BPF_FUNC_map_pop_elem;
 /** Inserts or replaces a map value while packet processing is in progress. */
 static long (*bpf_map_update_elem)(void *map, const void *key, const void *value,
                                    __u64 flags) =
@@ -318,6 +321,13 @@ struct {
     __type(value, __u64);
 } ssp_tc_active_flows_v1 SEC(".maps");
 
+/** Atomic host-to-dataplane active-flow release notifications. */
+struct {
+    __uint(type, BPF_MAP_TYPE_QUEUE);
+    __uint(max_entries, 65536);
+    __type(value, __u32);
+} ssp_tc_active_flow_releases_v1 SEC(".maps");
+
 /** Persisted generation allocator for flow incarnations. */
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
@@ -413,9 +423,12 @@ static __always_inline void increment_counter(__u32 index)
  * The increment is rolled back when the configured capacity has been reached.
  * @return 1 when a slot is reserved, otherwise 0
  */
+static __always_inline void release_flow_slot(void);
+
 static __always_inline int reserve_flow_slot(void)
 {
     __u32 config_key = 0;
+    __u32 release;
     __u64 *count = bpf_map_lookup_elem(&ssp_tc_active_flows_v1, &config_key);
     struct runtime_config_value *config =
         bpf_map_lookup_elem(&ssp_runtime_config_v3, &config_key);
@@ -423,6 +436,8 @@ static __always_inline int reserve_flow_slot(void)
 
     if (!count)
         return 0;
+    if (bpf_map_pop_elem(&ssp_tc_active_flow_releases_v1, &release) == 0)
+        release_flow_slot();
     previous = __sync_fetch_and_add(count, 1);
     if (config && config->active_flow_capacity &&
         previous >= config->active_flow_capacity) {
@@ -995,16 +1010,22 @@ static __always_inline int process_packet(struct __sk_buff *skb, bool ingress)
 
     now = bpf_ktime_get_ns();
     direction = ingress ? 0 : 1;
+    candidate = bpf_map_lookup_elem(&ssp_tc_scratch_v1, &scratch_key);
+    if (!candidate)
+        return TC_ACT_SHOT;
+    *candidate = *state;
     if (packet.protocol == IPPROTO_TCP) {
-        update_tcp_state(state, direction, packet.tcp_flags, now);
+        update_tcp_state(candidate, direction, packet.tcp_flags, now);
         if (bpf_map_lookup_elem(&ssp_flow_delete_guard_v1, &state_key))
             return TC_ACT_SHOT;
-        bpf_map_update_elem(&ssp_flow_state_v1, &state_key, state, BPF_EXIST);
+        bpf_map_update_elem(&ssp_flow_state_v1, &state_key, candidate,
+                            BPF_EXIST);
     } else {
-        state->last_used_ns = now;
+        candidate->last_used_ns = now;
         if (bpf_map_lookup_elem(&ssp_flow_delete_guard_v1, &state_key))
             return TC_ACT_SHOT;
-        bpf_map_update_elem(&ssp_flow_state_v1, &state_key, state, BPF_EXIST);
+        bpf_map_update_elem(&ssp_flow_state_v1, &state_key, candidate,
+                            BPF_EXIST);
     }
 
     if (ingress) {
@@ -1015,7 +1036,7 @@ static __always_inline int process_packet(struct __sk_buff *skb, bool ingress)
                        state->original.destination_port);
     }
     if (packet.protocol == IPPROTO_TCP && (packet.tcp_flags & TCP_FLAG_RST))
-        delete_flow(state);
+        delete_flow(candidate);
     return TC_ACT_OK;
 }
 
