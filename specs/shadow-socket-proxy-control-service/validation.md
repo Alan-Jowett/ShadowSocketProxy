@@ -48,6 +48,10 @@ OpenSSL tests require a build with PSK support.
 | TC-033 | REQ-008 | Concurrent append and pull | No duplicate or reordered sequence values |
 | TC-035 | REQ-003/005 | Mapping disappears between list and cleanup | No wrong tuple returned; delete is treated as already absent or explicit race |
 | TC-036 | REQ-006/007 | Unauthorized config/attach while authorized read is active | Unauthorized mutation is rejected and authorized read remains isolated |
+| TC-037 | REQ-005 | Packet/delete quiescence and guard failure | In-flight packet updates drain before observation verification; post-insertion failures remove or expire the guard and do not blackhole a later packet. |
+| TC-038 | REQ-005 | Replaced generation during RST/delete | State-first cleanup does not remove an index or release capacity for a newer generation sharing the tuple. |
+| TC-039 | REQ-007 | Concurrent attach and set-config | Serialization leaves the BPF map's runtime fields equal to the final published snapshot. |
+| TC-040 | REQ-007 | Unrepresentable duration | A duration that cannot fit the fixed-width nanosecond ABI is rejected before publication or map write. |
 
 ## 3. Property and Invariant Checks
 

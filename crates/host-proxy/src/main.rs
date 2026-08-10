@@ -131,20 +131,32 @@ async fn main() {
     );
     let control = client.clone();
     let (shutdown, receiver) = watch::channel(false);
+    let mut proxy_task = tokio::spawn(proxy.run_bound(tcp_listener, udp_socket, receiver));
     let result = tokio::select! {
-        result = proxy.run_bound(tcp_listener, udp_socket, receiver) => {
-            result
-        }
+        result = &mut proxy_task => result
+            .map_err(|error| shadow_socket_proxy_host::ProxyError::Control(error.to_string()))
+            .and_then(|result| result),
         result = tokio::signal::ctrl_c() => {
-            if let Err(error) = result {
-                Err(shadow_socket_proxy_host::ProxyError::Io(error))
-            } else {
-                let _ = shutdown.send(true);
-                Ok(())
+            match result {
+                Err(error) => Err(shadow_socket_proxy_host::ProxyError::Io(error)),
+                Ok(()) => {
+                    let _ = shutdown.send(true);
+                    proxy_task
+                        .await
+                        .map_err(|error| shadow_socket_proxy_host::ProxyError::Control(error.to_string()))
+                        .and_then(|result| result)
+                }
             }
         }
     };
-    if let Err(error) = control.detach(&args.interface).await {
+    if let Err(error) = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        control.detach(&args.interface),
+    )
+    .await
+    .map_err(|_| shadow_socket_proxy_host::ProxyError::Control("control detach timed out".into()))
+    .and_then(|result| result)
+    {
         tracing::error!(interface = %args.interface, error = %error, "control-service detach failed");
         eprintln!("control service detachment failed: {error}");
         std::process::exit(1);

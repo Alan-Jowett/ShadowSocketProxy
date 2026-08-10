@@ -155,7 +155,11 @@ across BPF and user-mode versions.
 
 This former requirement is retired by issue #12. Host-proxy owns stale-flow
 policy and cleanup; the control-service provides typed, generation-safe flow
-enumeration and deletion operations.
+enumeration and deletion operations. The adapter MUST freeze a requested flow
+generation, wait for packet-side in-flight updates to quiesce, and verify the
+enumerated observation before deletion. It MUST remove indexes only while they
+still encode that generation, release capacity only after deleting canonical
+state, and remove or safely expire every deletion guard on all outcomes.
 
 ### REQ-006 — Authenticated host control
 
@@ -188,6 +192,8 @@ values MUST be rejected without partially applying the update.
 - Invalid, zero, overflowing, or internally contradictory values are rejected.
 - Concurrent dataplane configuration writes observe either the old or new
   complete revision, never a mixture.
+- Concurrent attach and configuration transactions leave the BPF runtime map
+  consistent with the revision published to readers.
 
 **Invariant impact:** Preserves predictable maintenance and resource behavior
 under concurrent host control.

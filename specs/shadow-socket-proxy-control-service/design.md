@@ -88,7 +88,11 @@ returns an original tuple for a different synthetic key.
 
 Configuration is held in an atomic `ArcSwap`-style snapshot with a monotonically
 increasing revision. Set-config validates all fields against bounds and
-cross-field rules before publishing one new snapshot.
+cross-field rules before publishing one new snapshot. Attach and set-config
+share a service-level transaction lock: attach writes the validated current
+snapshot before readiness, while set-config writes its candidate BPF record
+before publishing. They therefore cannot expose a newer snapshot with an older
+runtime-map record.
 
 The configuration includes dataplane idle TTL, TCP terminal grace, active-flow
 capacity, listener/target settings, and bounded log capacity. Host maintenance
@@ -101,9 +105,14 @@ operations for the host-proxy. Enumeration returns bounded, opaque-cursor
 pages containing flow identity, generation, tuples, timestamps, and
 directional TCP lifecycle masks. Deletion compares both identity and
 generation before removing canonical state or tuple indexes and reports
-complete, already-absent, stale-generation, or partial outcomes. The service
-does not decide when a flow is stale, retry partial cleanup, or maintain local
-UDP associations; those policies remain host-proxy responsibilities.
+complete, already-absent, stale-generation, or partial outcomes. Packet
+updates use a shared in-flight map with an expiring, generation-keyed delete
+guard; deletion waits for that section to drain and rechecks its observation
+before state-first cleanup. Index removal verifies the current index value
+still names the deleted generation, and capacity release follows only
+successful state deletion. The service does not decide when a flow is stale,
+retry partial cleanup, or maintain local UDP associations; those policies
+remain host-proxy responsibilities.
 
 ### D-008 — gRPC API
 

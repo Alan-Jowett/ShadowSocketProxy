@@ -145,6 +145,25 @@
 - **Traceability:** `USER-REQUEST: issue #12 — make the host UDP mapping
   authoritative while active and avoid a query per UDP packet.`
 
+### CHG-010 — Harden flow deletion and lifecycle transactions
+
+- **Before:** RST teardown can release a slot after state ownership changes,
+  deletion guards do not prove packet quiescence, attach/configure requests can
+  interleave, and host shutdown/control retries have unbounded edges.
+- **After:** Packet updates participate in a generation-addressed in-flight
+  protocol. Host deletion freezes a generation, waits for in-flight updates to
+  drain, then verifies its observation before deleting canonical state. RST
+  teardown deletes indexes only after deleting its own state and only when each
+  index still names the same generation; capacity is released only by the
+  successful state owner. Guard expiry and unconditional post-insertion cleanup
+  prevent a failed delete from blackholing traffic. Attach and configuration
+  publication are one serialized transaction. Host-proxy tracks outbound UDP
+  activity, waits for forwarding children before detaching, bounds control
+  operations, bounds duration conversion, and schedules retry attempts by the
+  selected backoff deadline.
+- **Traceability:** `USER-REQUEST: consolidated hardening pass for remaining
+  concurrency, shutdown, timeout, and specification findings.`
+
 ## Stable Requirements
 
 ### REQ-TC-001 — Family-preserving global DNAT
@@ -160,13 +179,19 @@ are invalid.
 The flow ABI MUST retain one canonical record and three tuple indexes for the
 original client-to-destination, synthetic client-to-target, and reverse
 target-to-client tuples. New flow state MUST snapshot the current target;
-configuration changes MUST NOT mutate active flow targets.
+configuration changes MUST NOT mutate active flow targets. Packet updates MUST
+enter a generation-addressed in-flight critical section before mutating active
+state; host deletion MUST freeze that generation and observe the section
+drained before deleting its state or indexes.
 
 ### REQ-TC-003 — TCP/UDP lifecycle
 
 TCP MUST record SYN, SYN/ACK, ACK, FIN, and RST observations. RST removes the
 flow immediately. Completed bidirectional FIN/ACK teardown is retained until
 terminal grace; incomplete TCP, UDP, and QUIC-over-UDP expire through idle TTL.
+An RST teardown MUST delete canonical state before indexes, remove only indexes
+that still identify its flow ID and generation, and release active-flow
+capacity only when its state deletion succeeds.
 
 ### REQ-TC-004 — Packet safety
 
@@ -179,12 +204,16 @@ update checksums or flow state. No TCP lifecycle assumptions apply to UDP.
 Runtime configuration MUST validate atomically, preserve revisions on failure,
 bound active-flow capacity by fixed ELF maxima (three indexes per flow), and
 publish one coherent ABI record. Changing targets affects only new flows.
+Attach and `SetConfig` transactions MUST be serialized so the published
+snapshot and BPF runtime map never describe different configurations.
 
 ### REQ-TC-006 — Readiness and ownership
 
 The control service MUST validate all v3 symbols/maps, runtime schema, counter
 slots, and fixed maxima before readiness. Attach, rollback, detach, maintenance,
-and shutdown MUST retain explicit partial-failure behavior.
+and shutdown MUST retain explicit partial-failure behavior. Deletion guards
+MUST be cleaned after every post-insertion outcome and expire in the packet
+path if host cleanup cannot remove them.
 
 ### REQ-TC-007 — Listener immutability
 

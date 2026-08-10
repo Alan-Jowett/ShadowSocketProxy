@@ -344,6 +344,14 @@ struct {
     __type(value, __u64);
 } ssp_flow_delete_guard_v1 SEC(".maps");
 
+/** Packets that have entered one flow's update critical section. */
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 65536);
+    __type(key, struct flow_state_key);
+    __type(value, __u64);
+} ssp_flow_packet_inflight_v1 SEC(".maps");
+
 /**
  * Copies exactly four bytes without relying on unbounded packet pointers.
  * @param to destination buffer with four writable bytes
@@ -785,15 +793,74 @@ static __always_inline int is_control_packet(const struct packet_info *packet,
     return 1;
 }
 
-/** Records activity from a packet blocked by a host deletion guard. */
+/**
+ * Returns whether the host has frozen this flow for deletion.
+ *
+ * Guard values are BPF-monotonic expiry times. A failed userspace cleanup
+ * cannot blackhole a flow indefinitely because the next packet removes an
+ * expired guard before proceeding.
+ */
 static __always_inline int deletion_guard_active(
     const struct flow_state_key *state_key)
 {
     __u64 *guard = bpf_map_lookup_elem(&ssp_flow_delete_guard_v1, state_key);
+
     if (!guard)
         return 0;
-    *guard = bpf_ktime_get_ns();
+    if (bpf_ktime_get_ns() >= *guard) {
+        bpf_map_delete_elem(&ssp_flow_delete_guard_v1, state_key);
+        return 0;
+    }
     return 1;
+}
+
+/**
+ * Enters the packet-side deletion critical section.
+ *
+ * A host deletion first inserts the guard, then waits for this counter to
+ * reach zero. The second guard check closes the race where a packet passed the
+ * first check while the host inserted the guard. Packets that observe a guard
+ * never mutate the state or packet.
+ */
+static __always_inline int enter_flow_packet(
+    const struct flow_state_key *state_key, struct flow_state_value **state)
+{
+    __u64 *in_flight;
+    struct flow_state_value *current;
+
+    if (deletion_guard_active(state_key))
+        return 0;
+    in_flight = bpf_map_lookup_elem(&ssp_flow_packet_inflight_v1, state_key);
+    if (!in_flight)
+        return 0;
+    __sync_fetch_and_add(in_flight, 1);
+    if (deletion_guard_active(state_key)) {
+        __sync_fetch_and_sub(in_flight, 1);
+        return 0;
+    }
+    /*
+     * The host may have observed zero immediately before this packet entered.
+     * Re-resolve after the final guard check so a completed deletion cannot
+     * leave this packet with a stale state-map value pointer.
+     */
+    current = bpf_map_lookup_elem(&ssp_flow_state_v1, state_key);
+    if (!current || current->lifecycle != FLOW_ACTIVE) {
+        __sync_fetch_and_sub(in_flight, 1);
+        return 0;
+    }
+    *state = current;
+    return 1;
+}
+
+/** Leaves the packet-side deletion critical section. */
+static __always_inline void leave_flow_packet(
+    const struct flow_state_key *state_key)
+{
+    __u64 *in_flight =
+        bpf_map_lookup_elem(&ssp_flow_packet_inflight_v1, state_key);
+
+    if (in_flight)
+        __sync_fetch_and_sub(in_flight, 1);
 }
 
 /**
@@ -840,6 +907,9 @@ static __always_inline void update_tcp_state(struct flow_state_value *state,
  * @param state flow record containing the id/generation and three keys
  * @return TC_ACT_OK so deletion never drops the packet by itself
  */
+static __always_inline void delete_owned_index(
+    const struct tuple_key *key, const struct flow_index_value *owner);
+
 static __always_inline int delete_flow(const struct flow_state_value *state)
 {
     struct flow_state_key state_key = {
@@ -847,10 +917,23 @@ static __always_inline int delete_flow(const struct flow_state_value *state)
         .flow_id = state->flow_id,
         .generation = state->generation,
     };
-    bpf_map_delete_elem(&ssp_flow_index_v1, &state->original);
-    bpf_map_delete_elem(&ssp_flow_index_v1, &state->target);
-    bpf_map_delete_elem(&ssp_flow_index_v1, &state->reverse);
-    bpf_map_delete_elem(&ssp_flow_state_v1, &state_key);
+    struct flow_index_value owner = {
+        .version = bpf_htons(MAP_ABI_VERSION),
+        .flow_id = state->flow_id,
+        .generation = state->generation,
+    };
+
+    /*
+     * Delete canonical state first. A failed delete means another teardown
+     * won the race, so this packet must not release capacity or touch indexes
+     * that could already belong to a newer incarnation.
+     */
+    if (bpf_map_delete_elem(&ssp_flow_state_v1, &state_key) != 0)
+        return TC_ACT_OK;
+    delete_owned_index(&state->original, &owner);
+    delete_owned_index(&state->target, &owner);
+    delete_owned_index(&state->reverse, &owner);
+    bpf_map_delete_elem(&ssp_flow_packet_inflight_v1, &state_key);
     release_flow_slot();
     return TC_ACT_OK;
 }
@@ -901,6 +984,7 @@ static __always_inline int process_packet(struct __sk_buff *skb, bool ingress)
     __u32 scratch_key = 0;
     __u32 generation;
     __u64 *generation_counter;
+    __u64 zero = 0;
 
     if (!parse_packet(skb, &packet))
         return TC_ACT_OK;
@@ -979,10 +1063,13 @@ static __always_inline int process_packet(struct __sk_buff *skb, bool ingress)
                    bpf_map_update_elem(&ssp_flow_index_v1, &candidate->target,
                                        &candidate_index, BPF_NOEXIST) != 0 ||
                    bpf_map_update_elem(&ssp_flow_index_v1, &candidate->reverse,
-                                       &candidate_index, BPF_NOEXIST) != 0) {
+                                       &candidate_index, BPF_NOEXIST) != 0 ||
+                   bpf_map_update_elem(&ssp_flow_packet_inflight_v1, &state_key,
+                                       &zero, BPF_NOEXIST) != 0) {
             delete_owned_index(&lookup_key, &candidate_index);
             delete_owned_index(&candidate->target, &candidate_index);
             delete_owned_index(&candidate->reverse, &candidate_index);
+            bpf_map_delete_elem(&ssp_flow_packet_inflight_v1, &state_key);
             bpf_map_delete_elem(&ssp_flow_state_v1, &state_key);
             release_flow_slot();
             index = bpf_map_lookup_elem(&ssp_flow_index_v1, &lookup_key);
@@ -999,6 +1086,7 @@ static __always_inline int process_packet(struct __sk_buff *skb, bool ingress)
                 delete_owned_index(&lookup_key, &candidate_index);
                 delete_owned_index(&candidate->target, &candidate_index);
                 delete_owned_index(&candidate->reverse, &candidate_index);
+                bpf_map_delete_elem(&ssp_flow_packet_inflight_v1, &state_key);
                 bpf_map_delete_elem(&ssp_flow_state_v1, &state_key);
                 release_flow_slot();
                 increment_counter(1);
@@ -1016,27 +1104,21 @@ static __always_inline int process_packet(struct __sk_buff *skb, bool ingress)
     state = bpf_map_lookup_elem(&ssp_flow_state_v1, &state_key);
     if (!state || state->lifecycle != FLOW_ACTIVE)
         return TC_ACT_OK;
-    if (deletion_guard_active(&state_key))
+    if (!enter_flow_packet(&state_key, &state))
         return TC_ACT_SHOT;
 
     now = bpf_ktime_get_ns();
     direction = ingress ? 0 : 1;
     candidate = bpf_map_lookup_elem(&ssp_tc_scratch_v1, &scratch_key);
-    if (!candidate)
+    if (!candidate) {
+        leave_flow_packet(&state_key);
         return TC_ACT_SHOT;
+    }
     *candidate = *state;
     if (packet.protocol == IPPROTO_TCP) {
-        update_tcp_state(candidate, direction, packet.tcp_flags, now);
-        if (deletion_guard_active(&state_key))
-            return TC_ACT_SHOT;
-        bpf_map_update_elem(&ssp_flow_state_v1, &state_key, candidate,
-                            BPF_EXIST);
+        update_tcp_state(state, direction, packet.tcp_flags, now);
     } else {
-        candidate->last_used_ns = now;
-        if (deletion_guard_active(&state_key))
-            return TC_ACT_SHOT;
-        bpf_map_update_elem(&ssp_flow_state_v1, &state_key, candidate,
-                            BPF_EXIST);
+        state->last_used_ns = now;
     }
 
     if (ingress) {
@@ -1046,8 +1128,12 @@ static __always_inline int process_packet(struct __sk_buff *skb, bool ingress)
         rewrite_source(skb, &packet, state->original.destination,
                        state->original.destination_port);
     }
-    if (packet.protocol == IPPROTO_TCP && (packet.tcp_flags & TCP_FLAG_RST))
+    if (packet.protocol == IPPROTO_TCP && (packet.tcp_flags & TCP_FLAG_RST)) {
+        leave_flow_packet(&state_key);
         delete_flow(candidate);
+        return TC_ACT_OK;
+    }
+    leave_flow_packet(&state_key);
     return TC_ACT_OK;
 }
 

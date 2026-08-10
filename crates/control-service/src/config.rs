@@ -166,13 +166,15 @@ impl RuntimeConfig {
         }
         validate_target(self.ipv4_target, true)?;
         validate_target(self.ipv6_target, false)?;
-        if self.idle_ttl.as_secs() > 365 * 24 * 60 * 60
-            || self.tcp_terminal_grace.as_secs() > 365 * 24 * 60 * 60
-        {
-            return Err(ConfigError::DurationOverflow);
-        }
+        bpf_duration_nanos(self.idle_ttl)?;
+        bpf_duration_nanos(self.tcp_terminal_grace)?;
         Ok(())
     }
+}
+
+/// Converts a host duration to the fixed-width BPF nanosecond representation.
+pub fn bpf_duration_nanos(duration: Duration) -> Result<u64, ConfigError> {
+    u64::try_from(duration.as_nanos()).map_err(|_| ConfigError::DurationOverflow)
 }
 
 /// Checks optional target pairing, family, port, and address specificity.
@@ -293,5 +295,17 @@ mod tests {
         let address = "192.0.2.10:50051".parse().unwrap();
         let descriptor = ListenerDescriptor::from_socket_addr(address);
         assert_eq!(descriptor.socket_addr(), address);
+    }
+
+    #[test]
+    fn rejects_duration_that_cannot_fit_bpf_nanoseconds() {
+        let config = RuntimeConfig {
+            idle_ttl: Duration::from_secs(u64::MAX),
+            ..RuntimeConfig::default()
+        };
+        assert!(matches!(
+            ConfigStore::new(config),
+            Err(ConfigError::DurationOverflow)
+        ));
     }
 }

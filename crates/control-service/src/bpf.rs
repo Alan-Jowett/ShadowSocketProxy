@@ -12,6 +12,8 @@ use std::{
 use async_trait::async_trait;
 use thiserror::Error;
 
+#[cfg(target_os = "linux")]
+use crate::config::bpf_duration_nanos;
 use crate::config::RuntimeConfig;
 #[cfg(target_os = "linux")]
 use crate::mapping::{
@@ -143,6 +145,7 @@ pub trait BpfBackend: Send + Sync {
         _flow_id: u64,
         _generation: u32,
         _observed_last_used_ns: u64,
+        _guard_deadline_ns: u64,
     ) -> Result<FlowCleanupReport, BackendError> {
         Err(BackendError::Unsupported)
     }
@@ -183,6 +186,8 @@ struct MemoryState {
     fail_delete: Option<Vec<u8>>,
     /// Injected failure for legacy map scans.
     fail_list: bool,
+    /// Last validated runtime configuration written by the service.
+    runtime_config: Option<RuntimeConfig>,
 }
 
 #[derive(Clone, Default)]
@@ -220,6 +225,11 @@ impl InMemoryBackend {
     /// Sets capacities reported to runtime configuration validation.
     pub fn set_map_maxima(&self, maxima: MapMaxima) {
         self.state.lock().unwrap().maxima = maxima;
+    }
+
+    /// Returns the last runtime configuration written to the in-memory map.
+    pub fn runtime_config(&self) -> Option<RuntimeConfig> {
+        self.state.lock().unwrap().runtime_config.clone()
     }
 
     /// Inserts a native flow and all three tuple indexes used by cleanup.
@@ -409,6 +419,7 @@ impl BpfBackend for InMemoryBackend {
         flow_id: u64,
         generation: u32,
         observed_last_used_ns: u64,
+        _guard_deadline_ns: u64,
     ) -> Result<FlowCleanupReport, BackendError> {
         let mut state = self.state.lock().unwrap();
         let Some(current) = state.flow_states.get(&(flow_id, generation)) else {
@@ -441,8 +452,9 @@ impl BpfBackend for InMemoryBackend {
         })
     }
 
-    /// Accepts runtime configuration without side effects in memory.
-    async fn set_runtime_config(&self, _config: &RuntimeConfig) -> Result<(), BackendError> {
+    /// Records runtime configuration as the in-memory map equivalent.
+    async fn set_runtime_config(&self, config: &RuntimeConfig) -> Result<(), BackendError> {
+        self.state.lock().unwrap().runtime_config = Some(config.clone());
         Ok(())
     }
 
@@ -482,6 +494,7 @@ pub trait LinuxTcAdapter: Send + Sync {
         _flow_id: u64,
         _generation: u32,
         _observed_last_used_ns: u64,
+        _guard_deadline_ns: u64,
     ) -> Result<FlowCleanupReport, BackendError> {
         Err(BackendError::Unsupported)
     }
@@ -549,6 +562,8 @@ pub const ACTIVE_FLOW_RELEASES_MAP_NAME_V1: &str = "ssp_tc_active_flow_releases_
 pub const FLOW_GENERATION_MAP_NAME_V1: &str = "ssp_flow_generation_v1";
 /// Name of the transient host-deletion guard map.
 pub const FLOW_DELETE_GUARD_MAP_NAME_V1: &str = "ssp_flow_delete_guard_v1";
+/// Name of the packet-side flow update counter map.
+pub const FLOW_PACKET_INFLIGHT_MAP_NAME_V1: &str = "ssp_flow_packet_inflight_v1";
 /// Name of the v3 runtime configuration map.
 pub const RUNTIME_CONFIG_MAP_NAME_V3: &str = "ssp_runtime_config_v3";
 /// Name of the v1 packet-counter map.
@@ -628,6 +643,21 @@ impl AyaLinuxTcAdapter {
     /// Associates a map API failure with the generic `map` location.
     fn map_error(error: impl std::fmt::Display) -> BackendError {
         Self::operation("map", error)
+    }
+
+    /// Produces a BPF-monotonic guard deadline for legacy adapter cleanup.
+    fn deletion_guard_deadline_ns() -> u64 {
+        let mut timestamp = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut timestamp) } == 0 {
+            return (timestamp.tv_sec as u64)
+                .saturating_mul(1_000_000_000)
+                .saturating_add(timestamp.tv_nsec as u64)
+                .saturating_add(1_000_000_000);
+        }
+        1_000_000_000
     }
 
     /// Reads `max_entries` from a supported Aya map kind.
@@ -722,6 +752,20 @@ impl AyaLinuxTcAdapter {
         let map = bpf
             .map_mut(FLOW_DELETE_GUARD_MAP_NAME_V1)
             .ok_or_else(|| Self::operation("map", "flow deletion guard map is missing"))?;
+        let mut map = aya::maps::HashMap::try_from(map).map_err(Self::map_error)?;
+        operation(&mut map)
+    }
+
+    /// Borrows the packet-side flow update counter map.
+    fn with_packet_inflight_map<T>(
+        bpf: &mut aya::Ebpf,
+        operation: impl FnOnce(
+            &mut aya::maps::HashMap<&mut aya::maps::MapData, [u8; FLOW_STATE_KEY_LEN], [u8; 8]>,
+        ) -> Result<T, BackendError>,
+    ) -> Result<T, BackendError> {
+        let map = bpf
+            .map_mut(FLOW_PACKET_INFLIGHT_MAP_NAME_V1)
+            .ok_or_else(|| Self::operation("map", "flow packet in-flight map is missing"))?;
         let mut map = aya::maps::HashMap::try_from(map).map_err(Self::map_error)?;
         operation(&mut map)
     }
@@ -825,6 +869,7 @@ impl LinuxTcAdapter for AyaLinuxTcAdapter {
             ));
         }
         Self::with_delete_guard_map(&mut bpf, |_| Ok(()))?;
+        Self::with_packet_inflight_map(&mut bpf, |_| Ok(()))?;
         Self::with_runtime_map(&mut bpf, |_| Ok(()))?;
         Self::with_counters_map(&mut bpf, |_| Ok(()))?;
 
@@ -1057,7 +1102,14 @@ impl LinuxTcAdapter for AyaLinuxTcAdapter {
         };
         let index = crate::mapping::decode_flow_index(&index)
             .map_err(|error| Self::operation("flow-index:decode", error))?;
-        let report = self.delete_flow(index.flow_id, index.generation, 0).await?;
+        let report = self
+            .delete_flow(
+                index.flow_id,
+                index.generation,
+                0,
+                Self::deletion_guard_deadline_ns(),
+            )
+            .await?;
         Ok(report.state_deleted || report.indexes_deleted != 0)
     }
 
@@ -1082,6 +1134,7 @@ impl LinuxTcAdapter for AyaLinuxTcAdapter {
         flow_id: u64,
         generation: u32,
         observed_last_used_ns: u64,
+        guard_deadline_ns: u64,
     ) -> Result<FlowCleanupReport, BackendError> {
         let mut state = self.state.lock().unwrap();
         let state = state.as_mut().ok_or(BackendError::NotAttached)?;
@@ -1090,7 +1143,7 @@ impl LinuxTcAdapter for AyaLinuxTcAdapter {
             generation,
         };
         let state_key = encode_flow_state_key(flow_id, generation);
-        let flow = Self::with_state_map(&mut state.bpf, |map| {
+        let initial_flow = Self::with_state_map(&mut state.bpf, |map| {
             map.get(&state_key, 0)
                 .map(Some)
                 .or_else(|error| match error {
@@ -1100,62 +1153,68 @@ impl LinuxTcAdapter for AyaLinuxTcAdapter {
                     error => Err(Self::map_error(error)),
                 })
         })?;
-        if flow.is_none() {
+        if initial_flow.is_none() {
             let _ = Self::with_delete_guard_map(&mut state.bpf, |map| {
                 map.remove(&state_key).map_err(Self::map_error)
             });
         }
-        let guard_active = flow.is_some();
+        let guard_active = initial_flow.is_some();
         if guard_active {
             Self::with_delete_guard_map(&mut state.bpf, |map| {
-                map.insert(state_key, observed_last_used_ns.to_le_bytes(), 0)
+                map.insert(state_key, guard_deadline_ns.to_le_bytes(), 0)
                     .map_err(Self::map_error)
             })?;
-        }
-        if guard_active && observed_last_used_ns != 0 {
-            let current = Self::with_state_map(&mut state.bpf, |map| {
-                map.get(&state_key, 0)
-                    .map(Some)
-                    .or_else(|error| match error {
-                        aya::maps::MapError::KeyNotFound | aya::maps::MapError::ElementNotFound => {
-                            Ok(None)
-                        }
-                        error => Err(Self::map_error(error)),
-                    })
-            })?;
-            if current
-                .as_ref()
-                .map(|value| decode_flow_state(value))
-                .transpose()
-                .map_err(|error| Self::operation("flow-state:decode", error))?
-                .is_some_and(|current| current.last_used_ns != observed_last_used_ns)
-            {
-                let _ = Self::with_delete_guard_map(&mut state.bpf, |map| {
-                    map.remove(&state_key).map_err(Self::map_error)
-                });
-                return Ok(FlowCleanupReport {
-                    observation_mismatch: true,
-                    ..FlowCleanupReport::default()
-                });
-            }
-        }
-        if guard_active && observed_last_used_ns != 0 {
-            let guard_activity = Self::with_delete_guard_map(&mut state.bpf, |map| {
-                map.get(&state_key, 0)
-                    .map_err(Self::map_error)
-                    .map(u64::from_le_bytes)
-            })?;
-            if guard_activity != observed_last_used_ns {
-                let _ = Self::with_delete_guard_map(&mut state.bpf, |map| {
-                    map.remove(&state_key).map_err(Self::map_error)
-                });
-                return Ok(FlowCleanupReport {
-                    observation_mismatch: true,
-                    ..FlowCleanupReport::default()
-                });
-            }
         }
         let cleanup = (|| -> Result<FlowCleanupReport, BackendError> {
+            /*
+             * Every packet increments `in_flight` before its final guard
+             * check. Once the guard is installed, a zero count proves no
+             * packet can still update this generation. Bound the wait so an
+             * unexpected kernel-side fault cannot leave traffic blackholed.
+             */
+            let flow = if guard_active {
+                let mut stable = None;
+                for _ in 0..128 {
+                    let current = Self::with_state_map(&mut state.bpf, |map| {
+                        map.get(&state_key, 0)
+                            .map(Some)
+                            .or_else(|error| match error {
+                                aya::maps::MapError::KeyNotFound
+                                | aya::maps::MapError::ElementNotFound => Ok(None),
+                                error => Err(Self::map_error(error)),
+                            })
+                    })?;
+                    let Some(current) = current else {
+                        break;
+                    };
+                    let in_flight = Self::with_packet_inflight_map(&mut state.bpf, |map| {
+                        map.get(&state_key, 0).map(u64::from_ne_bytes).or_else(
+                            |error| match error {
+                                aya::maps::MapError::KeyNotFound
+                                | aya::maps::MapError::ElementNotFound => Ok(0),
+                                error => Err(Self::map_error(error)),
+                            },
+                        )
+                    })?;
+                    if in_flight == 0 {
+                        stable = Some(current);
+                        break;
+                    }
+                    std::thread::yield_now();
+                }
+                let Some(flow) = stable else {
+                    return Ok(FlowCleanupReport {
+                        observation_mismatch: true,
+                        ..FlowCleanupReport::default()
+                    });
+                };
+                Some(flow)
+            } else {
+                initial_flow
+            };
+            if flow.is_none() && guard_active {
+                return Ok(FlowCleanupReport::default());
+            }
             let stale_generation = flow.is_none()
                 && Self::with_flow_index_map(&mut state.bpf, |map| {
                     map.iter()
@@ -1168,9 +1227,15 @@ impl LinuxTcAdapter for AyaLinuxTcAdapter {
                         .collect::<Result<Vec<_>, BackendError>>()
                         .map(|values| values.into_iter().any(|matches| matches))
                 })?;
-            let mut index_keys = if let Some(flow) = flow {
-                let flow = decode_flow_state(&flow)
+            let mut index_keys = if let Some(flow) = flow.as_ref() {
+                let flow = decode_flow_state(flow)
                     .map_err(|error| Self::operation("flow-state:decode", error))?;
+                if observed_last_used_ns != 0 && flow.last_used_ns != observed_last_used_ns {
+                    return Ok(FlowCleanupReport {
+                        observation_mismatch: true,
+                        ..FlowCleanupReport::default()
+                    });
+                }
                 vec![
                     encode_key(&flow.original),
                     encode_key(&flow.target),
@@ -1196,53 +1261,67 @@ impl LinuxTcAdapter for AyaLinuxTcAdapter {
             };
             index_keys.sort_unstable();
             index_keys.dedup();
-            let mut indexes_deleted = 0;
             let mut partial = false;
-            for key in index_keys {
-                match Self::with_flow_index_map(&mut state.bpf, |map| {
-                    let current = map.get(&key, 0).map(Some).or_else(|error| match error {
-                        aya::maps::MapError::KeyNotFound | aya::maps::MapError::ElementNotFound => {
-                            Ok(None)
-                        }
-                        error => Err(Self::map_error(error)),
-                    })?;
-                    let Some(current) = current else {
-                        return Ok(false);
-                    };
-                    let current = crate::mapping::decode_flow_index(&current)
-                        .map_err(|error| Self::operation("flow-index:decode", error))?;
-                    if current != expected {
-                        return Ok(false);
-                    }
-                    map.remove(&key).map_err(Self::map_error)?;
-                    Ok(true)
+            let state_deleted = if flow.is_some() {
+                match Self::with_state_map(&mut state.bpf, |map| {
+                    map.remove(&state_key).map_err(Self::map_error)
                 }) {
-                    Ok(true) => indexes_deleted += 1,
-                    Ok(false) => {}
-                    Err(_) => partial = true,
+                    Ok(()) => true,
+                    Err(_) => {
+                        partial = true;
+                        false
+                    }
                 }
-            }
-            let state_key = encode_flow_state_key(flow_id, generation);
-            let state_deleted = match Self::with_state_map(&mut state.bpf, |map| {
-                let existed =
-                    map.get(&state_key, 0)
-                        .map(|_| true)
-                        .or_else(|error| match error {
+            } else {
+                false
+            };
+            /*
+             * State deletion is the ownership transfer. Do not remove tuple
+             * indexes or release a slot when it failed: a newer generation
+             * may be using the same tuple after a concurrent RST teardown.
+             */
+            let may_delete_indexes = state_deleted || flow.is_none();
+            let mut indexes_deleted = 0;
+            if may_delete_indexes {
+                for key in index_keys {
+                    match Self::with_flow_index_map(&mut state.bpf, |map| {
+                        let current = map.get(&key, 0).map(Some).or_else(|error| match error {
                             aya::maps::MapError::KeyNotFound
-                            | aya::maps::MapError::ElementNotFound => Ok(false),
+                            | aya::maps::MapError::ElementNotFound => Ok(None),
                             error => Err(Self::map_error(error)),
                         })?;
-                if existed {
-                    map.remove(&state_key).map_err(Self::map_error)?;
+                        let Some(current) = current else {
+                            return Ok(false);
+                        };
+                        let current = crate::mapping::decode_flow_index(&current)
+                            .map_err(|error| Self::operation("flow-index:decode", error))?;
+                        if current != expected {
+                            return Ok(false);
+                        }
+                        map.remove(&key).map_err(Self::map_error)?;
+                        Ok(true)
+                    }) {
+                        Ok(true) => indexes_deleted += 1,
+                        Ok(false) => {}
+                        Err(_) => partial = true,
+                    }
                 }
-                Ok(existed)
-            }) {
-                Ok(value) => value,
-                Err(_) => {
+            }
+            if state_deleted || flow.is_none() {
+                if Self::with_packet_inflight_map(&mut state.bpf, |map| {
+                    map.remove(&state_key)
+                        .or_else(|error| match error {
+                            aya::maps::MapError::KeyNotFound
+                            | aya::maps::MapError::ElementNotFound => Ok(()),
+                            error => Err(error),
+                        })
+                        .map_err(Self::map_error)
+                })
+                .is_err()
+                {
                     partial = true;
-                    false
                 }
-            };
+            }
             if state_deleted {
                 match Self::with_active_flow_releases(&mut state.bpf, |map| {
                     let release = 0_u32.to_ne_bytes();
@@ -1268,7 +1347,7 @@ impl LinuxTcAdapter for AyaLinuxTcAdapter {
             Ok(())
         };
         match (cleanup, guard_cleanup) {
-            (Ok(mut report), Ok(())) => Ok(report),
+            (Ok(report), Ok(())) => Ok(report),
             (Ok(mut report), Err(error)) => {
                 report.partial = true;
                 tracing::warn!(error = %error, "flow deletion guard cleanup failed");
@@ -1317,10 +1396,14 @@ impl LinuxTcAdapter for AyaLinuxTcAdapter {
         }
         value[46..48].copy_from_slice(&config.listener.port.to_be_bytes());
         value[48..56].copy_from_slice(
-            &(config.idle_ttl.as_nanos().min(u64::MAX as u128) as u64).to_le_bytes(),
+            &bpf_duration_nanos(config.idle_ttl)
+                .map_err(|error| Self::operation("runtime-config:idle-ttl", error))?
+                .to_le_bytes(),
         );
         value[56..64].copy_from_slice(
-            &(config.tcp_terminal_grace.as_nanos().min(u64::MAX as u128) as u64).to_le_bytes(),
+            &bpf_duration_nanos(config.tcp_terminal_grace)
+                .map_err(|error| Self::operation("runtime-config:terminal-grace", error))?
+                .to_le_bytes(),
         );
         value[64..68].copy_from_slice(&(config.active_flow_capacity as u32).to_le_bytes());
         let mut state = self.state.lock().unwrap();
@@ -1579,9 +1662,15 @@ impl BpfBackend for LinuxBpfBackend {
         flow_id: u64,
         generation: u32,
         observed_last_used_ns: u64,
+        guard_deadline_ns: u64,
     ) -> Result<FlowCleanupReport, BackendError> {
         self.adapter
-            .delete_flow(flow_id, generation, observed_last_used_ns)
+            .delete_flow(
+                flow_id,
+                generation,
+                observed_last_used_ns,
+                guard_deadline_ns,
+            )
             .await
     }
 
@@ -1693,9 +1782,83 @@ mod tests {
             .await
             .unwrap()
             .is_some());
-        let report = backend.delete_flow(9, 1, 0).await.unwrap();
+        let report = backend.delete_flow(9, 1, 0, 0).await.unwrap();
         assert_eq!(report.indexes_deleted, 3);
         assert!(backend.list_flow_states().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn generation_checked_cleanup_preserves_replaced_tuple_indexes() {
+        let backend = InMemoryBackend::default();
+        let original = Tuple {
+            source: "192.0.2.1".parse().unwrap(),
+            destination: "198.51.100.10".parse().unwrap(),
+            protocol: PROTOCOL_UDP,
+            source_port: 40000,
+            destination_port: 443,
+        };
+        let target = Tuple {
+            source: original.source,
+            destination: "192.0.2.10".parse().unwrap(),
+            protocol: PROTOCOL_UDP,
+            source_port: 40000,
+            destination_port: 8443,
+        };
+        let reverse = Tuple {
+            source: target.destination,
+            destination: original.source,
+            protocol: PROTOCOL_UDP,
+            source_port: 8443,
+            destination_port: 40000,
+        };
+        let old = FlowState {
+            flow_id: 9,
+            generation: 1,
+            original: original.clone(),
+            target: target.clone(),
+            reverse: reverse.clone(),
+            last_used_ns: 1,
+            protocol_flags: PROTOCOL_FLAG_UDP,
+            tcp_state_flags: 0,
+            fin_seen_mask: 0,
+            fin_ack_seen_mask: 0,
+            lifecycle: FlowLifecycle::Active,
+            terminal_deadline_ns: 0,
+        };
+        backend.insert_flow_state(old);
+        backend.insert_flow_state(FlowState {
+            flow_id: 9,
+            generation: 2,
+            original,
+            target: target.clone(),
+            reverse,
+            last_used_ns: 2,
+            protocol_flags: PROTOCOL_FLAG_UDP,
+            tcp_state_flags: 0,
+            fin_seen_mask: 0,
+            fin_ack_seen_mask: 0,
+            lifecycle: FlowLifecycle::Active,
+            terminal_deadline_ns: 0,
+        });
+
+        let report = backend.delete_flow(9, 1, 0, 0).await.unwrap();
+        assert!(report.state_deleted);
+        assert_eq!(report.indexes_deleted, 0);
+        assert!(backend
+            .get_entry(&encode_key(&target))
+            .await
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            backend
+                .list_flow_states()
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|flow| flow.generation)
+                .collect::<Vec<_>>(),
+            vec![2]
+        );
     }
 
     #[cfg(target_os = "linux")]

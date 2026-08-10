@@ -77,6 +77,11 @@ RST.
 | TC-HP-MAINT-008 | REQ-HP-MAINT-001/003 | Host-driven TCP cleanup | Host policy deletes incomplete idle TCP, RST, and completed FIN/ACK flows using generation-safe flow operations and verifies no indexes remain. |
 | TC-HP-MAINT-009 | REQ-HP-MAINT-001/003 | Host-driven UDP cleanup | Host policy expires idle UDP, deletes the corresponding dataplane flow, and invalidates the local association only after the deletion outcome is known. |
 | TC-HP-MAINT-010 | REQ-HP-MAINT-001/006 | Activation and shutdown ownership | Host-proxy initiates attach/configure and detach; control-service shutdown does not independently run cleanup or alter host policy. |
+| TC-TC-027 | REQ-TC-002/003/006 | RST and host deletion race | State-first deletion, generation-owned index checks, and successful-state-only capacity release preserve a replacement incarnation; every post-guard error removes or expires the guard. |
+| TC-TC-028 | REQ-TC-002/003 | Packet/delete quiescence | A packet that crossed the first guard check increments in-flight before its final check; host waits for zero and rejects a changed observation rather than deleting an active generation. |
+| TC-TC-029 | REQ-TC-005 | Concurrent attach/configure | The final BPF runtime record equals the final published snapshot irrespective of attach/set-config ordering. |
+| TC-HP-MAINT-011 | REQ-HP-MAINT-004/006 | Retry, timeout, and shutdown bounds | Retry schedules the next scan at its exponential-backoff deadline; pending RPCs cancel at shutdown or fail at their deadline before BPF detach. |
+| TC-HP-MAINT-012 | REQ-HP-MAINT-005 | Outbound UDP activity | Continuous client-to-destination sends extend association lifetime without extra mapping lookups; expiry still cancels the matching relay. |
 
 ## Impact Map
 

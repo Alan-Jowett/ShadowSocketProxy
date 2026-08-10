@@ -106,6 +106,8 @@ mod linux {
     const COUNTERS_MAP_NAME: &str = "ssp_tc_counters_v1";
     /// ELF map tracking active-flow slot usage.
     const ACTIVE_FLOWS_MAP_NAME: &str = "ssp_tc_active_flows_v1";
+    /// ELF map tracking packet updates participating in deletion quiescence.
+    const FLOW_PACKET_INFLIGHT_MAP_NAME: &str = "ssp_flow_packet_inflight_v1";
 
     /// Maximum packet bytes stored by a fixture buffer.
     const PACKET_CAPACITY: usize = 256;
@@ -292,6 +294,7 @@ mod linux {
                 RUNTIME_CONFIG_MAP_NAME,
                 COUNTERS_MAP_NAME,
                 ACTIVE_FLOWS_MAP_NAME,
+                FLOW_PACKET_INFLIGHT_MAP_NAME,
             ] {
                 if bpf.map_mut(map_name).is_none() {
                     eprintln!("required map {map_name} is missing");

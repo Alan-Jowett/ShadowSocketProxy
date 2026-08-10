@@ -12,6 +12,7 @@ use std::{
     time::Instant,
 };
 
+use tokio::sync::Mutex;
 use tonic::{Request, Response, Status};
 
 use crate::{
@@ -22,6 +23,9 @@ use crate::{
     proto::{self, control_server::Control},
 };
 use uuid::Uuid;
+
+/// Maximum time a failed host delete guard may block packet processing.
+const FLOW_DELETE_GUARD_TTL_NS: u64 = 1_000_000_000;
 
 /// Returns nanoseconds elapsed from a process-local monotonic origin.
 fn monotonic_now_ns() -> u64 {
@@ -56,6 +60,9 @@ pub struct ControlService {
     ready: Arc<AtomicBool>,
     /// Instance nonce used to reject continuation tokens from another service.
     token_nonce: u64,
+    /// Serializes attach/configure publication so the BPF map and snapshot
+    /// cannot expose different revisions.
+    config_transaction: Arc<Mutex<()>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -107,6 +114,7 @@ impl ControlService {
             logs,
             ready: Arc::new(AtomicBool::new(false)),
             token_nonce: Uuid::new_v4().as_u128() as u64,
+            config_transaction: Arc::new(Mutex::new(())),
         }
     }
 
@@ -370,6 +378,7 @@ impl Control for ControlService {
         &self,
         request: Request<proto::InterfaceRequest>,
     ) -> Result<Response<proto::OperationReply>, Status> {
+        let _config_transaction = self.config_transaction.lock().await;
         let request = request.into_inner();
         if request.elf_path.is_empty() || request.interfaces.is_empty() {
             return Err(Status::invalid_argument(
@@ -613,6 +622,7 @@ impl Control for ControlService {
                 request.flow_id,
                 request.generation,
                 request.observed_last_used_ns,
+                monotonic_now_ns().saturating_add(FLOW_DELETE_GUARD_TTL_NS),
             )
             .await
             .map_err(Self::map_backend_error)?;
@@ -689,6 +699,7 @@ impl Control for ControlService {
         &self,
         request: Request<proto::SetConfigRequest>,
     ) -> Result<Response<proto::ConfigReply>, Status> {
+        let _config_transaction = self.config_transaction.lock().await;
         let next = runtime_config_from_proto(request.into_inner().config)?;
         if next.listener != self.config.snapshot().listener {
             return Err(Status::failed_precondition(
@@ -995,5 +1006,37 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    }
+
+    #[tokio::test]
+    async fn attach_and_configure_publish_the_same_runtime_snapshot() {
+        let (backend, service) = service();
+        let mut config = proto_config();
+        config.ipv4_target_address = vec![192, 0, 2, 20];
+        config.ipv4_target_port = 8_443;
+
+        let (attach, configured) = tokio::join!(
+            service.attach(Request::new(proto::InterfaceRequest {
+                elf_path: "fixture.o".into(),
+                interfaces: vec!["eth0".into()],
+            })),
+            service.set_config(Request::new(proto::SetConfigRequest {
+                config: Some(config),
+            })),
+        );
+        attach.unwrap();
+        configured.unwrap();
+
+        let map_config = backend.runtime_config().expect("runtime map was written");
+        let published = service.config.snapshot();
+        assert_eq!(map_config.idle_ttl, published.idle_ttl);
+        assert_eq!(map_config.tcp_terminal_grace, published.tcp_terminal_grace);
+        assert_eq!(
+            map_config.active_flow_capacity,
+            published.active_flow_capacity
+        );
+        assert_eq!(map_config.ipv4_target, published.ipv4_target);
+        assert_eq!(map_config.ipv6_target, published.ipv6_target);
+        assert_eq!(map_config.listener, published.listener);
     }
 }

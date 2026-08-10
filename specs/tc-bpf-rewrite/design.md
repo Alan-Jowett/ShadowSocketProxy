@@ -6,7 +6,7 @@
 ## Traceability
 
 ```text
-USER-REQUEST -> CHG-001..004 -> REQ-TC-001..007
+USER-REQUEST -> CHG-001..004, CHG-010 -> REQ-TC-001..007
              -> CHG-005 -> REQ-CI-001..005
              -> CHG-006 -> REQ-HP-LOG-001..003
              -> CHG-007..009 -> REQ-HP-MAINT-001..006
@@ -25,7 +25,9 @@ USER-REQUEST -> CHG-001..004 -> REQ-TC-001..007
 The ELF exports `ssp_tc_ingress_v3` and `ssp_tc_egress_v3`,
 `ssp_flow_index_v1`, `ssp_flow_state_v1`, `ssp_runtime_config_v3`,
 `ssp_tc_counters_v1`, `ssp_tc_active_flows_v1`, and the scratch map.
-There is no destination-policy map. Flow keys/state retain their v1 layout.
+The lifecycle contract also includes `ssp_flow_delete_guard_v1` and
+`ssp_flow_packet_inflight_v1`, keyed by flow ID/generation. There is no
+destination-policy map. Flow keys/state retain their v1 layout.
 The loader rejects v2 program symbols, policy-only maps, missing v3 runtime
 configuration, missing counter slots, and incomplete flow-map contracts.
 
@@ -70,6 +72,16 @@ and increments counter slot 1. The active-flow cap accounts for three indexes
 per flow and never resizes maps. Flow timestamps and TCP lifecycle state remain
 dataplane observations; host-proxy owns cleanup decisions.
 
+An atomic in-flight map is keyed by each active state generation. A packet
+checks for a generation-keyed deletion guard, increments that counter, then
+checks again before modifying state. Host deletion inserts an expiring guard,
+waits for the counter to drain, rechecks `last_used_ns`, deletes canonical
+state, and only then deletes tuple indexes that still encode the same
+ID/generation and queues a capacity release. RST follows the same state-first,
+ownership-checked sequence. Every host path after guard insertion removes the
+guard; an expired guard self-removes in the packet path so a map operation
+failure cannot permanently drop traffic.
+
 ### D-TC-006 — Backend and service surface
 
 Remove policy types, map discovery, policy backend methods, capacity checks,
@@ -93,6 +105,13 @@ The loader uses explicit v3 symbol names and checks for stale v2/policy
 artifacts. A v2 ELF, policy-only ELF, mixed v2/v3 ELF, missing runtime map,
 or counters map with fewer than three slots fails closed. No legacy fallback
 or direct-forward behavior is introduced.
+
+Attach and `SetConfig` share a service-level transaction mutex. The attach
+transaction validates the snapshot, writes the BPF runtime record, and only
+then publishes readiness; the configuration transaction writes the candidate
+record before publishing its new snapshot. Their serialization prevents a
+newly attached program from retaining an older runtime record after a later
+snapshot is visible.
 
 ### D-TC-009 — Safety and checksums
 
@@ -312,3 +331,5 @@ returns nonzero.
 | INV-HP-MAINT-001 | Host-proxy is the sole lifecycle-policy owner; control-service requests are stateless adapters. |
 | INV-HP-MAINT-002 | A flow identity/generation maps to one canonical state and all tuple indexes during adapter cleanup. |
 | INV-HP-MAINT-003 | Control-plane loss does not interrupt existing forwarding or cause unconfirmed local deletion. |
+| INV-TC-010 | A deletion guard blocks only a bounded quiescence window; no old RST or host delete can remove a newer generation's index or capacity. |
+| INV-TC-011 | The BPF runtime map and published configuration are serialized across attach and configuration updates. |
