@@ -42,6 +42,7 @@ const CONTROL_RPC_TIMEOUT: Duration = Duration::from_secs(5);
 /// Lifecycle state for a Windows conditional-accept request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
+#[cfg(any(target_os = "windows", test))]
 enum ConditionalAttemptState {
     /// Request has been deferred and awaits preconnect.
     Deferred = 0,
@@ -55,6 +56,7 @@ enum ConditionalAttemptState {
     Cancelled = 4,
 }
 
+#[cfg(any(target_os = "windows", test))]
 impl ConditionalAttemptState {
     /// Decodes the atomic representation, treating unknown values as cancelled.
     fn from_raw(value: u8) -> Self {
@@ -70,6 +72,7 @@ impl ConditionalAttemptState {
 
 /// Exact deferred-request identity. The generation prevents a late worker
 /// result from being associated with a new request using the same tuple.
+#[cfg(any(target_os = "windows", test))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ConditionalRequestId {
     /// Exact synthetic tuple presented to the condition callback.
@@ -80,6 +83,7 @@ struct ConditionalRequestId {
 
 /// State shared by the conditional callback, coordinator, and preconnect
 /// worker. It contains no socket ownership so it is also testable off Windows.
+#[cfg(any(target_os = "windows", test))]
 struct ConditionalAttempt {
     /// Immutable identity for this deferred attempt.
     id: ConditionalRequestId,
@@ -91,6 +95,7 @@ struct ConditionalAttempt {
     released: AtomicBool,
 }
 
+#[cfg(any(target_os = "windows", test))]
 impl ConditionalAttempt {
     /// Creates a request in the deferred state.
     fn new(id: ConditionalRequestId) -> Self {
@@ -110,6 +115,7 @@ impl ConditionalAttempt {
 
 /// Atomically limits pending Windows conditional-accept attempts and gives
 /// every admitted request a monotonically increasing generation.
+#[cfg(any(target_os = "windows", test))]
 struct ConditionalAdmissions {
     /// Maximum number of unaccepted deferred attempts.
     limit: usize,
@@ -119,6 +125,7 @@ struct ConditionalAdmissions {
     next_generation: AtomicU64,
 }
 
+#[cfg(any(target_os = "windows", test))]
 impl ConditionalAdmissions {
     /// Creates an admission controller with the configured limit.
     fn new(limit: usize) -> Self {
@@ -170,6 +177,7 @@ impl ConditionalAdmissions {
 
 /// Computes the remaining conditional-preconnect budget from the first defer,
 /// not from when a worker happens to start.
+#[cfg(any(target_os = "windows", test))]
 fn conditional_preconnect_budget(deferred_at: std::time::Instant) -> Result<Duration, ProxyError> {
     CONTROL_RPC_TIMEOUT
         .checked_sub(deferred_at.elapsed())
@@ -179,6 +187,7 @@ fn conditional_preconnect_budget(deferred_at: std::time::Instant) -> Result<Dura
 }
 
 /// Changes a deferred request to ready only once its outbound socket is stored.
+#[cfg(any(target_os = "windows", test))]
 fn mark_attempt_ready(attempt: &ConditionalAttempt) -> bool {
     attempt
         .state
@@ -192,6 +201,7 @@ fn mark_attempt_ready(attempt: &ConditionalAttempt) -> bool {
 }
 
 /// Claims a ready request for the single matching accepted client socket.
+#[cfg(any(target_os = "windows", test))]
 fn claim_ready_attempt(attempt: &ConditionalAttempt) -> bool {
     attempt
         .state
@@ -625,7 +635,7 @@ impl<C: MappingClient + FlowClient + 'static> Proxy<C> {
             let tcp_listener = TcpListener::bind(self.config.listen).await?;
             let actual_listen = tcp_listener.local_addr()?;
             let udp_socket = Arc::new(UdpSocket::bind(actual_listen).await?);
-            return Ok((
+            Ok((
                 BoundTcpListener {
                     listener: tcp_listener,
                 },
