@@ -326,6 +326,14 @@ struct {
     __type(value, __u64);
 } ssp_flow_generation_v1 SEC(".maps");
 
+/** Marks a flow while the host performs an observation-checked deletion. */
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 65536);
+    __type(key, struct flow_state_key);
+    __type(value, __u64);
+} ssp_flow_delete_guard_v1 SEC(".maps");
+
 /**
  * Copies exactly four bytes without relying on unbounded packet pointers.
  * @param to destination buffer with four writable bytes
@@ -905,7 +913,7 @@ static __always_inline int process_packet(struct __sk_buff *skb, bool ingress)
             bpf_map_lookup_elem(&ssp_flow_generation_v1, &scratch_key);
         if (!generation_counter)
             return TC_ACT_SHOT;
-        generation = (__u32)__sync_fetch_and_add(generation_counter, 1);
+        generation = (__u32)(__sync_fetch_and_add(generation_counter, 1) + 1);
         if (generation == 0)
             generation = 1;
         candidate_index.generation = generation;
@@ -982,14 +990,20 @@ static __always_inline int process_packet(struct __sk_buff *skb, bool ingress)
     state = bpf_map_lookup_elem(&ssp_flow_state_v1, &state_key);
     if (!state || state->lifecycle != FLOW_ACTIVE)
         return TC_ACT_OK;
+    if (bpf_map_lookup_elem(&ssp_flow_delete_guard_v1, &state_key))
+        return TC_ACT_OK;
 
     now = bpf_ktime_get_ns();
     direction = ingress ? 0 : 1;
     if (packet.protocol == IPPROTO_TCP) {
         update_tcp_state(state, direction, packet.tcp_flags, now);
+        if (bpf_map_lookup_elem(&ssp_flow_delete_guard_v1, &state_key))
+            return TC_ACT_OK;
         bpf_map_update_elem(&ssp_flow_state_v1, &state_key, state, BPF_EXIST);
     } else {
         state->last_used_ns = now;
+        if (bpf_map_lookup_elem(&ssp_flow_delete_guard_v1, &state_key))
+            return TC_ACT_OK;
         bpf_map_update_elem(&ssp_flow_state_v1, &state_key, state, BPF_EXIST);
     }
 

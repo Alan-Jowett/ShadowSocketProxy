@@ -545,6 +545,8 @@ pub const FLOW_STATE_MAP_NAME_V1: &str = "ssp_flow_state_v1";
 pub const ACTIVE_FLOWS_MAP_NAME_V1: &str = "ssp_tc_active_flows_v1";
 /// Name of the persisted flow-generation allocator map.
 pub const FLOW_GENERATION_MAP_NAME_V1: &str = "ssp_flow_generation_v1";
+/// Name of the transient host-deletion guard map.
+pub const FLOW_DELETE_GUARD_MAP_NAME_V1: &str = "ssp_flow_delete_guard_v1";
 /// Name of the v3 runtime configuration map.
 pub const RUNTIME_CONFIG_MAP_NAME_V3: &str = "ssp_runtime_config_v3";
 /// Name of the v1 packet-counter map.
@@ -694,6 +696,20 @@ impl AyaLinuxTcAdapter {
         operation(&mut map)
     }
 
+    /// Borrows the transient flow-deletion guard map.
+    fn with_delete_guard_map<T>(
+        bpf: &mut aya::Ebpf,
+        operation: impl FnOnce(
+            &mut aya::maps::HashMap<&mut aya::maps::MapData, [u8; FLOW_STATE_KEY_LEN], [u8; 8]>,
+        ) -> Result<T, BackendError>,
+    ) -> Result<T, BackendError> {
+        let map = bpf
+            .map_mut(FLOW_DELETE_GUARD_MAP_NAME_V1)
+            .ok_or_else(|| Self::operation("map", "flow deletion guard map is missing"))?;
+        let mut map = aya::maps::HashMap::try_from(map).map_err(Self::map_error)?;
+        operation(&mut map)
+    }
+
     /// Borrows the runtime configuration map for one fallible operation.
     fn with_runtime_map<T>(
         bpf: &mut aya::Ebpf,
@@ -791,6 +807,7 @@ impl LinuxTcAdapter for AyaLinuxTcAdapter {
                 format!("required map {FLOW_GENERATION_MAP_NAME_V1} is missing"),
             ));
         }
+        Self::with_delete_guard_map(&mut bpf, |_| Ok(()))?;
         Self::with_runtime_map(&mut bpf, |_| Ok(()))?;
         Self::with_counters_map(&mut bpf, |_| Ok(()))?;
 
@@ -1066,10 +1083,20 @@ impl LinuxTcAdapter for AyaLinuxTcAdapter {
                     error => Err(Self::map_error(error)),
                 })
         })?;
+        let guard_active = flow.is_some();
+        if guard_active {
+            Self::with_delete_guard_map(&mut state.bpf, |map| {
+                map.insert(state_key, observed_last_used_ns.to_le_bytes(), 0)
+                    .map_err(Self::map_error)
+            })?;
+        }
         if let Some(flow) = flow.as_ref() {
             let current = decode_flow_state(flow)
                 .map_err(|error| Self::operation("flow-state:decode", error))?;
             if observed_last_used_ns != 0 && current.last_used_ns != observed_last_used_ns {
+                let _ = Self::with_delete_guard_map(&mut state.bpf, |map| {
+                    map.remove(&state_key).map_err(Self::map_error)
+                });
                 return Ok(FlowCleanupReport {
                     observation_mismatch: true,
                     ..FlowCleanupReport::default()
@@ -1176,6 +1203,15 @@ impl LinuxTcAdapter for AyaLinuxTcAdapter {
             }) {
                 Ok(()) => {}
                 Err(_) => partial = true,
+            }
+        }
+        if guard_active {
+            if Self::with_delete_guard_map(&mut state.bpf, |map| {
+                map.remove(&state_key).map_err(Self::map_error)
+            })
+            .is_err()
+            {
+                partial = true;
             }
         }
         Ok(FlowCleanupReport {
