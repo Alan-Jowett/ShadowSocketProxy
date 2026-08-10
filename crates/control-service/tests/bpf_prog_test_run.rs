@@ -13,6 +13,8 @@ const REQUIRED_SEQUENCE: &[&str] = &[
     "control-bypass",
     "fin-ack-teardown",
     "rst",
+    "deletion-commit",
+    "deletion-abort",
 ];
 
 #[test]

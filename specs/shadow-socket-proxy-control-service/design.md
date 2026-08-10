@@ -107,10 +107,12 @@ directional TCP lifecycle masks. Deletion compares both identity and
 generation before removing canonical state or tuple indexes and reports
 complete, already-absent, stale-generation, or partial outcomes. Packet
 updates use a shared in-flight map with an expiring, generation-keyed delete
-guard; deletion waits for that section to drain and rechecks its observation
-before state-first cleanup. Index removal verifies the current index value
-still names the deleted generation, and capacity release follows only
-successful state deletion. The service does not decide when a flow is stale,
+guard; deletion waits for that section to drain, atomically commits against
+packet-side guard expiry, and rechecks its observation before state-first
+cleanup. Index removal verifies the current index value still names the
+deleted generation. A persistent generation-addressed release journal lets
+partial cleanup republish capacity release idempotently; BPF consumes a
+journal entry exactly once. The service does not decide when a flow is stale,
 retry partial cleanup, or maintain local UDP associations; those policies
 remain host-proxy responsibilities.
 

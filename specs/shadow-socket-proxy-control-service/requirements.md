@@ -156,10 +156,12 @@ across BPF and user-mode versions.
 This former requirement is retired by issue #12. Host-proxy owns stale-flow
 policy and cleanup; the control-service provides typed, generation-safe flow
 enumeration and deletion operations. The adapter MUST freeze a requested flow
-generation, wait for packet-side in-flight updates to quiesce, and verify the
-enumerated observation before deletion. It MUST remove indexes only while they
-still encode that generation, release capacity only after deleting canonical
-state, and remove or safely expire every deletion guard on all outcomes.
+generation, wait for packet-side in-flight updates to quiesce, atomically
+commit against guard expiry, and verify the enumerated observation before
+deletion. It MUST remove indexes only while they still encode that generation,
+persist capacity release before deleting canonical state, and publish that
+generation-addressed release idempotently until BPF consumes it once. It MUST
+remove or safely expire every deletion guard and outcome on all outcomes.
 
 ### REQ-006 — Authenticated host control
 

@@ -31,7 +31,7 @@ RST.
 | TC-TC-013 | REQ-TC-002 | Concurrent first packets | Both directions converge on one canonical flow and three consistent indexes. |
 | TC-TC-014 | REQ-TC-002 | Flow insertion/full-map failure | Attempt-owned entries roll back, packet drops, and flow-failure counter increments. |
 | TC-TC-015 | REQ-TC-003 | TCP state progression | SYN, SYN/ACK, ACK, FIN, FIN/ACK, and RST encode/decode correctly. |
-| TC-TC-016 | REQ-TC-003 | Terminal cleanup | RST deletes immediately; completed FIN/ACK waits for grace; incomplete TCP expires by idle TTL. |
+| TC-TC-016 | REQ-TC-003 | Terminal cleanup | RST remains enumerable for host cleanup; completed FIN/ACK waits for grace; incomplete TCP expires by idle TTL. |
 | TC-TC-017 | REQ-TC-003 | UDP/QUIC lifecycle | Last-used updates; no TCP flags; idle TTL is the only cleanup path. |
 | TC-TC-018 | REQ-TC-005 | Runtime validation | Invalid schema, zero/overflow durations, partial targets, invalid listener, and oversized cap preserve prior revision. |
 | TC-TC-019 | REQ-TC-007 | Listener immutability | SetConfig rejects address, family, port, or wildcard changes. |
@@ -40,13 +40,13 @@ RST.
 | TC-TC-022 | REQ-TC-006 | Status counters | Status exposes target misses, flow insertion failures, control bypasses, and flow-map maxima only. |
 | TC-TC-023 | REQ-HP-MAINT-003 | Dataplane cleanup primitive | Canonical state/index deletion, decode failures, races, and backend errors remain explicit; lifecycle policy is not executed by the control-service. |
 | TC-TC-024 | REQ-TC-006 | Attach/rollback/detach/shutdown | Owned links and runtime state roll back transactionally and report partial cleanup. |
-| TC-TC-025 | REQ-TC-004/006 | Kernel test-run sequence | `bpf_prog_test_run_opts` asserts bytes, action, checksums, flow state, target miss, control bypass, FIN/ACK, and RST. |
+| TC-TC-025 | REQ-TC-004/006 | Kernel test-run sequence | `bpf_prog_test_run_opts` asserts bytes, action, checksums, retained RST state, target miss, control bypass, FIN/ACK, and deletion commit/abort behavior. |
 | TC-TC-026 | REQ-TC-006 | Protobuf wire compatibility | Retired policy tags are reserved; active legacy fields retain their original tags; new fields use fresh tags. |
 | TC-CI-001 | REQ-CI-001 | Workflow triggers and platform | Pull requests and pushes to `main` select Ubuntu and use locked repository/toolchain inputs. |
 | TC-CI-002 | REQ-CI-002 | Rust format/lint/build/test gates | Any failure of the four exact workspace commands fails the workflow. |
 | TC-CI-003 | REQ-CI-003 | Canonical BPF build | Required native tools are installed and `make -C crates/bpf clean all` produces the expected ELF; compile failure fails the workflow. |
 | TC-CI-004 | REQ-CI-004 | Runner loading and capability failure | The checked-in runner loads the ELF and exits nonzero for missing capabilities, invalid symbols/maps, verifier rejection, or setup failure. |
-| TC-CI-005 | REQ-CI-004 | Ordered kernel fixture sequence | The runner executes target miss, flow creation, forward/reverse rewrite, control bypass, FIN/ACK teardown, and RST; every expected action, packet byte, checksum, and map-state assertion passes. |
+| TC-CI-005 | REQ-CI-004 | Ordered kernel fixture sequence | The runner executes target miss, flow creation, forward/reverse rewrite, control bypass, FIN/ACK teardown, RST retention, and deletion commit/abort; every expected action, packet byte, checksum, and map-state assertion passes. |
 | TC-CI-006 | REQ-CI-005 | No silent skip/artifact publication | Enabled fixture execution cannot be skipped and the workflow publishes no build artifact or changes production behavior. |
 | TC-CI-007 | REQ-CI-006 | Windows OpenSSL installation | The Windows job installs the exact `ShiningLight.OpenSSL.Dev` 4.0.1 package, verifies the package and `openssl version`, and fails on mismatch or missing PSK capability. |
 | TC-CI-008 | REQ-CI-007 | Windows host-proxy build | With TLS-PSK enabled and the pinned OpenSSL environment, formatting, strict clippy, and the locked host-proxy build succeed. |
@@ -77,8 +77,8 @@ RST.
 | TC-HP-MAINT-008 | REQ-HP-MAINT-001/003 | Host-driven TCP cleanup | Host policy deletes incomplete idle TCP, RST, and completed FIN/ACK flows using generation-safe flow operations and verifies no indexes remain. |
 | TC-HP-MAINT-009 | REQ-HP-MAINT-001/003 | Host-driven UDP cleanup | Host policy expires idle UDP, deletes the corresponding dataplane flow, and invalidates the local association only after the deletion outcome is known. |
 | TC-HP-MAINT-010 | REQ-HP-MAINT-001/006 | Activation and shutdown ownership | Host-proxy initiates attach/configure and detach; control-service shutdown does not independently run cleanup or alter host policy. |
-| TC-TC-027 | REQ-TC-002/003/006 | RST and host deletion race | State-first deletion, generation-owned index checks, and successful-state-only capacity release preserve a replacement incarnation; every post-guard error removes or expires the guard. |
-| TC-TC-028 | REQ-TC-002/003 | Packet/delete quiescence | A packet that crossed the first guard check increments in-flight before its final check; host waits for zero and rejects a changed observation rather than deleting an active generation. |
+| TC-TC-027 | REQ-TC-002/003/006 | Host deletion and release recovery | State-first deletion, generation-owned index checks, and a persistent release journal preserve a replacement incarnation; a failed publication retries without double capacity release. |
+| TC-TC-028 | REQ-TC-002/003 | Packet/delete quiescence | A packet that crossed the first guard check increments in-flight before its final check; guard expiry and host commit race through an atomic outcome record, so only a committed operation can delete state. |
 | TC-TC-029 | REQ-TC-005 | Concurrent attach/configure | The final BPF runtime record equals the final published snapshot irrespective of attach/set-config ordering. |
 | TC-HP-MAINT-011 | REQ-HP-MAINT-004/006 | Retry, timeout, and shutdown bounds | Retry schedules the next scan at its exponential-backoff deadline; pending RPCs cancel at shutdown or fail at their deadline before BPF detach. |
 | TC-HP-MAINT-012 | REQ-HP-MAINT-005 | Outbound UDP activity | Continuous client-to-destination sends extend association lifetime without extra mapping lookups; expiry still cancels the matching relay. |

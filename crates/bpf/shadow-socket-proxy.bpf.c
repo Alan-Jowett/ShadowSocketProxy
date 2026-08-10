@@ -134,6 +134,14 @@ static __s64 (*bpf_csum_diff)(__be32 *from, __u32 from_size, __be32 *to,
 #define TCP_FLAG_RST 0x04
 /** TCP wire ACK flag value. */
 #define TCP_FLAG_ACK 0x10
+/** A deletion operation that expired before the host committed it. */
+#define FLOW_DELETE_ABORTED 1U
+/** A deletion operation committed by the host after packet quiescence. */
+#define FLOW_DELETE_COMMITTED 2U
+/** A capacity-release journal entry not yet consumed by the dataplane. */
+#define FLOW_RELEASE_PENDING 0U
+/** A capacity-release journal entry claimed by the dataplane. */
+#define FLOW_RELEASE_CONSUMED 1U
 
 /** Packed tuple key shared by the three tuple-index entries for a flow. */
 struct tuple_key {
@@ -321,12 +329,20 @@ struct {
     __type(value, __u64);
 } ssp_tc_active_flows_v1 SEC(".maps");
 
-/** Atomic host-to-dataplane active-flow release notifications. */
+/** Host-to-dataplane active-flow release notifications keyed by flow generation. */
 struct {
     __uint(type, BPF_MAP_TYPE_QUEUE);
     __uint(max_entries, 65536);
-    __type(value, __u32);
+    __type(value, struct flow_state_key);
 } ssp_tc_active_flow_releases_v1 SEC(".maps");
+
+/** Persists an exactly-once capacity-release journal until the dataplane consumes it. */
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 65536);
+    __type(key, struct flow_state_key);
+    __type(value, __u32);
+} ssp_tc_active_flow_release_pending_v1 SEC(".maps");
 
 /** Persisted generation allocator for flow incarnations. */
 struct {
@@ -343,6 +359,14 @@ struct {
     __type(key, struct flow_state_key);
     __type(value, __u64);
 } ssp_flow_delete_guard_v1 SEC(".maps");
+
+/** Arbitrates an expired guard against a host deletion commit. */
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 65536);
+    __type(key, struct flow_state_key);
+    __type(value, __u32);
+} ssp_flow_delete_outcome_v1 SEC(".maps");
 
 /** Packets that have entered one flow's update critical section. */
 struct {
@@ -436,7 +460,8 @@ static __always_inline void release_flow_slot(void);
 static __always_inline int reserve_flow_slot(void)
 {
     __u32 config_key = 0;
-    __u32 release;
+    struct flow_state_key release;
+    __u32 *pending;
     __u64 *count = bpf_map_lookup_elem(&ssp_tc_active_flows_v1, &config_key);
     struct runtime_config_value *config =
         bpf_map_lookup_elem(&ssp_runtime_config_v3, &config_key);
@@ -444,8 +469,17 @@ static __always_inline int reserve_flow_slot(void)
 
     if (!count)
         return 0;
-    if (bpf_map_pop_elem(&ssp_tc_active_flow_releases_v1, &release) == 0)
-        release_flow_slot();
+    if (bpf_map_pop_elem(&ssp_tc_active_flow_releases_v1, &release) == 0) {
+        pending = bpf_map_lookup_elem(&ssp_tc_active_flow_release_pending_v1,
+                                      &release);
+        if (pending &&
+            __sync_bool_compare_and_swap(pending, FLOW_RELEASE_PENDING,
+                                         FLOW_RELEASE_CONSUMED)) {
+            release_flow_slot();
+            bpf_map_delete_elem(&ssp_tc_active_flow_release_pending_v1,
+                                &release);
+        }
+    }
     previous = __sync_fetch_and_add(count, 1);
     if (config && config->active_flow_capacity &&
         previous >= config->active_flow_capacity) {
@@ -796,19 +830,43 @@ static __always_inline int is_control_packet(const struct packet_info *packet,
 /**
  * Returns whether the host has frozen this flow for deletion.
  *
- * Guard values are BPF-monotonic expiry times. A failed userspace cleanup
- * cannot blackhole a flow indefinitely because the next packet removes an
- * expired guard before proceeding.
+ * Guard expiry races the host commit through an outcome map using BPF_NOEXIST.
+ * Exactly one side wins: an expired guard records ABORT and permits packets,
+ * while a committed deletion blocks packets until host cleanup removes both
+ * records. This provides an atomic packet/host commit point without relying on
+ * a non-atomic userspace read of the in-flight counter.
  */
 static __always_inline int deletion_guard_active(
     const struct flow_state_key *state_key)
 {
     __u64 *guard = bpf_map_lookup_elem(&ssp_flow_delete_guard_v1, state_key);
+    __u32 *outcome =
+        bpf_map_lookup_elem(&ssp_flow_delete_outcome_v1, state_key);
+    __u32 aborted = FLOW_DELETE_ABORTED;
 
+    if (outcome) {
+        if (*outcome == FLOW_DELETE_COMMITTED)
+            return 1;
+        if (*outcome == FLOW_DELETE_ABORTED)
+            return 0;
+        return 1;
+    }
     if (!guard)
         return 0;
     if (bpf_ktime_get_ns() >= *guard) {
-        bpf_map_delete_elem(&ssp_flow_delete_guard_v1, state_key);
+        /*
+         * A host commit racing this expiry inserts COMMITTED with the same
+         * BPF_NOEXIST linearization. Do not remove the guard after losing that
+         * race: the committed deletion must continue to block packet updates.
+         */
+        if (bpf_map_update_elem(&ssp_flow_delete_outcome_v1, state_key,
+                                &aborted, BPF_NOEXIST) == 0) {
+            bpf_map_delete_elem(&ssp_flow_delete_guard_v1, state_key);
+            return 0;
+        }
+        outcome = bpf_map_lookup_elem(&ssp_flow_delete_outcome_v1, state_key);
+        if (outcome && *outcome == FLOW_DELETE_COMMITTED)
+            return 1;
         return 0;
     }
     return 1;
@@ -818,8 +876,9 @@ static __always_inline int deletion_guard_active(
  * Enters the packet-side deletion critical section.
  *
  * A host deletion first inserts the guard, then waits for this counter to
- * reach zero. The second guard check closes the race where a packet passed the
- * first check while the host inserted the guard. Packets that observe a guard
+ * reach zero and atomically commits through the outcome map. The second guard
+ * check closes the race where a packet passed the first check while the host
+ * inserted the guard. Packets that observe either guard or a committed outcome
  * never mutate the state or packet.
  */
 static __always_inline int enter_flow_packet(
@@ -902,41 +961,8 @@ static __always_inline void update_tcp_state(struct flow_state_value *state,
         state->terminal_deadline_ns = now + grace;
 }
 
-/**
- * Deletes native state plus its original, target, and reverse indexes.
- * @param state flow record containing the id/generation and three keys
- * @return TC_ACT_OK so deletion never drops the packet by itself
- */
 static __always_inline void delete_owned_index(
     const struct tuple_key *key, const struct flow_index_value *owner);
-
-static __always_inline int delete_flow(const struct flow_state_value *state)
-{
-    struct flow_state_key state_key = {
-        .version = bpf_htons(MAP_ABI_VERSION),
-        .flow_id = state->flow_id,
-        .generation = state->generation,
-    };
-    struct flow_index_value owner = {
-        .version = bpf_htons(MAP_ABI_VERSION),
-        .flow_id = state->flow_id,
-        .generation = state->generation,
-    };
-
-    /*
-     * Delete canonical state first. A failed delete means another teardown
-     * won the race, so this packet must not release capacity or touch indexes
-     * that could already belong to a newer incarnation.
-     */
-    if (bpf_map_delete_elem(&ssp_flow_state_v1, &state_key) != 0)
-        return TC_ACT_OK;
-    delete_owned_index(&state->original, &owner);
-    delete_owned_index(&state->target, &owner);
-    delete_owned_index(&state->reverse, &owner);
-    bpf_map_delete_elem(&ssp_flow_packet_inflight_v1, &state_key);
-    release_flow_slot();
-    return TC_ACT_OK;
-}
 
 /**
  * Deletes an index only when it still belongs to the supplied flow generation.
@@ -956,7 +982,7 @@ static __always_inline void delete_owned_index(const struct tuple_key *key,
 
 /**
  * Resolves or creates a flow-map entry, applies direction-specific tuple
- * rewriting, records TCP lifecycle state, and removes terminal flows.
+ * rewriting, and records TCP lifecycle state for host-owned cleanup.
  * Missing targets, capacity failures, malformed state, and unsupported
  * packets leave the packet unchanged or return the verifier-safe action
  * selected by the existing failure path.
@@ -1109,12 +1135,6 @@ static __always_inline int process_packet(struct __sk_buff *skb, bool ingress)
 
     now = bpf_ktime_get_ns();
     direction = ingress ? 0 : 1;
-    candidate = bpf_map_lookup_elem(&ssp_tc_scratch_v1, &scratch_key);
-    if (!candidate) {
-        leave_flow_packet(&state_key);
-        return TC_ACT_SHOT;
-    }
-    *candidate = *state;
     if (packet.protocol == IPPROTO_TCP) {
         update_tcp_state(state, direction, packet.tcp_flags, now);
     } else {
@@ -1127,11 +1147,6 @@ static __always_inline int process_packet(struct __sk_buff *skb, bool ingress)
     } else {
         rewrite_source(skb, &packet, state->original.destination,
                        state->original.destination_port);
-    }
-    if (packet.protocol == IPPROTO_TCP && (packet.tcp_flags & TCP_FLAG_RST)) {
-        leave_flow_packet(&state_key);
-        delete_flow(candidate);
-        return TC_ACT_OK;
     }
     leave_flow_packet(&state_key);
     return TC_ACT_OK;

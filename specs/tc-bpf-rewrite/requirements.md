@@ -147,20 +147,21 @@
 
 ### CHG-010 — Harden flow deletion and lifecycle transactions
 
-- **Before:** RST teardown can release a slot after state ownership changes,
-  deletion guards do not prove packet quiescence, attach/configure requests can
-  interleave, and host shutdown/control retries have unbounded edges.
+- **Before:** Dataplane RST teardown can release a slot after state ownership
+  changes, deletion guards do not provide a host/packet commit point,
+  attach/configure requests can interleave, and host shutdown/control retries
+  have unbounded edges.
 - **After:** Packet updates participate in a generation-addressed in-flight
   protocol. Host deletion freezes a generation, waits for in-flight updates to
-  drain, then verifies its observation before deleting canonical state. RST
-  teardown deletes indexes only after deleting its own state and only when each
-  index still names the same generation; capacity is released only by the
-  successful state owner. Guard expiry and unconditional post-insertion cleanup
-  prevent a failed delete from blackholing traffic. Attach and configuration
-  publication are one serialized transaction. Host-proxy tracks outbound UDP
-  activity, waits for forwarding children before detaching, bounds control
-  operations, bounds duration conversion, and schedules retry attempts by the
-  selected backoff deadline.
+  drain, then atomically commits against guard expiry before deleting canonical
+  state. RST remains a recorded TCP observation for host maintenance. A
+  persistent generation-addressed release journal makes capacity publication
+  retryable and dataplane consumption exactly once. Guard expiry and
+  unconditional post-insertion cleanup prevent a failed delete from
+  blackholing traffic. Attach and configuration publication are one serialized
+  transaction. Host-proxy tracks outbound UDP activity, waits for forwarding
+  children before detaching, bounds control operations, bounds duration
+  conversion, and schedules retry attempts by the selected backoff deadline.
 - **Traceability:** `USER-REQUEST: consolidated hardening pass for remaining
   concurrency, shutdown, timeout, and specification findings.`
 
@@ -181,17 +182,19 @@ original client-to-destination, synthetic client-to-target, and reverse
 target-to-client tuples. New flow state MUST snapshot the current target;
 configuration changes MUST NOT mutate active flow targets. Packet updates MUST
 enter a generation-addressed in-flight critical section before mutating active
-state; host deletion MUST freeze that generation and observe the section
-drained before deleting its state or indexes.
+state; host deletion MUST freeze that generation, observe the section drained,
+and atomically commit against guard expiry before deleting its state or
+indexes.
 
 ### REQ-TC-003 — TCP/UDP lifecycle
 
-TCP MUST record SYN, SYN/ACK, ACK, FIN, and RST observations. RST removes the
-flow immediately. Completed bidirectional FIN/ACK teardown is retained until
-terminal grace; incomplete TCP, UDP, and QUIC-over-UDP expire through idle TTL.
-An RST teardown MUST delete canonical state before indexes, remove only indexes
-that still identify its flow ID and generation, and release active-flow
-capacity only when its state deletion succeeds.
+TCP MUST record SYN, SYN/ACK, ACK, FIN, and RST observations. RST is retained
+for host-owned lifecycle policy; completed bidirectional FIN/ACK teardown is
+retained until terminal grace; incomplete TCP, UDP, and QUIC-over-UDP expire
+through idle TTL. Host deletion MUST delete canonical state before indexes,
+remove only indexes that still identify its flow ID and generation, and release
+active-flow capacity through a persistent generation-addressed journal only
+after state deletion succeeds.
 
 ### REQ-TC-004 — Packet safety
 
@@ -212,8 +215,9 @@ snapshot and BPF runtime map never describe different configurations.
 The control service MUST validate all v3 symbols/maps, runtime schema, counter
 slots, and fixed maxima before readiness. Attach, rollback, detach, maintenance,
 and shutdown MUST retain explicit partial-failure behavior. Deletion guards
-MUST be cleaned after every post-insertion outcome and expire in the packet
-path if host cleanup cannot remove them.
+MUST be atomically committed or aborted against packet-side expiry, cleaned
+after every post-insertion outcome, and expire in the packet path if host
+cleanup cannot remove them.
 
 ### REQ-TC-007 — Listener immutability
 

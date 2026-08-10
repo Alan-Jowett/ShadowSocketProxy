@@ -75,12 +75,16 @@ dataplane observations; host-proxy owns cleanup decisions.
 An atomic in-flight map is keyed by each active state generation. A packet
 checks for a generation-keyed deletion guard, increments that counter, then
 checks again before modifying state. Host deletion inserts an expiring guard,
-waits for the counter to drain, rechecks `last_used_ns`, deletes canonical
-state, and only then deletes tuple indexes that still encode the same
-ID/generation and queues a capacity release. RST follows the same state-first,
-ownership-checked sequence. Every host path after guard insertion removes the
-guard; an expired guard self-removes in the packet path so a map operation
-failure cannot permanently drop traffic.
+waits for the counter to drain, and atomically inserts a `COMMITTED` outcome
+against the packet path's `ABORTED` expiry outcome. Only a committed operation
+rechecks `last_used_ns` and deletes canonical state. It then deletes tuple
+indexes that still encode the same ID/generation and publishes a
+generation-addressed capacity-release journal entry. The dataplane consumes
+each journal entry once, so failed queue publication is retryable without
+double release. RST records lifecycle state but does not delete flows. Every
+host path after guard insertion removes its guard and outcome; an expired
+uncommitted guard records `ABORTED` and self-removes in the packet path so a
+map operation failure cannot permanently drop traffic.
 
 ### D-TC-006 — Backend and service surface
 
@@ -319,7 +323,7 @@ returns nonzero.
 | INV-TC-004 | One flow ID owns original, synthetic, and reverse indexes plus one lifecycle state. |
 | INV-TC-005 | Target miss passes; insertion failure drops; control bypass passes and is counted. |
 | INV-TC-006 | No malformed, non-initial, unsupported, or non-linear packet is partially rewritten. |
-| INV-TC-007 | TCP terminal grace precedes idle cleanup; RST deletes immediately; UDP remains idle-TTL managed. |
+| INV-TC-007 | TCP terminal grace precedes idle cleanup; RST is retained for host cleanup; UDP remains idle-TTL managed. |
 | INV-TC-008 | Readiness requires the complete v3 artifact and rejects stale/mixed policy artifacts. |
 | INV-TC-009 | The listener descriptor is present before attach and immutable through SetConfig. |
 | INV-CI-001 | Every required Rust, BPF-build, and explicitly enabled kernel-fixture gate is executed and failures remain visible. |
@@ -331,5 +335,5 @@ returns nonzero.
 | INV-HP-MAINT-001 | Host-proxy is the sole lifecycle-policy owner; control-service requests are stateless adapters. |
 | INV-HP-MAINT-002 | A flow identity/generation maps to one canonical state and all tuple indexes during adapter cleanup. |
 | INV-HP-MAINT-003 | Control-plane loss does not interrupt existing forwarding or cause unconfirmed local deletion. |
-| INV-TC-010 | A deletion guard blocks only a bounded quiescence window; no old RST or host delete can remove a newer generation's index or capacity. |
+| INV-TC-010 | An atomic deletion commit/abort outcome bounds guard quiescence; no old RST or host delete can remove a newer generation's index or capacity. |
 | INV-TC-011 | The BPF runtime map and published configuration are serialized across attach and configuration updates. |
