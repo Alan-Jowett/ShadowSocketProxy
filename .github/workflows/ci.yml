@@ -545,10 +545,11 @@ jobs:
             "shadow-socket-proxy-e2e-runner"
           )
           foreach ($package in $packages) {
-            $output = & cargo check --locked -p $package --no-default-features `
-              --features tls-psk,tls-rustls 2>&1
+            $log = Join-Path $env:RUNNER_TEMP "$package-both-tls.log"
+            & cargo check --locked -p $package --no-default-features `
+              --features tls-psk,tls-rustls *> $log
             $status = $LASTEXITCODE
-            $text = ($output | Out-String) `
+            $text = (Get-Content -Raw $log) `
               -replace "`e\[[0-9;]*m", "" `
               -replace "[^\x20-\x7E\r\n\t]", ""
             Write-Output $text
