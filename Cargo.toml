@@ -7,5 +7,6 @@ members = [
     "crates/control-service",
     "crates/e2e-runner",
     "crates/host-proxy",
+    "crates/tls-rustls",
 ]
 resolver = "2"

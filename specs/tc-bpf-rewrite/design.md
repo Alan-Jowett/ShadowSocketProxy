@@ -3,17 +3,28 @@
 
 # TC BPF Rewrite Design
 
+## Identifier scope and uniqueness
+
+Identifiers are scoped to this TC/BPF specification artifact. Design
+definitions (`D-*`) are unique within `design.md`; `CHG-*`, `REQ-*`, and
+`TC-*` names are references to their owning sibling artifacts. New TLS names
+that cross specification-artifact boundaries use globally unique,
+artifact-qualified spellings. Existing unqualified `CHG-*` duplicates across
+independent legacy specifications are baseline, not a result of the TLS
+change.
+
 ## Traceability
 
 ```text
 USER-REQUEST -> CHG-001..004, CHG-010 -> REQ-TC-001..007
              -> CHG-005 -> REQ-CI-001..005
+             -> CHG-CI-TLS-001 -> REQ-CI-009
              -> CHG-006 -> REQ-HP-LOG-001..003
              -> CHG-007..009 -> REQ-HP-MAINT-001..006
              -> D-TC-001..009, D-CI-001..004, D-HP-LOG-001..003,
                 D-HP-MAINT-001..006
-             -> TC-TC-001..026, TC-CI-001..006, TC-HP-LOG-001..005,
-                TC-HP-MAINT-001..010
+             -> TC-TC-001..026, TC-CI-001..014, TC-HP-LOG-001..005,
+                TC-HP-MAINT-001..012
              -> BPF, backend, protobuf, service, lifecycle, logging,
                 maintenance, and test changes
 ```
@@ -234,17 +245,27 @@ local in the control-service, but they cannot drive lifecycle policy.
 
 The workflow runs on pull requests and pushes to `main` on `ubuntu-latest`.
 It checks out the repository, installs the pinned lockfile-respecting Rust
-toolchain, installs clang, LLVM, Linux kernel UAPI headers,
-OpenSSL/pkg-config development dependencies, and the build tools needed by the
-workspace. It runs the four Rust gates and then the BPF build and fixture
-execution gates.
+toolchain, installs clang, LLVM, Linux kernel UAPI headers, and the build tools
+needed by the feature-neutral workspace baseline. PSK-specific artifact and
+Windows jobs install the pinned OpenSSL/pkg-config dependencies separately.
+The feature-neutral workspace gates, isolated Linux and Windows rustls jobs,
+separate PSK jobs, and BPF fixture execution all fail closed.
 
 ### D-CI-002 — Canonical command ownership
 
-Rust validation uses the exact workspace commands in REQ-CI-002. BPF
-compilation uses `make -C crates/bpf clean all`, preserving the repository
-Makefile as the source of compiler flags and output naming. The generated ELF
-path is passed to the integration test through `SSP_TEST_BPF_ELF`.
+Rust validation uses the feature-neutral commands in REQ-CI-002 plus explicit
+`tls-rustls` and `tls-psk` matrix commands. A `tls-rustls` job never installs or
+configures OpenSSL, and the PSK jobs retain the pinned OpenSSL setup. The
+feature-selection gate invokes each runnable package with both TLS features
+and requires the mutually-exclusive diagnostic. The feature-neutral gate also
+executes each TLS-selected binary without either feature and requires its
+nonzero explicit feature-selection diagnostic while retaining library/test
+compilation. The OpenSSL-capable Linux control artifact job runs the
+control-service `tls-psk` test suite in addition to its PSK release build.
+BPF compilation uses
+`make -C crates/bpf clean all`, preserving the repository Makefile as the
+source of compiler flags and output naming. The generated ELF path is passed
+to the integration test through `SSP_TEST_BPF_ELF`.
 
 ### D-CI-003 — Checked-in privileged runner
 
@@ -269,7 +290,8 @@ skip.
 The existing workflow adds a `windows-latest` job with the same pull-request
 and `main` push triggers as the Linux job. It uses the pinned repository
 actions and Rust 1.96.1, but limits validation to formatting, strict clippy,
-and the Windows host-proxy TLS-PSK build and test gates.
+the Windows host-proxy TLS-PSK build/test gates, and a separate Windows rustls
+job that does not install or configure OpenSSL.
 
 ### D-CI-006 — Pinned Windows OpenSSL setup
 
@@ -277,7 +299,8 @@ The Windows job installs `ShiningLight.OpenSSL.Dev` version 4.0.1 with winget
 using the exact package ID and version. It verifies the installed package and
 OpenSSL version, configures the OpenSSL environment expected by the
 `openssl-sys` build, and fails explicitly if the installation or TLS-PSK
-capability is unavailable.
+capability is unavailable. The rustls feature checks do not depend on this
+installation.
 
 ### D-CI-007 — Locked Windows commands
 
@@ -286,6 +309,8 @@ Windows validation runs `cargo fmt --all -- --check`,
 --all-targets -- -D warnings`, `cargo build --locked
 -p shadow-socket-proxy-host --features tls-psk`, and
 `cargo test --locked -p shadow-socket-proxy-host --features tls-psk`.
+The isolated Windows rustls job checks the host-proxy, control-service, and
+e2e-runner without enabling or configuring OpenSSL.
 
 ### D-CI-E2E-001 — Deployable workflow artifacts
 

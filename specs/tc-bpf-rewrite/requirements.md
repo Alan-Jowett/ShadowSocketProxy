@@ -3,6 +3,19 @@
 
 # TC BPF Rewrite Requirements
 
+## Identifier scope and uniqueness
+
+This TC/BPF specification set is the owning artifact for the requirements,
+design, validation, and CI audit references in this directory. `CHG-*` and
+`REQ-*` definitions are owned by this requirements artifact, `D-*` definitions
+by `design.md`, and `TC-*` definitions by `validation.md`. Each identifier
+MUST be defined only once within its owning artifact; references may repeat.
+New TLS identifiers referenced from another specification artifact MUST use an
+artifact-qualified name that is globally unique across `specs/`, and every
+cross-artifact reference MUST preserve that qualified spelling. Existing
+unqualified `CHG-*` duplicates in independent legacy specifications are
+baseline and were not introduced by the TLS change.
+
 ## Approved Change Set
 
 ### CHG-001 — Replace destination policy with global family targets
@@ -165,6 +178,21 @@
 - **Traceability:** `USER-REQUEST: consolidated hardening pass for remaining
   concurrency, shutdown, timeout, and specification findings.`
 
+### CHG-CI-TLS-001 — Isolate mutually exclusive TLS CI validation
+
+- **Before:** The CI/specification matrix treats the mutually exclusive TLS
+  alternatives as one all-features workspace gate and does not isolate
+  OpenSSL-dependent PSK validation from rustls validation.
+- **After:** Feature-neutral workspace gates remain runnable without selecting a
+  TLS transport. Linux and Windows rustls jobs build and test without
+  installing or configuring OpenSSL, PSK jobs retain their OpenSSL setup, and
+  the runnable packages explicitly reject selecting both TLS features.
+- **Traceability:** `USER-REQUEST: Reconcile CI/spec requirements with
+  exclusive TLS features: runnable binaries require exactly one; no impossible
+  all-features gate. Add isolated rustls Linux/Windows jobs that do not
+  install/configure OpenSSL, retain separate PSK jobs, and explicitly test
+  both-features rejection.`
+
 ## Stable Requirements
 
 ### REQ-TC-001 — Family-preserving global DNAT
@@ -235,8 +263,12 @@ dependencies explicit.
 ### REQ-CI-002 — Rust quality gates
 
 The workflow MUST fail if `cargo fmt --all -- --check`,
-`cargo clippy --workspace --all-targets --all-features -- -D warnings`,
-`cargo build --workspace`, or `cargo test --workspace` fails.
+`cargo clippy --locked --workspace --all-targets --no-default-features -- -D
+warnings`, `cargo build --locked --workspace`, or
+`cargo test --locked --workspace` fails.
+The workspace baseline MUST remain feature-neutral; mutually exclusive TLS
+features MUST be validated through separate per-feature jobs rather than an
+impossible `--all-features` invocation.
 
 ### REQ-CI-003 — BPF build gate
 
@@ -278,6 +310,25 @@ enabled fails.
 Before the change is submitted for review, the same OpenSSL version and
 Windows host-proxy validation commands MUST pass on a Windows development
 environment.
+
+### REQ-CI-009 — Rustls feature gate
+
+CI MUST also run isolated Linux and Windows `tls-rustls` jobs for the
+control-service, host-proxy, and e2e-runner without installing or configuring
+OpenSSL in those jobs. The Linux job MUST run authenticated tonic h2 server
+and client coverage where the target supports it; the Windows job MUST run
+the rustls host-proxy client path. The shared rustls parser/verifier tests and
+duplicate CLI/environment rejection tests MUST pass. Separate PSK jobs retain
+the OpenSSL setup and MUST explicitly verify that selecting both TLS features
+fails with the mutually-exclusive diagnostic.
+
+The feature-neutral validation job MUST build and execute each runnable
+control-service, host-proxy, and e2e-runner binary without either TLS feature.
+Each executable MUST exit nonzero with its explicit feature-selection
+diagnostic. Supporting library and test compilation MUST remain allowed in the
+feature-neutral workspace. An OpenSSL-capable Linux artifact job MUST also run
+the control-service test suite with `tls-psk`; the existing Windows PSK build
+and test gates remain separate from the rustls jobs.
 
 ### REQ-CI-E2E-001 — Separate deployable artifacts
 

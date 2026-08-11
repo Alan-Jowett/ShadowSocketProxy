@@ -3,6 +3,19 @@
 
 # ShadowSocketProxy Host Shadow Proxy Requirements
 
+## Identifier scope and uniqueness
+
+This host-shadow-proxy specification set is the owning artifact for the
+requirements, design, and validation documents in this directory.
+`CHG-*` and `REQ-*` definitions are owned by this requirements artifact,
+`D-*` definitions by `design.md`, and `TC-*` definitions by `validation.md`.
+Each identifier MUST be defined only once within its owning artifact;
+references may repeat. New TLS identifiers referenced from another
+specification artifact MUST use an artifact-qualified name that is globally
+unique across `specs/`, and every cross-artifact reference MUST preserve that
+qualified spelling. Existing unqualified `CHG-*` duplicates in independent
+legacy specifications are baseline and were not introduced by the TLS change.
+
 ## Change Set
 
 ### CHG-009 — Add the Windows host shadow proxy
@@ -89,7 +102,18 @@
   expire according to the configured idle timeout.
 - **Traceability:** `Unbounded, relying on OS/resource errors`.
 
-### CHG-016 — Windows conditional TCP admission
+### CHG-HP-TLS-001 — Feature-selected control transport
+
+- **Before:** The Windows proxy control client supports only OpenSSL
+  TLS-PSK.
+- **After:** The runnable proxy selects exactly one of `tls-psk` or
+  `tls-rustls`, with no default. The PSK path is preserved; the rustls path
+  uses mutual self-signed PEM identities and a normalized SHA-256 pin of the
+  peer leaf DER, with no hostname requirement and no fallback.
+- **Traceability:** `USER-REQUEST: add mutually exclusive tls-psk/tls-rustls
+  selection ... host-proxy ...`
+
+### CHG-019 — Windows conditional TCP admission
 
 - **Before:** Tokio accepts TCP connections before the proxy has validated the
   mapping or established the outbound connection.
@@ -229,15 +253,24 @@ response delivery.
 
 ### REQ-013 — Authenticated Windows gRPC client
 
-The proxy MUST use the existing `GetMapping` protobuf RPC over authenticated
-TLS 1.2 PSK gRPC. It MUST fail startup when configured credentials or the
-required PSK-capable transport cannot be initialized.
+The proxy MUST use the existing `GetMapping` protobuf RPC over the selected
+authenticated TLS transport. `tls-psk` MUST preserve TLS 1.2 PSK gRPC.
+`tls-rustls` MUST provide TLS 1.2/1.3 h2 gRPC with mutual self-signed PEM
+certificates and a normalized SHA-256 pin over the peer leaf's exact DER
+bytes. Rustls MUST validate signature, validity, and applicable key-usage
+checks with the pinned leaf as trust anchor, without hostname matching.
+Startup MUST
+fail when the selected credentials, files, pin, or transport cannot be
+initialized.
 
 **Acceptance criteria**
 
 - Correct identity/secret permits lookup.
 - Incorrect credentials, plaintext, and unsupported PSK builds do not yield
   successful lookups.
+- A matching rustls certificate/key pair and peer pin permits lookup; a
+  malformed, duplicate CLI/environment, mismatched, expired, or wrong-usage
+  rustls configuration fails before readiness.
 - The PSK secret is not logged or returned in diagnostics.
 - Control-service errors remain distinguishable from mapping-not-found.
 

@@ -3,6 +3,9 @@
 //! Control-plane library combining BPF lifecycle, configuration, logs, ABI
 //! mapping, gRPC service, and TLS transport modules.
 
+#[cfg(all(feature = "tls-psk", feature = "tls-rustls"))]
+compile_error!("tls-psk and tls-rustls are mutually exclusive");
+
 /// BPF attachment, map, counter, and cleanup backends.
 pub mod bpf;
 /// Runtime configuration validation and atomic publication.
@@ -15,7 +18,7 @@ pub mod logs;
 pub mod mapping;
 /// gRPC methods and protobuf/ABI conversion helpers.
 pub mod service;
-/// Linux TLS-PSK listener for the control service.
+/// Feature-selected TLS listener for the control service.
 pub mod transport;
 
 /// Generated protobuf and tonic service bindings.

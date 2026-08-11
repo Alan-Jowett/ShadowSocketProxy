@@ -15,6 +15,7 @@ path = "src/main.rs"
 [features]
 default = []
 tls-psk = ["dep:hyper-util", "dep:openssl", "dep:tokio-openssl"]
+tls-rustls = ["dep:hyper-util", "dep:shadow-socket-proxy-tls-rustls", "dep:tokio-rustls"]
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
@@ -28,6 +29,16 @@ tower = "0.5"
 hyper-util = { version = "0.1", features = ["tokio"], optional = true }
 openssl = { version = "0.10.81", optional = true }
 tokio-openssl = { version = "0.6.5", optional = true }
+
+[dependencies.shadow-socket-proxy-tls-rustls]
+path = "../tls-rustls"
+optional = true
+
+[dependencies.tokio-rustls]
+version = "0.26"
+default-features = false
+features = ["ring", "tls12"]
+optional = true
 
 [build-dependencies]
 protoc-bin-vendored = "3"

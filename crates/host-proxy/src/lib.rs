@@ -3,6 +3,9 @@
 //! Runs the TCP/UDP host-side forwarder and its platform-specific control
 //! service client.
 
+#[cfg(all(feature = "tls-psk", feature = "tls-rustls"))]
+compile_error!("tls-psk and tls-rustls are mutually exclusive");
+
 #[cfg(any(target_os = "windows", test))]
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::{
@@ -254,7 +257,7 @@ pub enum ProxyError {
     /// A socket or stream operation failed.
     Io(#[from] io::Error),
     #[error("proxy is unsupported on this platform")]
-    /// The selected build does not provide the TLS-PSK mapping client.
+    /// The selected build does not provide its platform TLS mapping client.
     UnsupportedPlatform,
 }
 
@@ -384,6 +387,7 @@ impl ProxyConfig {
                 "control endpoint is required".into(),
             ));
         }
+        #[cfg(not(feature = "tls-rustls"))]
         if self.psk_identity.is_empty() || self.psk_secret.is_empty() {
             return Err(ProxyError::InvalidConfiguration(
                 "PSK identity and secret are required".into(),
@@ -415,6 +419,18 @@ impl ProxyConfig {
         {
             return Err(ProxyError::InvalidConfiguration(
                 "maintenance settings must be nonzero".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Validates the legacy OpenSSL TLS-PSK credentials used by the PSK
+    /// control client.
+    #[cfg(feature = "tls-psk")]
+    pub fn validate_tls_psk(&self) -> Result<(), ProxyError> {
+        if self.psk_identity.is_empty() || self.psk_secret.is_empty() {
+            return Err(ProxyError::InvalidConfiguration(
+                "PSK identity and secret are required".into(),
             ));
         }
         Ok(())
@@ -2667,6 +2683,84 @@ mod windows_conditional {
             );
             assert!(error.to_string().starts_with("saved WSAAccept: "));
         }
+    }
+}
+
+#[cfg(all(target_os = "windows", feature = "tls-rustls"))]
+mod rustls_client;
+
+#[cfg(all(target_os = "windows", feature = "tls-rustls"))]
+pub use rustls_client::TlsRustlsMappingClient;
+
+#[cfg(not(all(target_os = "windows", feature = "tls-rustls")))]
+#[derive(Clone)]
+/// Placeholder client that reports rustls support is unavailable on this
+/// build.
+pub struct TlsRustlsMappingClient;
+
+#[cfg(not(all(target_os = "windows", feature = "tls-rustls")))]
+impl TlsRustlsMappingClient {
+    /// Always returns `UnsupportedPlatform` when the Windows rustls client is
+    /// absent.
+    pub async fn connect(
+        _endpoint: &str,
+        _certificate_file: &std::path::Path,
+        _key_file: &std::path::Path,
+        _peer_cert_sha256: &str,
+    ) -> Result<Self, ProxyError> {
+        Err(ProxyError::UnsupportedPlatform)
+    }
+
+    /// Reports that BPF activation is unavailable without the Windows rustls
+    /// client.
+    pub async fn activate(
+        &self,
+        _elf_path: &str,
+        _interface: &str,
+        _proxy: SocketAddr,
+    ) -> Result<(), ProxyError> {
+        Err(ProxyError::UnsupportedPlatform)
+    }
+
+    /// Reports that BPF detachment is unavailable without the Windows rustls
+    /// client.
+    pub async fn detach(&self, _interface: &str) -> Result<(), ProxyError> {
+        Err(ProxyError::UnsupportedPlatform)
+    }
+}
+
+#[cfg(not(all(target_os = "windows", feature = "tls-rustls")))]
+#[async_trait]
+impl MappingClient for TlsRustlsMappingClient {
+    /// Always returns `UnsupportedPlatform` when the Windows rustls client is
+    /// absent.
+    async fn get_mapping(&self, _tuple: &Tuple) -> Result<OriginalDestination, ProxyError> {
+        Err(ProxyError::UnsupportedPlatform)
+    }
+}
+
+#[cfg(not(all(target_os = "windows", feature = "tls-rustls")))]
+#[async_trait]
+impl FlowClient for TlsRustlsMappingClient {
+    /// Reports that typed flow operations are unavailable without the Windows
+    /// rustls client.
+    async fn enumerate_flows(
+        &self,
+        _page_token: Vec<u8>,
+        _limit: u32,
+    ) -> Result<(Vec<FlowRecord>, Vec<u8>), ProxyError> {
+        Err(ProxyError::UnsupportedPlatform)
+    }
+
+    /// Reports that typed flow operations are unavailable without the Windows
+    /// rustls client.
+    async fn delete_flow(
+        &self,
+        _flow_id: u64,
+        _generation: u32,
+        _observed_last_used_ns: u64,
+    ) -> Result<FlowDeleteReport, ProxyError> {
+        Err(ProxyError::UnsupportedPlatform)
     }
 }
 

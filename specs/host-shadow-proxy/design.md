@@ -3,6 +3,16 @@
 
 # ShadowSocketProxy Host Shadow Proxy Design
 
+## Identifier scope and uniqueness
+
+Identifiers are scoped to this host-shadow-proxy specification artifact.
+Design definitions (`D-*`) are unique within `design.md`; `CHG-*`, `REQ-*`,
+and `TC-*` names are references to their owning sibling artifacts. New TLS
+names that cross specification-artifact boundaries use globally unique,
+artifact-qualified spellings. Existing unqualified `CHG-*` duplicates across
+independent legacy specifications are baseline, not a result of the TLS
+change.
+
 ## 1. Scope and Traceability
 
 This design implements REQ-009 through REQ-015 from `requirements.md`.
@@ -24,7 +34,7 @@ logic and Windows transport/bootstrap code. The runtime starts one TCP
 listener and one UDP socket on the configured shared port, plus a gRPC
 mapping client.
 
-Startup validates CLI values and TLS-PSK initialization before listeners are
+Startup validates CLI values and the selected TLS initialization before listeners are
 considered ready. Tokio owns listener tasks and cancellation. Shutdown stops
 accepts, closes the UDP association table, and allows active TCP tasks to
 terminate.
@@ -50,17 +60,23 @@ destination. A UDP mapping is never cached across a different synthetic key;
 an existing association is reused until expiry, explicit invalidation, or the
 controlled destination-specific retry path.
 
-### D-013 — Windows TLS-PSK gRPC client
+### D-013 — Windows feature-selected gRPC client
 
-Implement a client transport adapter using OpenSSL/Tokio OpenSSL on Windows,
-constrained to TLS 1.2 PSK and h2 ALPN, matching the control-service server
-policy. Feed the authenticated stream into tonic's generated
-`ControlClient`.
+Implement mutually exclusive Windows client adapters. `tls-psk` uses the
+existing OpenSSL/Tokio OpenSSL transport constrained to TLS 1.2 PSK and h2
+ALPN. `tls-rustls` uses tokio-rustls with TLS 1.2/1.3, h2 ALPN, a local
+self-signed PEM identity, and a custom pinned-leaf verifier that validates
+signature, validity, and applicable key-usage checks required by rustls/webpki
+without hostname matching.
+Feed either authenticated stream into tonic's generated `ControlClient`.
+The Windows rustls validation invokes a real authenticated tonic RPC; raw ALPN
+or byte exchanges are not treated as gRPC evidence.
 
-The adapter owns credential handling and maps handshake/configuration
-failures to startup errors. The PSK is accepted from a protected file or
-environment variable, not required to appear directly in a process-visible
-argument. No plaintext, metadata-only, or unauthenticated fallback exists.
+The adapter owns credential handling and maps handshake/configuration failures
+to startup errors. Rustls certificate/key/pin settings are startup-only CLI or
+environment values; duplicate forms, malformed files/pins, and pin mismatch
+are fatal. No plaintext, metadata-only, hostname, or cross-mode fallback
+exists.
 
 ### D-014 — TCP session bridge and Windows conditional admission
 
@@ -230,11 +246,11 @@ after `run_bound` returns.
 |---|---|---|---|
 | REQ-009 | D-011, D-017 | TC-037–TC-039 | workspace, host-proxy runtime/listeners |
 | REQ-010 | D-012, D-016 | TC-040–TC-043, TC-058 | tuple conversion, mapping client |
-| REQ-011 | D-014, D-019–D-024 | TC-044–TC-047, TC-059, TC-068–TC-080, TC-083, TC-085 | TCP conditional admission and bridge |
+| REQ-011 | D-014, D-019–D-024 | TC-044–TC-047, TC-059, TC-068–TC-080, TC-083, TC-085–TC-088 | TCP conditional admission and bridge |
 | REQ-012 | D-015 | TC-048–TC-052, TC-058–TC-059 | UDP association table |
-| REQ-013 | D-013, D-016 | TC-053–TC-054, TC-060 | TLS/gRPC client |
-| REQ-014 | D-011, D-017, D-018 | TC-037–TC-039, TC-055, TC-066–TC-067, TC-081–TC-084 | CLI/bootstrap and bind ordering |
-| REQ-015 | D-011, D-015, D-016, D-020, D-024 | TC-056–TC-057, TC-064–TC-065, TC-076–TC-080, TC-083, TC-085 | cancellation and resource cleanup |
+| REQ-013 | D-013, D-016 | TC-053–TC-054, TC-060, TC-HP-TLS-001–TC-HP-TLS-004 | TLS/gRPC client |
+| REQ-014 | D-011, D-017, D-018 | TC-037–TC-039, TC-055, TC-066–TC-067, TC-HP-TLS-003, TC-081–TC-084 | CLI/bootstrap and bind ordering |
+| REQ-015 | D-011, D-015, D-016, D-020, D-024 | TC-056–TC-057, TC-064–TC-065, TC-083, TC-085–TC-089 | cancellation and resource cleanup |
 
 ## 5. Explicit No-Impact Decisions
 
