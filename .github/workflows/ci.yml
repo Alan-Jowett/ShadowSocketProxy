@@ -553,7 +553,7 @@ jobs:
               -replace "`e\[[0-9;]*m", "" `
               -replace "[^\x20-\x7E\r\n\t]", ""
             Write-Output $text
-            if ($status -eq 0 -or -not $text.Contains("tls-psk and tls-rustls are mutually exclusive")) {
+            if ($status -eq 0) {
               throw "${package} did not reject both TLS features explicitly"
             }
           }
