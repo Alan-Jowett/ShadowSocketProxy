@@ -545,11 +545,23 @@ jobs:
             "shadow-socket-proxy-e2e-runner"
           )
           foreach ($package in $packages) {
-            $log = Join-Path $env:RUNNER_TEMP "$package-both-tls.log"
-            & cargo check --locked -p $package --no-default-features `
-              --features tls-psk,tls-rustls *> $log
-            $status = $LASTEXITCODE
-            $text = (Get-Content -Raw $log) `
+            $stdout = Join-Path $env:RUNNER_TEMP "$package-both-tls.stdout.log"
+            $stderr = Join-Path $env:RUNNER_TEMP "$package-both-tls.stderr.log"
+            $process = Start-Process -FilePath "cargo.exe" `
+              -ArgumentList @(
+                "check",
+                "--locked",
+                "-p", $package,
+                "--no-default-features",
+                "--features", "tls-psk,tls-rustls"
+              ) `
+              -RedirectStandardOutput $stdout `
+              -RedirectStandardError $stderr `
+              -Wait `
+              -PassThru `
+              -NoNewWindow
+            $status = $process.ExitCode
+            $text = ((Get-Content -Raw $stdout) + (Get-Content -Raw $stderr)) `
               -replace "`e\[[0-9;]*m", "" `
               -replace "[^\x20-\x7E\r\n\t]", ""
             Write-Output $text
