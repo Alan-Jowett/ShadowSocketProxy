@@ -262,6 +262,10 @@ pub enum ProxyError {
 }
 
 /// Converts a protobuf flow protocol after validating its one-byte ABI width.
+#[cfg(any(
+    feature = "tls-psk",
+    all(target_os = "windows", feature = "tls-rustls")
+))]
 fn checked_flow_protocol(protocol: u32) -> Result<u8, ProxyError> {
     u8::try_from(protocol)
         .map_err(|_| ProxyError::InvalidMapping("flow protocol is out of range".into()))
@@ -3271,6 +3275,10 @@ mod windows_client {
 pub use windows_client::PublicTlsPskMappingClient as TlsPskMappingClient;
 
 #[cfg(test)]
+#[cfg(any(
+    feature = "tls-psk",
+    all(target_os = "windows", feature = "tls-rustls")
+))]
 mod protocol_validation_tests {
     use super::*;
 
