@@ -321,12 +321,6 @@ impl FlowClient for TlsRustlsMappingClient {
     }
 }
 
-/// Converts a protobuf flow protocol after validating its one-byte ABI width.
-fn checked_flow_protocol(protocol: u32) -> Result<u8, ProxyError> {
-    u8::try_from(protocol)
-        .map_err(|_| ProxyError::InvalidMapping("flow protocol is out of range".into()))
-}
-
 /// Converts a protobuf tuple to a socket tuple, rejecting family/width and
 /// protocol-field violations.
 fn tuple_from_proto(tuple: proto::Tuple) -> Result<Tuple, ProxyError> {
@@ -583,14 +577,5 @@ mod tests {
 
         let _ = shutdown.send(());
         server_task.await.unwrap();
-    }
-
-    #[test]
-    fn flow_protocol_must_fit_in_one_byte() {
-        assert_eq!(checked_flow_protocol(u8::MAX as u32).unwrap(), u8::MAX);
-        assert!(matches!(
-            checked_flow_protocol(u8::MAX as u32 + 1),
-            Err(ProxyError::InvalidMapping(message)) if message == "flow protocol is out of range"
-        ));
     }
 }

@@ -261,6 +261,12 @@ pub enum ProxyError {
     UnsupportedPlatform,
 }
 
+/// Converts a protobuf flow protocol after validating its one-byte ABI width.
+fn checked_flow_protocol(protocol: u32) -> Result<u8, ProxyError> {
+    u8::try_from(protocol)
+        .map_err(|_| ProxyError::InvalidMapping("flow protocol is out of range".into()))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// BPF-agnostic flow record returned by host maintenance enumeration.
 pub struct FlowRecord {
@@ -3000,9 +3006,8 @@ mod windows_client {
                 let original = tuple_from_proto(flow.original.ok_or_else(|| {
                     ProxyError::InvalidMapping("flow original tuple missing".into())
                 })?)?;
-                if synthetic.protocol != flow.protocol as u8
-                    || original.protocol != flow.protocol as u8
-                {
+                let protocol = checked_flow_protocol(flow.protocol)?;
+                if synthetic.protocol != protocol || original.protocol != protocol {
                     return Err(ProxyError::InvalidMapping(
                         "flow protocol does not match tuples".into(),
                     ));
@@ -3264,6 +3269,21 @@ mod windows_client {
 
 #[cfg(all(target_os = "windows", feature = "tls-psk"))]
 pub use windows_client::PublicTlsPskMappingClient as TlsPskMappingClient;
+
+#[cfg(test)]
+mod protocol_validation_tests {
+    use super::*;
+
+    #[test]
+    fn flow_protocol_must_fit_in_one_byte() {
+        assert_eq!(checked_flow_protocol(u8::MAX as u32).unwrap(), u8::MAX);
+        assert!(matches!(
+            checked_flow_protocol(u8::MAX as u32 + 1),
+            Err(ProxyError::InvalidMapping(message))
+                if message == "flow protocol is out of range"
+        ));
+    }
+}
 
 #[cfg(test)]
 mod tests {
