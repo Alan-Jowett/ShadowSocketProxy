@@ -1650,6 +1650,7 @@ mod windows_conditional {
     }
 
     impl AttemptSlot {
+        /// Creates an empty fixed-capacity conditional attempt slot.
         fn new(attempt: ConditionalAttempt) -> Self {
             Self {
                 attempt,
@@ -1826,6 +1827,23 @@ mod windows_conditional {
                 self.reject_and_release(slot, ConditionalAttemptState::Rejected);
             }
         }
+
+        /// Removes a slot that the callback marked terminal without dropping
+        /// its prepared socket from inside the callback.
+        fn reject_terminal_attempt(&self) {
+            let terminal = {
+                let attempt = self.attempt.lock().expect("conditional attempt poisoned");
+                attempt.as_ref().is_some_and(|slot| {
+                    matches!(
+                        slot.attempt.state(),
+                        ConditionalAttemptState::Rejected | ConditionalAttemptState::Cancelled
+                    )
+                })
+            };
+            if terminal {
+                self.reject_active_attempt();
+            }
+        }
     }
 
     impl Drop for ConditionalContext {
@@ -1943,6 +1961,7 @@ mod windows_conditional {
     }
 
     impl Drop for HandoffReservation {
+        /// Releases the reservation if the handoff was not consumed.
         fn drop(&mut self) {
             self.context.release_handoff();
         }
@@ -2212,9 +2231,10 @@ mod windows_conditional {
                 } else if error != WSAEWOULDBLOCK && error != WSATRY_AGAIN {
                     context.reject_active_attempt();
                 }
+                context.reject_terminal_attempt();
                 if !is_conditional_client_error(error) {
                     context.stop_and_reject_pending();
-                    return Err(last_socket_error("WSAAccept"));
+                    return Err(socket_error("WSAAccept", error));
                 }
                 if error != WSAEWOULDBLOCK && error != WSATRY_AGAIN {
                     tracing::debug!(
@@ -2425,18 +2445,18 @@ mod windows_conditional {
                 return CF_REJECT;
             }
             if !context.accepting.load(Ordering::Acquire) {
-                let removed = attempt.take().expect("existing conditional attempt");
-                drop(attempt);
-                context.reject_and_release(removed, ConditionalAttemptState::Cancelled);
+                slot.attempt
+                    .state
+                    .store(ConditionalAttemptState::Cancelled as u8, Ordering::Release);
                 return CF_REJECT;
             }
             match slot.attempt.state() {
                 ConditionalAttemptState::Deferred => return CF_DEFER,
                 ConditionalAttemptState::Ready => {
                     if !context.reserve_handoff() {
-                        let removed = attempt.take().expect("existing conditional attempt");
-                        drop(attempt);
-                        context.reject_and_release(removed, ConditionalAttemptState::Rejected);
+                        slot.attempt
+                            .state
+                            .store(ConditionalAttemptState::Rejected as u8, Ordering::Release);
                         return CF_REJECT;
                     }
                     if claim_ready_attempt(&slot.attempt) {
@@ -2446,17 +2466,14 @@ mod windows_conditional {
                         return CF_ACCEPT;
                     }
                     context.release_handoff_reservation();
-                    let removed = attempt.take().expect("existing conditional attempt");
-                    drop(attempt);
-                    context.reject_and_release(removed, ConditionalAttemptState::Rejected);
+                    slot.attempt
+                        .state
+                        .store(ConditionalAttemptState::Rejected as u8, Ordering::Release);
                     return CF_REJECT;
                 }
                 ConditionalAttemptState::Claimed => return CF_REJECT,
                 ConditionalAttemptState::Rejected | ConditionalAttemptState::Cancelled => {
-                    let removed = attempt.take().expect("existing conditional attempt");
-                    drop(attempt);
-                    context.reject_and_release(removed, ConditionalAttemptState::Rejected);
-                    return CF_REJECT;
+                    return CF_REJECT
                 }
             }
         }
@@ -2527,11 +2544,129 @@ mod windows_conditional {
     fn last_socket_error(operation: &str) -> ProxyError {
         // SAFETY: this is called immediately after a Winsock operation on the
         // same thread, before another Winsock call can overwrite its status.
-        let error = unsafe { WSAGetLastError() };
+        socket_error(operation, unsafe { WSAGetLastError() })
+    }
+
+    /// Converts a saved Winsock error code without querying thread-local
+    /// error state after cleanup may have overwritten it.
+    fn socket_error(operation: &str, error: c_int) -> ProxyError {
         ProxyError::Io(io::Error::new(
             io::Error::from_raw_os_error(error).kind(),
             format!("{operation}: {}", io::Error::from_raw_os_error(error)),
         ))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::net::{SocketAddrV4, TcpListener};
+
+        fn loopback_sockaddr(address: SocketAddr) -> [u8; 16] {
+            let SocketAddr::V4(address) = address else {
+                panic!("test requires an IPv4 loopback address");
+            };
+            let mut bytes = [0_u8; 16];
+            bytes[..2].copy_from_slice(&2_u16.to_ne_bytes());
+            bytes[2..4].copy_from_slice(&address.port().to_be_bytes());
+            bytes[4..8].copy_from_slice(&address.ip().octets());
+            bytes
+        }
+
+        #[test]
+        fn ready_attempt_with_exhausted_handoff_is_released_by_coordinator() {
+            let listener = TcpListener::bind(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 0))
+                .expect("bind loopback listener");
+            let destination = listener.local_addr().expect("read listener address");
+            let outbound = StdTcpStream::connect(destination).expect("connect loopback socket");
+            let (request_sender, _request_receiver) = mpsc::sync_channel(1);
+            // SAFETY: this test creates and owns the event until `context` drops.
+            let wake_event = unsafe { CreateEventW(ptr::null(), 1, 0, ptr::null()) };
+            assert!(!wake_event.is_null(), "create wake event");
+            let context = Arc::new(ConditionalContext::new(request_sender, wake_event));
+            let tuple = Tuple {
+                source: "127.0.0.1:42019".parse().expect("parse source"),
+                destination,
+                protocol: TCP_PROTOCOL,
+            };
+            let attempt = context
+                .admissions
+                .reserve(tuple.clone())
+                .expect("reserve conditional attempt");
+            assert!(mark_attempt_ready(&attempt));
+            *context.attempt.lock().expect("conditional attempt lock") = Some(AttemptSlot {
+                attempt,
+                prepared: Some(PreparedSocket {
+                    socket: OwnedSocket::new(outbound.into_raw_socket() as Socket),
+                    destination,
+                }),
+            });
+            context.handoffs.store(1, Ordering::Release);
+            assert!(
+                !context.handoff_reserved.load(Ordering::Acquire),
+                "model an already queued handoff owner"
+            );
+
+            let mut caller = loopback_sockaddr(tuple.source);
+            let mut callee = loopback_sockaddr(tuple.destination);
+            let mut caller_id = WsaBuf {
+                len: caller.len() as u32,
+                buf: caller.as_mut_ptr().cast(),
+            };
+            let mut callee_id = WsaBuf {
+                len: callee.len() as u32,
+                buf: callee.as_mut_ptr().cast(),
+            };
+            // SAFETY: the address buffers have the sockaddr layout decoded by
+            // `socket_addr_from_wsa_buf`, and `context` remains alive throughout.
+            let result = unsafe {
+                condition_callback(
+                    &mut caller_id,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    &mut callee_id,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    Arc::as_ptr(&context) as usize,
+                )
+            };
+
+            assert_eq!(result, CF_REJECT);
+            {
+                let attempt = context.attempt.lock().expect("conditional attempt lock");
+                let slot = attempt.as_ref().expect("callback must retain the slot");
+                assert_eq!(slot.attempt.state(), ConditionalAttemptState::Rejected);
+                assert!(
+                    slot.prepared.is_some(),
+                    "callback must not drop the prepared socket"
+                );
+            }
+
+            context.reject_terminal_attempt();
+
+            assert!(context
+                .attempt
+                .lock()
+                .expect("conditional attempt lock")
+                .is_none());
+            assert_eq!(context.admissions.pending(), 0);
+            assert_eq!(context.handoffs.load(Ordering::Acquire), 1);
+            assert!(!context.handoff_reserved.load(Ordering::Acquire));
+            context.release_handoff();
+            assert_eq!(context.handoffs.load(Ordering::Acquire), 0);
+        }
+
+        #[test]
+        fn saved_winsock_error_conversion_uses_saved_code() {
+            let ProxyError::Io(error) = socket_error("saved WSAAccept", WSAECONNREFUSED) else {
+                panic!("saved Winsock error must be an I/O error");
+            };
+            assert_eq!(
+                error.kind(),
+                io::Error::from_raw_os_error(WSAECONNREFUSED).kind()
+            );
+            assert!(error.to_string().starts_with("saved WSAAccept: "));
+        }
     }
 }
 

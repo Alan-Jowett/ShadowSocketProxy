@@ -230,11 +230,11 @@ after `run_bound` returns.
 |---|---|---|---|
 | REQ-009 | D-011, D-017 | TC-037–TC-039 | workspace, host-proxy runtime/listeners |
 | REQ-010 | D-012, D-016 | TC-040–TC-043, TC-058 | tuple conversion, mapping client |
-| REQ-011 | D-014, D-019–D-023 | TC-044–TC-047, TC-059, TC-068–TC-078 | TCP conditional admission and bridge |
+| REQ-011 | D-014, D-019–D-024 | TC-044–TC-047, TC-059, TC-068–TC-080, TC-083, TC-085 | TCP conditional admission and bridge |
 | REQ-012 | D-015 | TC-048–TC-052, TC-058–TC-059 | UDP association table |
 | REQ-013 | D-013, D-016 | TC-053–TC-054, TC-060 | TLS/gRPC client |
-| REQ-014 | D-011, D-017, D-018 | TC-037–TC-039, TC-055, TC-066–TC-067, TC-081–TC-083 | CLI/bootstrap and bind ordering |
-| REQ-015 | D-011, D-015, D-016, D-024 | TC-056–TC-057, TC-076–TC-080 | cancellation and resource cleanup |
+| REQ-014 | D-011, D-017, D-018 | TC-037–TC-039, TC-055, TC-066–TC-067, TC-081–TC-084 | CLI/bootstrap and bind ordering |
+| REQ-015 | D-011, D-015, D-016, D-020, D-024 | TC-056–TC-057, TC-064–TC-065, TC-076–TC-080, TC-083, TC-085 | cancellation and resource cleanup |
 
 ## 5. Explicit No-Impact Decisions
 
