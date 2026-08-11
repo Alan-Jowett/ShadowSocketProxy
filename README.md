@@ -184,8 +184,11 @@ cargo build --locked --release -p shadow-socket-proxy-host --features tls-rustls
 ```
 
 Generate one self-signed certificate/key pair for each endpoint and pass each
-process its own pair plus the SHA-256 pin of the peer certificate DER. The
-same three `--tls-*` options can be supplied through `SSP_TLS_*` variables;
+process its own pair plus the SHA-256 pin of the peer certificate DER. A
+rustls listener has one configured peer-leaf pin, so every client connecting
+to that listener must use the same pinned client certificate; the E2E driver
+therefore shares one client pair between the host proxy and runner. The same
+three `--tls-*` options can be supplied through `SSP_TLS_*` variables;
 supplying a value through both forms is rejected.
 
 ### Start the demo
@@ -322,28 +325,51 @@ The disposable `site/` directory contains `index.html`, `rustdoc/`, and
 
 ## Windows/WSL end-to-end validation
 
-The checked-in Windows/WSL driver exercises the deployed BPF, control service,
-and host proxy with an ephemeral TLS-PSK. It requires Windows, an installed
-WSL distribution, and the Windows OpenSSL/Rust prerequisites:
+The checked-in Windows/WSL driver defaults to the deployed BPF, control service,
+and host proxy with an ephemeral TLS-PSK. That default requires Windows, an
+installed WSL distribution, and the Windows OpenSSL/Rust prerequisites:
 
 ```powershell
 cargo build --locked --release -p shadow-socket-proxy-e2e-runner --features tls-psk
 .\scripts\run-windows-wsl-e2e.ps1 `
+  -Transport psk `
   -BpfArtifact .\artifacts\bpf\shadow-socket-proxy.bpf.o `
   -ControlArtifact .\artifacts\control\shadow-socket-proxy-control `
   -HostArtifact .\artifacts\host
 ```
 
-For a rustls-only runner build, use:
+For rustls-only end-to-end validation, build all three artifacts with rustls:
 
 ```powershell
+wsl -d Ubuntu -- bash -lc `
+  'cd /mnt/c/dev/ShadowSocketProxy &&
+   cargo build --locked --release -p shadow-socket-proxy-control --features tls-rustls'
+cargo build --locked --release -p shadow-socket-proxy-host --features tls-rustls
 cargo build --locked --release -p shadow-socket-proxy-e2e-runner --features tls-rustls
 ```
 
-The runner also supports the three certificate
-flags/environment variables above. In rustls mode, the control service,
-host proxy, and runner each require their own PEM identity and the pin for
-the peer leaf; no PSK or hostname fallback is attempted.
+Provide a PEM certificate/key pair for the control service and one shared PEM
+client pair for the host proxy and runner. Set the control-service pin to the
+client certificate's DER SHA-256 and the client pin to the control certificate's
+DER SHA-256, then select the rustls branch of the driver:
+
+```powershell
+.\scripts\run-windows-wsl-e2e.ps1 `
+  -Transport rustls `
+  -BpfArtifact .\crates\bpf\shadow-socket-proxy.bpf.o `
+  -ControlArtifact .\target\release\shadow-socket-proxy-control `
+  -HostArtifact .\target\release `
+  -TlsControlCertificateFile .\certs\control-cert.pem `
+  -TlsControlKeyFile .\certs\control-key.pem `
+  -TlsControlPeerCertSha256 <shared-client-certificate-pin> `
+  -TlsClientCertificateFile .\certs\client-cert.pem `
+  -TlsClientKeyFile .\certs\client-key.pem `
+  -TlsClientPeerCertSha256 <control-certificate-pin>
+```
+
+The driver passes the control identity through `SSP_TLS_*` variables and the
+Windows identities through CLI flags. The rustls branch does not install or use
+OpenSSL; no PSK or hostname fallback is attempted.
 
 The command fails when WSL, BPF/TC, authentication, process, marker,
 mapping, counter, or cleanup prerequisites are unavailable; it never falls

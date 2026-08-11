@@ -50,10 +50,14 @@ fn base_arguments() -> Vec<String> {
 }
 
 fn run_host_proxy(arguments: &[String]) -> Output {
-    let mut command = Command::new(
-        std::env::var_os("CARGO_BIN_EXE_shadow-socket-proxy-host")
-            .expect("Cargo must provide the host-proxy executable path"),
-    );
+    run_host_proxy_with_environment(arguments, None)
+}
+
+fn run_host_proxy_with_environment(
+    arguments: &[String],
+    certificate_from_environment: Option<&Path>,
+) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_shadow_socket_proxy_host"));
     command
         .args(arguments)
         .env_remove("SSP_TLS_CERT_FILE")
@@ -61,6 +65,9 @@ fn run_host_proxy(arguments: &[String]) -> Output {
         .env_remove("SSP_TLS_PEER_CERT_SHA256")
         .env_remove("SSP_TLS_PSK_IDENTITY")
         .env_remove("SSP_TLS_PSK_SECRET");
+    if let Some(certificate) = certificate_from_environment {
+        command.env("SSP_TLS_CERT_FILE", certificate);
+    }
     command.output().expect("run host-proxy executable")
 }
 
@@ -190,5 +197,26 @@ fn incomplete_tls_configuration_is_rejected_at_startup() {
     assert_startup_failure(
         &arguments,
         &["--tls-cert-file, --tls-key-file, and --tls-peer-cert-sha256 are required"],
+    );
+}
+
+#[test]
+fn duplicate_cli_and_environment_tls_settings_are_rejected_by_spawned_binary() {
+    let fixture = FixtureDirectory::new("duplicate-cli-environment");
+    let (certificate, key) = write_valid_identity(&fixture);
+    let arguments = complete_tls_arguments(&certificate, &key, &"00".repeat(32));
+    let output = run_host_proxy_with_environment(&arguments, Some(&certificate));
+    assert!(
+        !output.status.success(),
+        "host-proxy unexpectedly started: {output:?}"
+    );
+    let diagnostics = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        diagnostics.contains("SSP_TLS_CERT_FILE must not be combined with its command-line option"),
+        "diagnostics did not report the duplicate TLS setting: {diagnostics}"
     );
 }

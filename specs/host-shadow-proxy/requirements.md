@@ -271,6 +271,10 @@ initialized.
 - A matching rustls certificate/key pair and peer pin permits lookup; a
   malformed, duplicate CLI/environment, mismatched, expired, or wrong-usage
   rustls configuration fails before readiness.
+- Typed flow records with a protocol value above 255 are rejected before
+  conversion to the host-proxy one-byte protocol representation.
+- The control-service listener has one peer pin, so the Windows/WSL E2E host
+  proxy and runner use the same client certificate/key pair.
 - The PSK secret is not logged or returned in diagnostics.
 - Control-service errors remain distinguishable from mapping-not-found.
 

@@ -266,6 +266,10 @@ not require hostname matching. The startup-only settings
 `--tls-peer-cert-sha256`/`SSP_TLS_PEER_CERT_SHA256` MUST reject missing,
 malformed, or duplicate CLI-plus-environment values and MUST never fall back
 to another transport or plaintext.
+Each listener has one configured peer-leaf pin. Multiple clients connecting to
+the same listener MUST therefore share the pinned client certificate; the
+Windows/WSL E2E flow uses one client identity for both the host proxy and
+runner, and multiple peer pins are not part of this change.
 
 Once startup succeeds, malformed TLS input, peer-authentication failures,
 missing h2 negotiation, and handshake timeouts are per-connection rejections.

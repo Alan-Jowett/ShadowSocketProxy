@@ -171,8 +171,8 @@ impl TlsRustlsMappingClient {
             let original = tuple_from_proto(flow.original.ok_or_else(|| {
                 ProxyError::InvalidMapping("flow original tuple missing".into())
             })?)?;
-            if synthetic.protocol != flow.protocol as u8 || original.protocol != flow.protocol as u8
-            {
+            let protocol = checked_flow_protocol(flow.protocol)?;
+            if synthetic.protocol != protocol || original.protocol != protocol {
                 return Err(ProxyError::InvalidMapping(
                     "flow protocol does not match tuples".into(),
                 ));
@@ -319,6 +319,12 @@ impl FlowClient for TlsRustlsMappingClient {
         self.delete_flow(flow_id, generation, observed_last_used_ns)
             .await
     }
+}
+
+/// Converts a protobuf flow protocol after validating its one-byte ABI width.
+fn checked_flow_protocol(protocol: u32) -> Result<u8, ProxyError> {
+    u8::try_from(protocol)
+        .map_err(|_| ProxyError::InvalidMapping("flow protocol is out of range".into()))
 }
 
 /// Converts a protobuf tuple to a socket tuple, rejecting family/width and
@@ -577,5 +583,14 @@ mod tests {
 
         let _ = shutdown.send(());
         server_task.await.unwrap();
+    }
+
+    #[test]
+    fn flow_protocol_must_fit_in_one_byte() {
+        assert_eq!(checked_flow_protocol(u8::MAX as u32).unwrap(), u8::MAX);
+        assert!(matches!(
+            checked_flow_protocol(u8::MAX as u32 + 1),
+            Err(ProxyError::InvalidMapping(message)) if message == "flow protocol is out of range"
+        ));
     }
 }

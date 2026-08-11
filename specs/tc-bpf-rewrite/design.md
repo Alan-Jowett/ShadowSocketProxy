@@ -328,7 +328,11 @@ invokes `wsl.exe -u root` for package installation, process deployment, and
 cleanup. It launches the Windows marker server and host proxy, then invokes
 the checked-in `shadow-socket-proxy-e2e-runner` executable. CI downloads the
 three deployable artifacts and builds only this test driver from source;
-developers can invoke the same script locally.
+developers can invoke the same script locally. The driver defaults to the
+existing ephemeral TLS-PSK path; an explicit rustls mode accepts control and
+shared-client certificate/key files plus their peer pins. Because the control
+listener has one peer pin, its host-proxy and runner clients use the same
+certificate identity in that mode.
 
 ### D-CI-E2E-003 — Ordered deployment and evidence
 

@@ -692,6 +692,62 @@ mod tests {
         assert!(server_task.await.unwrap());
     }
 
+    async fn assert_invalid_client_certificate_is_rejected(client_identity: RustlsIdentity) {
+        let server_identity = identity("server.invalid");
+        let server = RustlsConfig {
+            identity: server_identity.clone(),
+            peer_cert_sha256: pin(&client_identity),
+        };
+        let client = RustlsConfig {
+            identity: client_identity,
+            peer_cert_sha256: pin(&server_identity),
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            TlsAcceptor::from(server.server_config().unwrap())
+                .accept(stream)
+                .await
+                .is_err()
+        });
+
+        let stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        let server_name = ServerName::try_from("not-the-certificate-name".to_owned()).unwrap();
+        let result = TlsConnector::from(client.client_config().unwrap())
+            .connect(server_name, stream)
+            .await;
+        let _ = result;
+        assert!(server_task.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn expired_pinned_client_certificate_is_rejected() {
+        let client_identity = identity_with_validity(
+            "client.invalid",
+            date_time_ymd(2000, 1, 1),
+            date_time_ymd(2001, 1, 1),
+        );
+        assert_invalid_client_certificate_is_rejected(client_identity).await;
+    }
+
+    #[tokio::test]
+    async fn bad_signature_on_pinned_client_certificate_is_rejected() {
+        let generated = generate_simple_self_signed(vec!["client.invalid".to_owned()]).unwrap();
+        let mut certificate = generated.cert.der().to_vec();
+        *certificate.last_mut().unwrap() ^= 1;
+        let client_identity =
+            identity_from_parts(certificate, generated.signing_key.serialize_pem());
+        assert_invalid_client_certificate_is_rejected(client_identity).await;
+    }
+
+    #[tokio::test]
+    async fn pinned_client_with_wrong_key_usage_is_rejected() {
+        let client_identity =
+            identity_with_eku("client.invalid", ExtendedKeyUsagePurpose::ServerAuth);
+        assert_invalid_client_certificate_is_rejected(client_identity).await;
+    }
+
     #[test]
     fn mismatched_private_key_is_rejected_before_handshake() {
         let certificate = generate_simple_self_signed(vec!["server.invalid".to_owned()]).unwrap();

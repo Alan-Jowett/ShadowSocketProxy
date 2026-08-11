@@ -217,6 +217,7 @@ jobs:
         shell: pwsh
         run: |
           .\scripts\run-windows-wsl-e2e.ps1 `
+            -Transport psk `
             -BpfArtifact "${{ github.workspace }}\artifacts\bpf\shadow-socket-proxy.bpf.o" `
             -ControlArtifact "${{ github.workspace }}\artifacts\control\shadow-socket-proxy-control" `
             -HostArtifact "${{ github.workspace }}\artifacts\host" `
@@ -547,6 +548,7 @@ jobs:
           foreach ($package in $packages) {
             $stdout = Join-Path $env:RUNNER_TEMP "$package-both-tls.stdout.log"
             $stderr = Join-Path $env:RUNNER_TEMP "$package-both-tls.stderr.log"
+            Remove-Item -Force -ErrorAction SilentlyContinue $stdout, $stderr
             $process = Start-Process -FilePath "cargo.exe" `
               -ArgumentList @(
                 "check",
@@ -565,7 +567,7 @@ jobs:
               -replace "`e\[[0-9;]*m", "" `
               -replace "[^\x20-\x7E\r\n\t]", ""
             Write-Output $text
-            if ($status -eq 0) {
+            if ($status -eq 0 -or $text -notmatch "(?i)mutually exclusive") {
               throw "${package} did not reject both TLS features explicitly"
             }
           }

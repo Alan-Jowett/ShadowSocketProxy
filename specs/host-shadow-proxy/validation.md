@@ -23,7 +23,8 @@ rustls integration test performs an authenticated tonic RPC over h2; raw ALPN
 or byte exchanges are not treated as gRPC validation. The executable
 `crates/host-proxy/tests/rustls_startup.rs` suite spawns the rustls host-proxy
 binary and verifies startup rejection for missing or malformed certificate/key
-files, missing peer pins, and incomplete TLS configuration.
+files, missing peer pins, incomplete TLS configuration, and duplicate real
+`SSP_TLS_*` plus CLI settings.
 
 The proxy validation continues to use the existing `GetMapping` contract.
 Control-service v3 target/listener validation is covered by the TC-BPF
@@ -74,9 +75,9 @@ validation specification and is not duplicated here.
 | TC-074 | REQ-011 | Outbound TCP connect failure or resource error | Worker marks the request rejected; failure is observable and no accepted client socket is published. |
 | TC-075 | REQ-011 | Valid mapping and outbound connection | Worker prepares one outbound socket; callback returns `CF_ACCEPT`; TCP bridge reuses that socket and does not connect a second time. |
 | TC-HP-TLS-001 | REQ-013 | Build with `tls-psk`, `tls-rustls`, neither, or both | PSK and rustls builds remain separate; the host-proxy and e2e-runner binaries built without either feature exit nonzero with the explicit feature-selection diagnostic; both features fail compilation. |
-| TC-HP-TLS-002 | REQ-013 | Rustls mutual self-signed identity and matching peer pin | The Windows rustls client completes an authenticated h2 gRPC mapping RPC with no hostname dependency; explicit TLS 1.2/1.3 selection is covered by the Linux control-service test. |
+| TC-HP-TLS-002 | REQ-013 | Rustls mutual self-signed identity and matching peer pin | The Windows rustls client completes an authenticated h2 gRPC mapping RPC with no hostname dependency; the Windows/WSL driver uses one shared client identity for the host proxy and runner; explicit TLS 1.2/1.3 selection is covered by the Linux control-service test. |
 | TC-HP-TLS-003 | REQ-013/014 | Rustls missing/malformed certificate or key files, missing peer pin, incomplete, or duplicate CLI/environment settings | The executable `rustls_startup` tests start the real host-proxy binary and require startup failure before listener readiness; no PSK or plaintext fallback occurs. |
-| TC-HP-TLS-004 | REQ-013 | Rustls wrong pin, invalid signature/validity, wrong key usage, or mismatched private key | Handshake or configuration is rejected even when the endpoint is reachable. |
+| TC-HP-TLS-004 | REQ-013 | Rustls wrong pin, invalid signature/validity, wrong key usage, mismatched private key, or flow protocol above 255 | Handshake/configuration rejects invalid certificates even when the endpoint is reachable, and a flow protocol is range-checked before conversion to the one-byte ABI. |
 | TC-086 | REQ-011/015 | Shutdown while lookup or connect is pending | Admission stops, the worker operation is cancelled, its socket is closed if produced, and worker/coordinator threads join. |
 | TC-087 | REQ-011 | Accepted raw socket, full/closed handoff queue, post-`CF_ACCEPT` `WSAAccept`, or Tokio conversion failure | Both client and paired outbound owners close; the exact prepared socket, admission, and handoff reservation release; no half-handoff reaches a bridge. |
 | TC-088 | REQ-011 | Worker result races cancellation or a claimed request | State transition permits only one handoff; terminal/stale result sockets close. |
@@ -154,12 +155,12 @@ cargo test --locked -p shadow-socket-proxy-host \
   --no-default-features --features tls-rustls --test rustls_startup
 ```
 
-TC-067 through TC-089 combine focused state-machine tests with the Windows
-loopback conditional-accept bridge test. Live TLS-PSK control-plane validation
-remains environment-gated on a PSK-capable OpenSSL installation; rustls
-validation uses the shared pinned-mutual-TLS tests, the authenticated tonic
-client test, `TC-HP-TLS-001` through `TC-HP-TLS-004`, the executable
-`rustls_startup` negative tests, and rustls feature builds.
+TC-067 through TC-075 and TC-080 through TC-089 combine focused state-machine
+tests with the Windows loopback conditional-accept bridge test. Live TLS-PSK
+control-plane validation remains environment-gated on a PSK-capable OpenSSL
+installation; rustls validation uses the shared pinned-mutual-TLS tests, the
+authenticated tonic client test, `TC-HP-TLS-001` through `TC-HP-TLS-004`, the
+executable `rustls_startup` negative tests, and rustls feature builds.
 
 Privileged live TC attach/link validation is a pre-existing,
 Linux-environment-gated deferred item outside the TLS change scope. It is not

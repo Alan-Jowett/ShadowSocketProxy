@@ -9,6 +9,7 @@ use thiserror::Error;
 
 #[cfg(all(target_os = "linux", feature = "tls-psk"))]
 use std::{
+    future::Future,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
@@ -36,6 +37,7 @@ use tonic::transport::server::Connected;
 
 #[cfg(all(target_os = "linux", feature = "tls-rustls"))]
 use std::{
+    future::Future,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
@@ -159,10 +161,17 @@ impl TlsPskServer {
         Ok(TcpListenerStream::new(listener)
             .map(move |accepted| {
                 let context = context.clone();
-                async move { accept_tls(context, accepted?).await }
+                async move {
+                    process_accepted(
+                        accepted,
+                        move |stream| accept_tls(context, stream),
+                        "TLS-PSK",
+                    )
+                    .await
+                }
             })
             .buffer_unordered(64)
-            .filter_map(|result| drop_failed_connection(result, "TLS-PSK")))
+            .filter_map(|result| async move { result }))
     }
 }
 
@@ -333,15 +342,39 @@ impl TlsRustlsServer {
         Ok(TcpListenerStream::new(listener)
             .map(move |accepted| {
                 let acceptor = acceptor.clone();
-                async move { accept_rustls(acceptor, accepted?).await }
+                async move {
+                    process_accepted(
+                        accepted,
+                        move |stream| accept_rustls(acceptor, stream),
+                        "rustls",
+                    )
+                    .await
+                }
             })
             .buffer_unordered(64)
-            .filter_map(|result| drop_failed_connection(result, "rustls")))
+            .filter_map(|result| async move { result }))
     }
 }
 
 #[cfg(all(target_os = "linux", any(feature = "tls-psk", feature = "tls-rustls")))]
-/// Drops one failed accept or TLS handshake without terminating the listener.
+/// Preserves listener errors while dropping failures after a socket is accepted.
+async fn process_accepted<T, F, Fut>(
+    accepted: Result<TcpStream, std::io::Error>,
+    handshake: F,
+    transport: &'static str,
+) -> Option<Result<T, std::io::Error>>
+where
+    F: FnOnce(TcpStream) -> Fut,
+    Fut: Future<Output = Result<T, std::io::Error>>,
+{
+    match accepted {
+        Err(error) => Some(Err(error)),
+        Ok(stream) => drop_failed_connection(handshake(stream).await, transport).await,
+    }
+}
+
+#[cfg(all(target_os = "linux", any(feature = "tls-psk", feature = "tls-rustls")))]
+/// Drops one failed TLS handshake without terminating the listener.
 async fn drop_failed_connection<T>(
     result: Result<T, std::io::Error>,
     transport: &'static str,
@@ -489,6 +522,37 @@ mod tests {
             secret: b"01234567890123456789012345678901".to_vec(),
         });
         assert!(server.is_ok());
+    }
+
+    #[cfg(all(target_os = "linux", any(feature = "tls-psk", feature = "tls-rustls")))]
+    #[tokio::test]
+    async fn listener_accept_errors_are_preserved_and_handshake_errors_are_dropped() {
+        use tokio::net::{TcpListener, TcpStream};
+
+        let listener_error =
+            std::io::Error::new(std::io::ErrorKind::Interrupted, "listener accept failed");
+        let preserved = process_accepted(
+            Err(listener_error),
+            |_stream| async { Ok::<(), std::io::Error>(()) },
+            "test",
+        )
+        .await
+        .expect("listener error should remain in the incoming stream")
+        .expect_err("listener error should not become a successful connection");
+        assert_eq!(preserved.kind(), std::io::ErrorKind::Interrupted);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = TcpStream::connect(address).await.unwrap();
+        let (server_stream, _) = listener.accept().await.unwrap();
+        let dropped = process_accepted(
+            Ok(server_stream),
+            |_stream| async { Err::<(), _>(std::io::Error::other("TLS handshake failed")) },
+            "test",
+        )
+        .await;
+        assert!(dropped.is_none());
+        drop(client);
     }
 
     #[cfg(all(target_os = "linux", feature = "tls-psk"))]

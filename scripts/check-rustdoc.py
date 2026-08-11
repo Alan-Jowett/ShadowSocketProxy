@@ -22,7 +22,7 @@ FIELD_RE = re.compile(
     r"^(?:pub(?:\s*\([^)]*\))?\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*:"
 )
 VARIANT_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\s*(?:\(|\{|=|,|$)")
-CFG_TEST_RE = re.compile(r"^\s*#\s*\[\s*cfg\s*\(.*\btest\b.*\)\s*\]")
+CFG_ATTRIBUTE_RE = re.compile(r"^\s*#\s*\[\s*cfg\s*\(")
 
 
 def _brace_delta(line: str) -> int:
@@ -48,6 +48,61 @@ def _brace_delta(line: str) -> int:
     return result
 
 
+def cfg_requires_test(attribute: str) -> bool:
+    """Return whether a cfg predicate is true only when the test cfg is true."""
+    match = re.search(r"#\s*\[\s*cfg\s*\(", attribute, flags=re.DOTALL)
+    if not match:
+        return False
+
+    expression = attribute[match.end() :]
+    depth = 1
+    end = len(expression)
+    for index, character in enumerate(expression):
+        if character == "(":
+            depth += 1
+        elif character == ")":
+            depth -= 1
+            if depth == 0:
+                end = index
+                break
+    tokens = re.findall(
+        r"[A-Za-z_][A-Za-z0-9_]*|[(),=]|\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'",
+        expression[:end],
+    )
+    position = 0
+
+    def parse_predicate() -> bool:
+        nonlocal position
+        if position >= len(tokens):
+            return False
+        name = tokens[position]
+        position += 1
+        if position >= len(tokens) or tokens[position] != "(":
+            if position < len(tokens) and tokens[position] == "=":
+                position += 1
+                if position < len(tokens):
+                    position += 1
+            return name == "test"
+
+        position += 1
+        children: list[bool] = []
+        while position < len(tokens) and tokens[position] != ")":
+            children.append(parse_predicate())
+            if position < len(tokens) and tokens[position] == ",":
+                position += 1
+            else:
+                break
+        if position < len(tokens) and tokens[position] == ")":
+            position += 1
+        if name == "all":
+            return bool(children) and any(children)
+        if name == "any":
+            return bool(children) and all(children)
+        return False
+
+    return parse_predicate()
+
+
 def excluded_test_lines(lines: list[str]) -> set[int]:
     """Return zero-based line indices belonging to cfg(test) items or modules."""
     excluded: set[int] = set()
@@ -61,7 +116,7 @@ def excluded_test_lines(lines: list[str]) -> set[int]:
             cfg_indices.append(index)
             cfg_text.append(line)
             if "]" in line:
-                if re.search(r"\btest\b", " ".join(cfg_text)):
+                if cfg_requires_test(" ".join(cfg_text)):
                     excluded.update(cfg_indices)
                     pending = True
                 pending_cfg = False
@@ -83,11 +138,11 @@ def excluded_test_lines(lines: list[str]) -> set[int]:
                     depth = 0
             pending = False
             continue
-        if re.match(r"^\s*#\s*\[\s*cfg\s*\(", line):
+        if CFG_ATTRIBUTE_RE.match(line):
             cfg_indices = [index]
             cfg_text = [line]
             if "]" in line:
-                if re.search(r"\btest\b", line):
+                if cfg_requires_test(line):
                     excluded.add(index)
                     pending = True
                 cfg_indices = []
@@ -95,9 +150,6 @@ def excluded_test_lines(lines: list[str]) -> set[int]:
             else:
                 pending_cfg = True
             continue
-        if CFG_TEST_RE.match(line):
-            excluded.add(index)
-            pending = True
     return excluded
 
 

@@ -71,12 +71,16 @@ without hostname matching.
 Feed either authenticated stream into tonic's generated `ControlClient`.
 The Windows rustls validation invokes a real authenticated tonic RPC; raw ALPN
 or byte exchanges are not treated as gRPC evidence.
+Typed flow enumeration validates the protobuf protocol field before converting
+it to the one-byte host-proxy representation.
 
 The adapter owns credential handling and maps handshake/configuration failures
 to startup errors. Rustls certificate/key/pin settings are startup-only CLI or
 environment values; duplicate forms, malformed files/pins, and pin mismatch
 are fatal. No plaintext, metadata-only, hostname, or cross-mode fallback
-exists.
+exists. Each configured listener has one peer-leaf pin; the Windows/WSL E2E
+driver therefore uses one shared client certificate/key pair for the host
+proxy and runner when they connect to the control service.
 
 ### D-014 — TCP session bridge and Windows conditional admission
 
@@ -246,7 +250,7 @@ after `run_bound` returns.
 |---|---|---|---|
 | REQ-009 | D-011, D-017 | TC-037–TC-039 | workspace, host-proxy runtime/listeners |
 | REQ-010 | D-012, D-016 | TC-040–TC-043, TC-058 | tuple conversion, mapping client |
-| REQ-011 | D-014, D-019–D-024 | TC-044–TC-047, TC-059, TC-068–TC-080, TC-083, TC-085–TC-088 | TCP conditional admission and bridge |
+| REQ-011 | D-014, D-019–D-024 | TC-044–TC-047, TC-059, TC-068–TC-075, TC-080, TC-083, TC-085–TC-088 | TCP conditional admission and bridge |
 | REQ-012 | D-015 | TC-048–TC-052, TC-058–TC-059 | UDP association table |
 | REQ-013 | D-013, D-016 | TC-053–TC-054, TC-060, TC-HP-TLS-001–TC-HP-TLS-004 | TLS/gRPC client |
 | REQ-014 | D-011, D-017, D-018 | TC-037–TC-039, TC-055, TC-066–TC-067, TC-HP-TLS-003, TC-081–TC-084 | CLI/bootstrap and bind ordering |

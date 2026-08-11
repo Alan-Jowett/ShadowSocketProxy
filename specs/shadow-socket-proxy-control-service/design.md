@@ -176,11 +176,16 @@ environment value or malformed/missing file or pin is rejected at startup;
 a peer handshake pin mismatch is rejected per connection. Startup
 configuration and bind failures remain fatal, while post-startup handshake
 failures are isolated to the connection that failed.
-The incoming stream drops failed accepts and TLS handshakes before tonic sees
-them, including malformed, unauthenticated, non-h2, and timed-out attempts.
-Those per-connection rejections do not terminate the listener, stop the
-control service, or trigger BPF lifecycle cleanup, and there is no plaintext
-or cross-mode fallback. Full-server PSK and rustls tests exercise a wrong
+Each listener stores one peer-leaf pin, so multiple clients connecting to the
+same listener MUST share the pinned client certificate. The Windows/WSL E2E
+driver uses one client identity for both the host proxy and runner; supporting
+multiple peer pins is outside this change.
+The incoming stream preserves listener-accept errors for lifecycle handling and
+drops only failures after a socket is accepted, before tonic sees them. This
+includes malformed, unauthenticated, non-h2, and timed-out handshakes. Those
+per-connection rejections do not terminate the listener, stop the control
+service, or trigger BPF lifecycle cleanup, and there is no plaintext or
+cross-mode fallback. Full-server PSK and rustls tests exercise a wrong
 credential or pinned-client failure on the running listener before a valid
 authenticated tonic RPC; they start with an owned in-memory attachment and
 assert readiness, retained ownership, and zero backend detach calls.
@@ -203,9 +208,9 @@ the newest records and invalidate cursors that no longer exist.
 Startup validates configuration, prepares the TLS endpoint, and initializes
 the BPF backend before reporting readiness. Shutdown stops accepting RPCs,
 attempts owned detachment, and reports cleanup failures. Host-proxy owns
-maintenance cancellation and flow cleanup. A failed TLS accept or handshake
-is not a shutdown signal; only explicit shutdown or a service-level transport
-failure reaches lifecycle cleanup.
+maintenance cancellation and flow cleanup. A failed post-accept TLS handshake
+is not a shutdown signal; a listener-accept error remains a service-level
+transport failure, alongside explicit shutdown, for lifecycle cleanup.
 
 ## 3. Invariants
 
