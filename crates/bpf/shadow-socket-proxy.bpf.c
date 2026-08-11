@@ -140,8 +140,6 @@ static __s64 (*bpf_csum_diff)(__be32 *from, __u32 from_size, __be32 *to,
 #define FLOW_DELETE_COMMITTED 2U
 /** A capacity-release journal entry not yet consumed by the dataplane. */
 #define FLOW_RELEASE_PENDING 0U
-/** A capacity-release journal entry claimed by the dataplane. */
-#define FLOW_RELEASE_CONSUMED 1U
 
 /** Packed tuple key shared by the three tuple-index entries for a flow. */
 struct tuple_key {
@@ -461,7 +459,6 @@ static __always_inline int reserve_flow_slot(void)
 {
     __u32 config_key = 0;
     struct flow_state_key release;
-    __u32 *pending;
     __u64 *count = bpf_map_lookup_elem(&ssp_tc_active_flows_v1, &config_key);
     struct runtime_config_value *config =
         bpf_map_lookup_elem(&ssp_runtime_config_v3, &config_key);
@@ -470,14 +467,14 @@ static __always_inline int reserve_flow_slot(void)
     if (!count)
         return 0;
     if (bpf_map_pop_elem(&ssp_tc_active_flow_releases_v1, &release) == 0) {
-        pending = bpf_map_lookup_elem(&ssp_tc_active_flow_release_pending_v1,
-                                      &release);
-        if (pending &&
-            __sync_bool_compare_and_swap(pending, FLOW_RELEASE_PENDING,
-                                         FLOW_RELEASE_CONSUMED)) {
+        /*
+         * Deletion claims the journal entry atomically. This avoids a
+         * 32-bit BPF atomic CAS, which is not supported by all clang BPF
+         * backends.
+         */
+        if (bpf_map_delete_elem(&ssp_tc_active_flow_release_pending_v1,
+                                &release) == 0) {
             release_flow_slot();
-            bpf_map_delete_elem(&ssp_tc_active_flow_release_pending_v1,
-                                &release);
         }
     }
     previous = __sync_fetch_and_add(count, 1);

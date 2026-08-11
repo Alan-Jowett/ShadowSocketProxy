@@ -62,15 +62,19 @@ failures to startup errors. The PSK is accepted from a protected file or
 environment variable, not required to appear directly in a process-visible
 argument. No plaintext, metadata-only, or unauthenticated fallback exists.
 
-### D-014 — TCP session bridge
+### D-014 — TCP session bridge and Windows conditional admission
 
-For each accepted connection, perform lookup, connect to
-`original.destination`, and run two concurrent copy directions. EOF
-half-closes the corresponding outbound direction; completion or fatal error
-cancels the peer direction and closes both sockets.
+On non-Windows, retain the existing Tokio accept, lookup, connect, and bridge
+path. On Windows, bind the native listener with `SO_CONDITIONAL_ACCEPT` and
+drive `WSAAccept` from a dedicated coordinator thread. The callback returns
+`CF_DEFER` for a reserved attempt and the bridge is created only from the
+matching `CF_ACCEPT` client socket plus preconnected outbound socket.
 
-Outbound source binding is not attempted because the approved behavior
-requires connection to the original destination, not source impersonation.
+The bridge runs two concurrent copy directions. EOF half-closes the
+corresponding outbound direction; completion or fatal error cancels the peer
+direction and closes both sockets. Outbound source binding is not attempted
+because the approved behavior requires connection to the original destination,
+not source impersonation.
 
 ### D-015 — UDP association table
 
@@ -121,6 +125,81 @@ maintenance, and UDP relay work, and only then issues the bounded detach RPC.
 All control RPCs carry a tonic deadline and are locally bounded so shutdown
 cannot wait indefinitely on a hung control channel.
 
+### D-018 — Native listener and backlog configuration
+
+`ProxyConfig.listen_backlog` and `--listen-backlog` default to 1024. Windows
+first binds the native TCP socket, enables `SO_CONDITIONAL_ACCEPT`, and calls
+native `listen` with that backlog before UDP binds the exact selected TCP
+socket address. Port zero and an explicit IPv4/IPv6 family are preserved.
+
+The native backlog is validated only in the Windows `i32` range and is never
+used to allocate an application channel. Winsock re-invokes a condition
+callback only for the deferred queue head, so the proxy has one fixed
+conditional work slot and does not claim to process multiple deferred
+connections concurrently. This is an explicit safe limitation, not a
+conditional-backlog guarantee.
+
+### D-019 — Prompt condition callback
+
+The callback decodes only the supplied caller and callee socket-address bytes,
+forming the exact TCP synthetic tuple. It fills one preallocated conditional
+attempt slot, performs a bounded atomic reservation, a nonblocking unit-queue
+`try_send`, and event signal, then returns `CF_DEFER`. The fixed slot and
+unit queue avoid heap allocation in the callback. Its `try_lock` contention
+is a resource failure and returns `CF_REJECT`, never blocking. It does no
+Winsock call, RPC, socket operation, Tokio operation, or logging.
+
+### D-020 — Coordinator and callback lifetime
+
+The coordinator owns the native listener and repeatedly invokes nonblocking
+`WSAAccept`. A manual-reset Windows event wakes it for worker completion and
+shutdown; a bounded polling interval also services the queue head. The
+callback receives an `Arc`-backed stable context pointer. The listener task
+and coordinator retain that context until the coordinator joins, so no
+callback can observe a dangling pointer. Fallible worker/coordinator startup,
+native worker/runtime failures, thread panics, and both layers of native joins
+propagate through `run_bound`.
+
+### D-021 — Preconnect worker execution context
+
+A distinct native preconnect worker thread owns a Tokio current-thread runtime.
+It dequeues deferred attempts, runs `MappingClient::get_mapping`, validates
+protocol, family, non-unspecified address, and port, and connects outbound.
+The lookup/connect deadline is the remaining portion of five seconds measured
+from the first `CF_DEFER`. This avoids `Handle::block_on` on a Tokio runtime
+thread. Cancellation changes the attempt state and drops the pending async
+operation.
+
+### D-022 — Attempt identity, generations, and repeated defers
+
+The fixed queue-head slot stores the exact caller/local TCP tuple and a
+monotonic generation. A repeated callback for that deferred tuple returns
+`CF_DEFER` using the existing state; another tuple is rejected until the slot
+reaches a terminal state. Worker completion is applied only if its tuple and
+generation still match the slot; late results drop their outbound socket.
+Terminal removal releases admission exactly once.
+
+### D-023 — Socket handoff ownership
+
+Worker success stores an RAII-owned outbound socket before marking the request
+ready. The callback atomically changes ready to claimed and returns
+`CF_ACCEPT`; the coordinator removes the matching state and transfers both
+raw sockets as one handoff. Conversion to Tokio streams occurs before a bridge
+is spawned. Every failed claim, conversion, channel send, stale completion,
+post-`CF_ACCEPT` `WSAAccept` failure, or shutdown path drops both
+untransferred owners and releases the admission/handoff reservation; no
+accepted socket is published without its matching outbound socket.
+
+### D-024 — Conditional shutdown ordering
+
+Shutdown takes the fixed-slot lock, then closes admission and removes the
+attempt. This is the linearization point after which a ready callback cannot
+claim `CF_ACCEPT`. It drops any prepared outbound socket, signals the
+coordinator event, cancels worker operations, joins coordinator and worker
+threads, aborts/joins TCP bridges, and clears UDP associations and maintenance
+before returning from the proxy. The executable performs BPF detach only
+after `run_bound` returns.
+
 ## 3. Invariants
 
 | ID | Invariant |
@@ -131,6 +210,19 @@ cannot wait indefinitely on a hung control channel.
 | INV-011 | UDP responses are delivered only to the client address recorded for their association. |
 | INV-012 | No forwarding path bypasses authenticated control lookup or falls back to direct destination inference. |
 | INV-013 | A PSK secret is never written to logs, diagnostics, or successful responses. |
+| INV-014 | A Windows condition callback returns promptly without heap allocation, Winsock, blocking, RPC, re-entrant, or logging operations. |
+| INV-015 | The one Windows queue-head `CF_DEFER` has one bounded admission reservation and queued request, released exactly once. |
+| INV-016 | A Windows `CF_ACCEPT` is preceded by successful exact mapping validation and outbound TCP connection. |
+| INV-017 | No TCP bridge reconnects an outbound socket prepared for conditional acceptance. |
+| INV-018 | An attempt identity is its exact caller/local tuple plus a monotonic generation. |
+| INV-019 | A stale generation result cannot publish a socket and closes any owned outbound socket. |
+| INV-020 | A repeated deferred callback reuses the matching pending request state. |
+| INV-021 | An accepted client socket cannot be published without its paired outbound socket. |
+| INV-022 | Callback context memory remains valid until the coordinator/`WSAAccept` thread has stopped. |
+| INV-023 | Conditional shutdown rejects pending work and joins native/forwarding owners before BPF detach. |
+| INV-024 | UDP binds the actual TCP-selected address, port, and family. |
+| INV-025 | After conditional shutdown linearizes, no ready attempt can claim `CF_ACCEPT`. |
+| INV-026 | A failed/closed handoff and a post-`CF_ACCEPT` native failure release the exact attempt's prepared socket, admission, and handoff reservation. |
 
 ## 4. Impact Map
 
@@ -138,11 +230,11 @@ cannot wait indefinitely on a hung control channel.
 |---|---|---|---|
 | REQ-009 | D-011, D-017 | TC-037–TC-039 | workspace, host-proxy runtime/listeners |
 | REQ-010 | D-012, D-016 | TC-040–TC-043, TC-058 | tuple conversion, mapping client |
-| REQ-011 | D-014 | TC-044–TC-047, TC-059 | TCP session bridge |
+| REQ-011 | D-014, D-019–D-024 | TC-044–TC-047, TC-059, TC-068–TC-080, TC-083, TC-085 | TCP conditional admission and bridge |
 | REQ-012 | D-015 | TC-048–TC-052, TC-058–TC-059 | UDP association table |
 | REQ-013 | D-013, D-016 | TC-053–TC-054, TC-060 | TLS/gRPC client |
-| REQ-014 | D-011, D-017 | TC-037–TC-039, TC-055 | CLI/bootstrap |
-| REQ-015 | D-011, D-015, D-016 | TC-056–TC-057 | cancellation and resource cleanup |
+| REQ-014 | D-011, D-017, D-018 | TC-037–TC-039, TC-055, TC-066–TC-067, TC-081–TC-084 | CLI/bootstrap and bind ordering |
+| REQ-015 | D-011, D-015, D-016, D-020, D-024 | TC-056–TC-057, TC-064–TC-065, TC-076–TC-080, TC-083, TC-085 | cancellation and resource cleanup |
 
 ## 5. Explicit No-Impact Decisions
 

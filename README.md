@@ -86,7 +86,11 @@ Configure the listener and control service with CLI options; provide the PSK thr
 `--udp-idle-timeout-secs` and never falls back to direct forwarding when a
 mapping lookup fails. The listen address must be a specific local IPv4 or IPv6
 address, not a wildcard address, so UDP lookups preserve the actual local
-destination tuple.
+destination tuple. `--listen-backlog` defaults to 1024 and is passed to native
+`listen` on Windows. Winsock calls a conditional-accept callback only for the
+deferred queue head, so the proxy processes one deferred attempt at a time;
+the configured native backlog neither sizes internal queues nor promises
+parallel conditional admission.
 
 ## Windows/WSL demo deployment
 

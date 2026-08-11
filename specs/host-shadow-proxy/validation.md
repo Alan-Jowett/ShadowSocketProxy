@@ -48,6 +48,26 @@ validation specification and is not duplicated here.
 | TC-063 | REQ-012 | Continuous one-way UDP sends | Successful outbound sends refresh the idle lease; the association expires only after outbound and inbound activity stop. |
 | TC-064 | REQ-015 | Ctrl-C with active forwarding | Shutdown joins TCP and UDP forwarding tasks before the bounded control detach request begins. |
 | TC-065 | REQ-015 | Hung control operation | Maintenance and detach operations observe cancellation or their deadline and do not block shutdown indefinitely. |
+| TC-066 | REQ-014 | Omit `--listen-backlog`; configure zero, `i32::MAX`, and out-of-range values | Default is 1024; zero and values above `i32::MAX` fail before readiness; `i32::MAX` validates without sizing an internal queue. |
+| TC-067 | REQ-014 | Windows native TCP listener setup | The configured backlog is passed only to native `listen`; the fixed conditional work slot is independent of that value. |
+| TC-068 | REQ-011 | Windows condition callback on a new TCP tuple | Callback uses fixed storage plus bounded reservation/unit-queue/event work and returns `CF_DEFER` without heap allocation, Winsock, RPC, blocking, re-entry, or logging. |
+| TC-069 | REQ-011/015 | Deferred Windows queue head and later connections | Only one queue-head tuple reserves conditional state; later connections remain subject to native backlog and are not advertised as independently deferred application work. Terminal cleanup frees the fixed slot. |
+| TC-070 | REQ-011 | Repeated callback for a deferred exact tuple | The same request identity is reused and returns `CF_DEFER`, without an additional reservation or lookup. |
+| TC-071 | REQ-011 | Worker completion after the tuple is released and reused | A distinct higher generation owns the new request; stale success is ignored and closes its socket. |
+| TC-072 | REQ-011 | Deferred mapping lookup begins late | Lookup plus connect are bounded by five seconds measured at first `CF_DEFER`, not worker start. |
+| TC-073 | REQ-011 | Mapping missing, malformed, protocol/family-mismatched, or unspecified | Worker marks the request rejected; coordinator returns `CF_REJECT` and publishes no socket. |
+| TC-074 | REQ-011 | Outbound TCP connect failure or resource error | Worker marks the request rejected; failure is observable and no accepted client socket is published. |
+| TC-075 | REQ-011 | Valid mapping and outbound connection | Worker prepares one outbound socket; callback returns `CF_ACCEPT`; TCP bridge reuses that socket and does not connect a second time. |
+| TC-076 | REQ-011/015 | Shutdown while lookup or connect is pending | Admission stops, the worker operation is cancelled, its socket is closed if produced, and worker/coordinator threads join. |
+| TC-077 | REQ-011 | Accepted raw socket, full/closed handoff queue, post-`CF_ACCEPT` `WSAAccept`, or Tokio conversion failure | Both client and paired outbound owners close; the exact prepared socket, admission, and handoff reservation release; no half-handoff reaches a bridge. |
+| TC-078 | REQ-011 | Worker result races cancellation or a claimed request | State transition permits only one handoff; terminal/stale result sockets close. |
+| TC-079 | REQ-015 | Shutdown with deferred and ready conditional requests | Pending requests are rejectable, prepared outbound sockets close, and forwarding tasks join before `run_bound` returns. |
+| TC-080 | REQ-011/015 | Callback context teardown | Context remains allocated through coordinator/`WSAAccept` stop and is reclaimed only after thread join. |
+| TC-081 | REQ-014 | TCP bind with port zero | UDP binds the actual selected TCP address and port rather than the requested zero port. |
+| TC-082 | REQ-014 | Explicit IPv4 and IPv6 TCP listeners | UDP binds the matching selected family and mapping tuples retain that family. |
+| TC-083 | REQ-011/014/015 | Non-Windows build and Windows test availability | Non-Windows TCP behavior remains unchanged and unit regressions pass; Windows runs a deterministic loopback `SO_CONDITIONAL_ACCEPT`/`WSAAccept` bridge test. |
+| TC-084 | REQ-014 | Windows IPv6 conditional loopback | `::1` TCP and UDP share the selected port and the conditional mapping tuple remains IPv6. |
+| TC-085 | REQ-011/015 | Windows shutdown during a hanging conditional mapping | A connection initiates a deferred lookup; shutdown returns within the bound with no handoff and joins the native worker/coordinator. |
 
 ## 3. Property and Invariant Checks
 
@@ -60,6 +80,15 @@ validation specification and is not duplicated here.
 - Idle UDP associations eventually release their socket and task.
 - No forwarding path succeeds without an authenticated mapping lookup.
 - No secret value appears in logs, diagnostics, or RPC responses.
+- `CF_ACCEPT` is impossible without a ready matching outbound socket, and a
+  ready outbound socket is impossible without a successful exact validation
+  and connect.
+- Deferred-request generations are monotonic; a stale generation cannot
+  transfer or leak its socket.
+- Conditional work has exactly one fixed queue-head slot independent of
+  `listen_backlog`, and every request decrements its reservation at most once.
+- The callback context outlives every `WSAAccept` callback.
+- After shutdown linearizes, no callback can claim a ready attempt.
 
 ## 4. Failure Semantics
 
@@ -91,9 +120,14 @@ cargo check -p shadow-socket-proxy-host
 cargo test -p shadow-socket-proxy-host
 cargo check --workspace
 cargo test --workspace
+cargo clippy -p shadow-socket-proxy-host --all-targets -- -D warnings
 ```
 
 Windows-specific integration tests MUST be feature- or environment-gated and
 MUST fail clearly when required OpenSSL PSK support or runtime prerequisites
 are unavailable. Linux control-service checks remain green without
 pretending to provide the Windows host proxy runtime.
+
+TC-067 through TC-085 combine focused state-machine tests with the Windows
+loopback conditional-accept bridge test. Live TLS-PSK control-plane validation
+remains environment-gated on a PSK-capable OpenSSL installation.
