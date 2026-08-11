@@ -548,9 +548,9 @@ jobs:
             $output = & cargo check --locked -p $package --no-default-features `
               --features tls-psk,tls-rustls 2>&1
             $status = $LASTEXITCODE
-            $text = $output -join "`n"
+            $text = ($output | Out-String) -replace "`e\[[0-9;]*m", ""
             Write-Output $text
-            if ($status -eq 0 -or $text -notmatch "mutually exclusive") {
+            if ($status -eq 0 -or $text -notmatch "tls-psk and tls-rustls are mutually exclusive") {
               throw "$package did not reject both TLS features explicitly"
             }
           }
