@@ -548,9 +548,11 @@ jobs:
             $output = & cargo check --locked -p $package --no-default-features `
               --features tls-psk,tls-rustls 2>&1
             $status = $LASTEXITCODE
-            $text = ($output | Out-String) -replace "`e\[[0-9;]*m", ""
+            $text = ($output | Out-String) `
+              -replace "`e\[[0-9;]*m", "" `
+              -replace "[^\x20-\x7E\r\n\t]", ""
             Write-Output $text
-            if ($status -eq 0 -or $text -notmatch "tls-psk and tls-rustls are mutually exclusive") {
-              throw "$package did not reject both TLS features explicitly"
+            if ($status -eq 0 -or -not $text.Contains("tls-psk and tls-rustls are mutually exclusive")) {
+              throw "${package} did not reject both TLS features explicitly"
             }
           }
