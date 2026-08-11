@@ -87,6 +87,7 @@ struct ConditionalAttempt {
     /// Immutable identity for this deferred attempt.
     id: ConditionalRequestId,
     /// Timestamp of the initial `CF_DEFER`.
+    #[cfg(target_os = "windows")]
     deferred_at: std::time::Instant,
     /// Atomic lifecycle state shared across native contexts.
     state: AtomicU8,
@@ -100,6 +101,7 @@ impl ConditionalAttempt {
     fn new(id: ConditionalRequestId) -> Self {
         Self {
             id,
+            #[cfg(target_os = "windows")]
             deferred_at: std::time::Instant::now(),
             state: AtomicU8::new(ConditionalAttemptState::Deferred as u8),
             released: AtomicBool::new(false),
