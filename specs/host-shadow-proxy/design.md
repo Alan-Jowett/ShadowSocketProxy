@@ -132,27 +132,33 @@ first binds the native TCP socket, enables `SO_CONDITIONAL_ACCEPT`, and calls
 native `listen` with that backlog before UDP binds the exact selected TCP
 socket address. Port zero and an explicit IPv4/IPv6 family are preserved.
 
-The same value is the application pending-attempt limit. It is documented as
-an admission policy, not a guarantee of Windows conditional backlog behavior,
-because conditional accept changes Winsock backlog semantics.
+The native backlog is validated only in the Windows `i32` range and is never
+used to allocate an application channel. Winsock re-invokes a condition
+callback only for the deferred queue head, so the proxy has one fixed
+conditional work slot and does not claim to process multiple deferred
+connections concurrently. This is an explicit safe limitation, not a
+conditional-backlog guarantee.
 
 ### D-019 — Prompt condition callback
 
 The callback decodes only the supplied caller and callee socket-address bytes,
-forming the exact TCP synthetic tuple. It performs a bounded atomic admission
-reservation, a nonblocking queue `try_send`, and event signal, then returns
-`CF_DEFER`. A callback table lock is `try_lock`; contention is a resource
-failure and returns `CF_REJECT`, never blocking. It does no Winsock call, RPC,
-socket operation, Tokio operation, or logging.
+forming the exact TCP synthetic tuple. It fills one preallocated conditional
+attempt slot, performs a bounded atomic reservation, a nonblocking unit-queue
+`try_send`, and event signal, then returns `CF_DEFER`. The fixed slot and
+unit queue avoid heap allocation in the callback. Its `try_lock` contention
+is a resource failure and returns `CF_REJECT`, never blocking. It does no
+Winsock call, RPC, socket operation, Tokio operation, or logging.
 
 ### D-020 — Coordinator and callback lifetime
 
 The coordinator owns the native listener and repeatedly invokes nonblocking
 `WSAAccept`. A manual-reset Windows event wakes it for worker completion and
-shutdown; a bounded polling interval also services new connection attempts.
-The callback receives an `Arc`-backed stable context pointer. The listener
-task and coordinator retain that context until the coordinator joins, so no
-callback can observe a dangling pointer.
+shutdown; a bounded polling interval also services the queue head. The
+callback receives an `Arc`-backed stable context pointer. The listener task
+and coordinator retain that context until the coordinator joins, so no
+callback can observe a dangling pointer. Fallible worker/coordinator startup,
+native worker/runtime failures, thread panics, and both layers of native joins
+propagate through `run_bound`.
 
 ### D-021 — Preconnect worker execution context
 
@@ -166,12 +172,12 @@ operation.
 
 ### D-022 — Attempt identity, generations, and repeated defers
 
-The attempt table is keyed by the exact caller/local TCP tuple and each
-reservation receives a monotonic generation. A repeated callback for a
-deferred tuple returns `CF_DEFER` using the existing state. Worker completion
-is applied only if its tuple and generation still match the table slot; late
-results drop their outbound socket. Terminal removal releases admission
-exactly once.
+The fixed queue-head slot stores the exact caller/local TCP tuple and a
+monotonic generation. A repeated callback for that deferred tuple returns
+`CF_DEFER` using the existing state; another tuple is rejected until the slot
+reaches a terminal state. Worker completion is applied only if its tuple and
+generation still match the slot; late results drop their outbound socket.
+Terminal removal releases admission exactly once.
 
 ### D-023 — Socket handoff ownership
 
@@ -180,16 +186,19 @@ ready. The callback atomically changes ready to claimed and returns
 `CF_ACCEPT`; the coordinator removes the matching state and transfers both
 raw sockets as one handoff. Conversion to Tokio streams occurs before a bridge
 is spawned. Every failed claim, conversion, channel send, stale completion,
-or shutdown path drops both untransferred owners; no accepted socket is
-published without its matching outbound socket.
+post-`CF_ACCEPT` `WSAAccept` failure, or shutdown path drops both
+untransferred owners and releases the admission/handoff reservation; no
+accepted socket is published without its matching outbound socket.
 
 ### D-024 — Conditional shutdown ordering
 
-Shutdown first closes admission and marks pending attempts rejectable, removes
-prepared outbound sockets, and signals the coordinator event. It cancels
-worker operations, joins coordinator and worker threads, aborts/joins TCP
-bridges, and clears UDP associations and maintenance before returning from the
-proxy. The executable performs BPF detach only after `run_bound` returns.
+Shutdown takes the fixed-slot lock, then closes admission and removes the
+attempt. This is the linearization point after which a ready callback cannot
+claim `CF_ACCEPT`. It drops any prepared outbound socket, signals the
+coordinator event, cancels worker operations, joins coordinator and worker
+threads, aborts/joins TCP bridges, and clears UDP associations and maintenance
+before returning from the proxy. The executable performs BPF detach only
+after `run_bound` returns.
 
 ## 3. Invariants
 
@@ -201,8 +210,8 @@ proxy. The executable performs BPF detach only after `run_bound` returns.
 | INV-011 | UDP responses are delivered only to the client address recorded for their association. |
 | INV-012 | No forwarding path bypasses authenticated control lookup or falls back to direct destination inference. |
 | INV-013 | A PSK secret is never written to logs, diagnostics, or successful responses. |
-| INV-014 | A Windows condition callback returns promptly without Winsock, blocking, RPC, re-entrant, or logging operations. |
-| INV-015 | Every `CF_DEFER` has one bounded admission reservation and queued request, released exactly once. |
+| INV-014 | A Windows condition callback returns promptly without heap allocation, Winsock, blocking, RPC, re-entrant, or logging operations. |
+| INV-015 | The one Windows queue-head `CF_DEFER` has one bounded admission reservation and queued request, released exactly once. |
 | INV-016 | A Windows `CF_ACCEPT` is preceded by successful exact mapping validation and outbound TCP connection. |
 | INV-017 | No TCP bridge reconnects an outbound socket prepared for conditional acceptance. |
 | INV-018 | An attempt identity is its exact caller/local tuple plus a monotonic generation. |
@@ -212,6 +221,8 @@ proxy. The executable performs BPF detach only after `run_bound` returns.
 | INV-022 | Callback context memory remains valid until the coordinator/`WSAAccept` thread has stopped. |
 | INV-023 | Conditional shutdown rejects pending work and joins native/forwarding owners before BPF detach. |
 | INV-024 | UDP binds the actual TCP-selected address, port, and family. |
+| INV-025 | After conditional shutdown linearizes, no ready attempt can claim `CF_ACCEPT`. |
+| INV-026 | A failed/closed handoff and a post-`CF_ACCEPT` native failure release the exact attempt's prepared socket, admission, and handoff reservation. |
 
 ## 4. Impact Map
 

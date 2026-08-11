@@ -16,7 +16,8 @@ struct Args {
     /// Specific local TCP/UDP listener address.
     listen: SocketAddr,
     #[arg(long, default_value_t = 1024)]
-    /// Native TCP listen backlog and Windows conditional pending-attempt limit.
+    /// Native TCP listen backlog; Windows conditional work is fixed at one
+    /// queue-head attempt regardless of this value.
     listen_backlog: u32,
     #[arg(long, default_value = "https://127.0.0.1:50051")]
     /// TLS-PSK control-service endpoint.
