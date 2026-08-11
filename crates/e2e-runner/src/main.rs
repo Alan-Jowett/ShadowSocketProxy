@@ -93,6 +93,7 @@ mod windows {
         marker: String,
     }
 
+    /// Selects a setting from either the command line or its environment variable.
     fn select_value<T>(
         cli: Option<T>,
         env_name: &str,
@@ -117,12 +118,14 @@ mod windows {
         Ok(environment.filter(|value| !value.is_empty()).map(value))
     }
 
+    /// Runtime certificate and peer-pin settings for rustls mode.
     type RustlsOptions = (
         Option<std::path::PathBuf>,
         Option<std::path::PathBuf>,
         Option<String>,
     );
 
+    /// Resolves rustls certificate and peer-pin settings.
     fn resolve_rustls_options(args: &Args) -> Result<RustlsOptions, String> {
         Ok((
             select_value(

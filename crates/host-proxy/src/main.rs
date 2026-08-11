@@ -91,9 +91,11 @@ fn load_secret(args: &Args) -> Result<Vec<u8>, String> {
 }
 
 #[cfg(any(feature = "tls-psk", feature = "tls-rustls"))]
+/// Runtime certificate and peer-pin settings for rustls mode.
 type RustlsOptions = (Option<PathBuf>, Option<PathBuf>, Option<String>);
 
 #[cfg(any(feature = "tls-psk", feature = "tls-rustls"))]
+/// Selects a setting from either the command line or its environment variable.
 fn select_value<T>(
     cli: Option<T>,
     env_name: &str,
@@ -119,6 +121,7 @@ fn select_value<T>(
 }
 
 #[cfg(any(feature = "tls-psk", feature = "tls-rustls"))]
+/// Resolves rustls certificate and peer-pin settings.
 fn resolve_rustls_options(args: &Args) -> Result<RustlsOptions, String> {
     Ok((
         select_value(
@@ -136,6 +139,7 @@ fn resolve_rustls_options(args: &Args) -> Result<RustlsOptions, String> {
 }
 
 #[cfg(feature = "tls-psk")]
+/// Connects to the control service using the selected PSK credentials.
 async fn connect_client(
     args: &Args,
     secret: &[u8],
@@ -149,6 +153,7 @@ async fn connect_client(
 }
 
 #[cfg(feature = "tls-rustls")]
+/// Connects to the control service using the selected rustls credentials.
 async fn connect_client(
     args: &Args,
     tls_cert_file: &Path,
@@ -165,6 +170,7 @@ async fn connect_client(
 }
 
 #[cfg(any(feature = "tls-psk", feature = "tls-rustls"))]
+/// Builds the host-proxy runtime configuration.
 fn proxy_config(args: &Args, psk_identity: String, psk_secret: Vec<u8>) -> ProxyConfig {
     ProxyConfig {
         listen: args.listen,

@@ -22,7 +22,7 @@ FIELD_RE = re.compile(
     r"^(?:pub(?:\s*\([^)]*\))?\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*:"
 )
 VARIANT_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\s*(?:\(|\{|=|,|$)")
-CFG_TEST_RE = re.compile(r"^\s*#\s*\[\s*cfg\s*\(\s*test\s*\)\s*\]")
+CFG_TEST_RE = re.compile(r"^\s*#\s*\[\s*cfg\s*\(.*\btest\b.*\)\s*\]")
 
 
 def _brace_delta(line: str) -> int:
@@ -52,8 +52,22 @@ def excluded_test_lines(lines: list[str]) -> set[int]:
     """Return zero-based line indices belonging to cfg(test) items or modules."""
     excluded: set[int] = set()
     pending = False
+    pending_cfg = False
+    cfg_indices: list[int] = []
+    cfg_text: list[str] = []
     depth = 0
     for index, line in enumerate(lines):
+        if pending_cfg:
+            cfg_indices.append(index)
+            cfg_text.append(line)
+            if "]" in line:
+                if re.search(r"\btest\b", " ".join(cfg_text)):
+                    excluded.update(cfg_indices)
+                    pending = True
+                pending_cfg = False
+                cfg_indices = []
+                cfg_text = []
+            continue
         if depth:
             excluded.add(index)
             depth += _brace_delta(line)
@@ -68,6 +82,18 @@ def excluded_test_lines(lines: list[str]) -> set[int]:
                 if depth <= 0:
                     depth = 0
             pending = False
+            continue
+        if re.match(r"^\s*#\s*\[\s*cfg\s*\(", line):
+            cfg_indices = [index]
+            cfg_text = [line]
+            if "]" in line:
+                if re.search(r"\btest\b", line):
+                    excluded.add(index)
+                    pending = True
+                cfg_indices = []
+                cfg_text = []
+            else:
+                pending_cfg = True
             continue
         if CFG_TEST_RE.match(line):
             excluded.add(index)

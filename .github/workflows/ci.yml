@@ -538,6 +538,7 @@ jobs:
       - name: Verify both TLS features are rejected
         shell: pwsh
         run: |
+          $PSNativeCommandUseErrorActionPreference = $false
           $packages = @(
             "shadow-socket-proxy-control",
             "shadow-socket-proxy-host",

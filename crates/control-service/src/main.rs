@@ -33,6 +33,7 @@ struct Args {
 }
 
 #[cfg(any(feature = "tls-psk", feature = "tls-rustls"))]
+/// Selects a setting from either the command line or its environment variable.
 fn select_value<T>(
     cli: Option<T>,
     env_name: &str,
@@ -58,6 +59,7 @@ fn select_value<T>(
 }
 
 #[cfg(any(feature = "tls-psk", feature = "tls-rustls"))]
+/// Resolves the selected TLS backend's runtime configuration.
 fn resolve_tls_config(args: &Args) -> Result<TlsConfig, String> {
     let certificate_file = select_value(
         args.tls_cert_file.clone(),

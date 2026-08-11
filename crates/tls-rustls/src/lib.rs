@@ -93,6 +93,7 @@ impl RustlsIdentity {
 }
 
 impl Clone for RustlsIdentity {
+    /// Clones the certificate chain and private key.
     fn clone(&self) -> Self {
         Self {
             cert_chain: self.cert_chain.clone(),
@@ -216,6 +217,7 @@ pub fn parse_sha256_pin(value: &str) -> Result<[u8; 32], RustlsConfigError> {
     Ok(digest)
 }
 
+/// Converts one hexadecimal digit to its numeric value.
 fn hex_nibble(value: u8) -> Result<u8, RustlsConfigError> {
     match value {
         b'0'..=b'9' => Ok(value - b'0'),
@@ -225,19 +227,23 @@ fn hex_nibble(value: u8) -> Result<u8, RustlsConfigError> {
     }
 }
 
+/// Returns the cryptographic provider used by rustls.
 fn provider() -> Arc<CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
 }
 
+/// Converts a rustls error into the public configuration error.
 fn rustls_error(error: RustlsError) -> RustlsConfigError {
     RustlsConfigError::Rustls(error.to_string())
 }
 
+/// Checks whether a certificate matches the configured SHA-256 pin.
 fn pin_matches(pin: &[u8; 32], certificate: &CertificateDer<'_>) -> bool {
     let digest: [u8; 32] = Sha256::digest(certificate.as_ref()).into();
     digest == *pin
 }
 
+/// Builds a trust store containing the pinned certificate.
 fn roots_for_leaf(certificate: &CertificateDer<'_>) -> Result<RootCertStore, RustlsError> {
     let mut roots = RootCertStore::empty();
     roots.add(certificate.clone()).map_err(|error| {
@@ -246,13 +252,17 @@ fn roots_for_leaf(certificate: &CertificateDer<'_>) -> Result<RootCertStore, Rus
     Ok(roots)
 }
 
+/// Server-side verifier for a pinned self-signed peer certificate.
 #[derive(Debug)]
 struct PinnedServerCertVerifier {
+    /// SHA-256 digest of the expected peer certificate.
     pin: [u8; 32],
+    /// Cryptographic provider used for certificate verification.
     provider: Arc<CryptoProvider>,
 }
 
 impl ServerCertVerifier for PinnedServerCertVerifier {
+    /// Verifies the pinned server certificate and its signature chain.
     fn verify_server_cert(
         &self,
         end_entity: &CertificateDer<'_>,
@@ -278,6 +288,7 @@ impl ServerCertVerifier for PinnedServerCertVerifier {
         Ok(ServerCertVerified::assertion())
     }
 
+    /// Verifies a TLS 1.2 handshake signature.
     fn verify_tls12_signature(
         &self,
         message: &[u8],
@@ -292,6 +303,7 @@ impl ServerCertVerifier for PinnedServerCertVerifier {
         )
     }
 
+    /// Verifies a TLS 1.3 handshake signature.
     fn verify_tls13_signature(
         &self,
         message: &[u8],
@@ -306,6 +318,7 @@ impl ServerCertVerifier for PinnedServerCertVerifier {
         )
     }
 
+    /// Lists the signature schemes supported by the provider.
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
         self.provider
             .signature_verification_algorithms
@@ -313,17 +326,22 @@ impl ServerCertVerifier for PinnedServerCertVerifier {
     }
 }
 
+/// Client-side verifier for a pinned self-signed peer certificate.
 #[derive(Debug)]
 struct PinnedClientCertVerifier {
+    /// SHA-256 digest of the expected peer certificate.
     pin: [u8; 32],
+    /// Cryptographic provider used for certificate verification.
     provider: Arc<CryptoProvider>,
 }
 
 impl ClientCertVerifier for PinnedClientCertVerifier {
+    /// Returns no distinguished-name hints for the pinned self-signed peer.
     fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
         &[]
     }
 
+    /// Verifies the pinned client certificate and its signature chain.
     fn verify_client_cert(
         &self,
         end_entity: &CertificateDer<'_>,
@@ -343,6 +361,7 @@ impl ClientCertVerifier for PinnedClientCertVerifier {
         verifier.verify_client_cert(end_entity, intermediates, now)
     }
 
+    /// Verifies a TLS 1.2 handshake signature.
     fn verify_tls12_signature(
         &self,
         message: &[u8],
@@ -357,6 +376,7 @@ impl ClientCertVerifier for PinnedClientCertVerifier {
         )
     }
 
+    /// Verifies a TLS 1.3 handshake signature.
     fn verify_tls13_signature(
         &self,
         message: &[u8],
@@ -371,6 +391,7 @@ impl ClientCertVerifier for PinnedClientCertVerifier {
         )
     }
 
+    /// Lists the signature schemes supported by the provider.
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
         self.provider
             .signature_verification_algorithms

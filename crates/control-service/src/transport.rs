@@ -366,6 +366,7 @@ pub struct TlsRustlsConnection {
 }
 
 #[cfg(all(target_os = "linux", feature = "tls-rustls"))]
+/// Accepts and wraps one rustls control connection.
 async fn accept_rustls(
     acceptor: TlsAcceptor,
     stream: TcpStream,

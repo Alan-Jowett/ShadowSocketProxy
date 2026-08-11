@@ -2687,6 +2687,7 @@ mod windows_conditional {
 }
 
 #[cfg(all(target_os = "windows", feature = "tls-rustls"))]
+/// Windows rustls client transport implementation.
 mod rustls_client;
 
 #[cfg(all(target_os = "windows", feature = "tls-rustls"))]
