@@ -62,7 +62,12 @@ const WSK_FLAG_LISTEN_SOCKET: u32 = wsk::WSK_FLAG_LISTEN_SOCKET;
 const WSK_FLAG_DATAGRAM_SOCKET: u32 = wsk::WSK_FLAG_DATAGRAM_SOCKET;
 const WSK_EVENT_ACCEPT: u32 = wsk::WSK_EVENT_ACCEPT;
 const WSK_EVENT_RECEIVE_FROM: u32 = wsk::WSK_EVENT_RECEIVE_FROM;
+const WSK_EVENT_RECEIVE: u32 = wsk::WSK_EVENT_RECEIVE;
+const WSK_EVENT_DISCONNECT: u32 = wsk::WSK_EVENT_DISCONNECT;
 const WSK_SET_STATIC_EVENT_CALLBACKS: u32 = wsk::WSK_SET_STATIC_EVENT_CALLBACKS;
+const WSK_SET_OPTION: i32 = wsk::WSK_CONTROL_SOCKET_TYPE::WskSetOption;
+const SO_WSK_EVENT_CALLBACK: u32 = 0x4002;
+const SOL_SOCKET: u32 = 0xffff;
 const WSK_INFINITE_WAIT: u32 = wsk::WSK_INFINITE_WAIT;
 const TIMER_PERIOD_MS: i32 = 1_000;
 const TIMER_PERIOD_100NS: i64 = 10_000_000;
@@ -186,6 +191,7 @@ static TIMER_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
 static SESSION_LOCK: AtomicBool = AtomicBool::new(false);
 static SESSION_ACTIVE: AtomicBool = AtomicBool::new(false);
+static STATIC_EVENT_CALLBACKS_ENABLED: AtomicBool = AtomicBool::new(false);
 static SESSION_NONCE: [AtomicU64; 4] = [
     AtomicU64::new(0),
     AtomicU64::new(0),
@@ -1004,6 +1010,7 @@ fn set_static_event_callbacks() -> NTSTATUS {
     if provider.Dispatch.is_null() {
         return STATUS_NOT_SUPPORTED;
     }
+
     let Some(control_client) = (unsafe { (*provider.Dispatch).WskControlClient }) else {
         return STATUS_NOT_SUPPORTED;
     };
@@ -1011,7 +1018,7 @@ fn set_static_event_callbacks() -> NTSTATUS {
         NpiId: core::ptr::addr_of!(WSK_INTERFACE_ID),
         EventMask: WSK_EVENT_ACCEPT | WSK_EVENT_RECEIVE_FROM,
     };
-    unsafe {
+    let status = unsafe {
         control_client(
             provider.Client,
             WSK_SET_STATIC_EVENT_CALLBACKS,
@@ -1022,7 +1029,49 @@ fn set_static_event_callbacks() -> NTSTATUS {
             null_mut(),
             null_mut(),
         )
+    };
+    STATIC_EVENT_CALLBACKS_ENABLED.store(status == STATUS_SUCCESS, Ordering::Release);
+    status
+}
+
+fn enable_socket_event_callbacks(socket: wsk::PWSK_SOCKET, event_mask: u32) -> bool {
+    if socket.is_null() || event_mask == 0 {
+        return false;
     }
+    if STATIC_EVENT_CALLBACKS_ENABLED.load(Ordering::Acquire) {
+        return true;
+    }
+    let dispatch = unsafe {
+        if (*socket).Dispatch.is_null() {
+            return false;
+        }
+        &*((*socket).Dispatch as *const wsk::WSK_PROVIDER_BASIC_DISPATCH)
+    };
+    let Some(control_socket) = dispatch.WskControlSocket else {
+        return false;
+    };
+    let mut control = wsk::WSK_EVENT_CALLBACK_CONTROL {
+        NpiId: core::ptr::addr_of!(WSK_INTERFACE_ID),
+        EventMask: event_mask,
+    };
+    let status = unsafe {
+        control_socket(
+            socket,
+            WSK_SET_OPTION,
+            SO_WSK_EVENT_CALLBACK,
+            SOL_SOCKET,
+            size_of::<wsk::WSK_EVENT_CALLBACK_CONTROL>() as u64,
+            (&mut control as *mut wsk::WSK_EVENT_CALLBACK_CONTROL).cast(),
+            0,
+            null_mut(),
+            null_mut(),
+            null_mut(),
+        )
+    };
+    if status != STATUS_SUCCESS {
+        debug_status(b"WskControlSocket\0", status);
+    }
+    status == STATUS_SUCCESS
 }
 
 fn create_wsk_socket(
@@ -1174,6 +1223,15 @@ fn setup_listener(
         dispatch,
     )?;
     if !bind_socket(socket, family, protocol) {
+        let _ = close_socket_sync(socket);
+        return None;
+    }
+    let event_mask = if protocol == IPPROTO_TCP {
+        WSK_EVENT_ACCEPT
+    } else {
+        WSK_EVENT_RECEIVE_FROM
+    };
+    if !enable_socket_event_callbacks(socket, event_mask) {
         let _ = close_socket_sync(socket);
         return None;
     }
@@ -1749,7 +1807,13 @@ fn create_outbound_socket(original: &abi::MappingTuple, index: usize) -> Option<
             })
             .ok()?;
             if result.0 == STATUS_SUCCESS && result.1 != 0 {
-                Some(result.1 as usize as wsk::PWSK_SOCKET)
+                let socket = result.1 as usize as wsk::PWSK_SOCKET;
+                if enable_socket_event_callbacks(socket, WSK_EVENT_RECEIVE | WSK_EVENT_DISCONNECT) {
+                    Some(socket)
+                } else {
+                    let _ = close_socket_sync(socket);
+                    None
+                }
             } else {
                 None
             }
@@ -1780,7 +1844,13 @@ fn create_outbound_socket(original: &abi::MappingTuple, index: usize) -> Option<
             })
             .ok()?;
             if result.0 == STATUS_SUCCESS && result.1 != 0 {
-                Some(result.1 as usize as wsk::PWSK_SOCKET)
+                let socket = result.1 as usize as wsk::PWSK_SOCKET;
+                if enable_socket_event_callbacks(socket, WSK_EVENT_RECEIVE | WSK_EVENT_DISCONNECT) {
+                    Some(socket)
+                } else {
+                    let _ = close_socket_sync(socket);
+                    None
+                }
             } else {
                 None
             }
@@ -1945,6 +2015,10 @@ unsafe extern "C" fn wsk_accept_event(
         unsafe {
             *accept_socket_dispatch = &WSK_CLIENT_CONNECTION_DISPATCH;
         }
+    }
+    if !enable_socket_event_callbacks(accept_socket, WSK_EVENT_RECEIVE | WSK_EVENT_DISCONNECT) {
+        close_slot_sync(index);
+        return STATUS_REQUEST_NOT_ACCEPTED;
     }
     let _ = context;
     STATUS_SUCCESS
@@ -2455,8 +2529,6 @@ fn register_wsk() -> NTSTATUS {
     let status = set_static_event_callbacks();
     if status != STATUS_SUCCESS {
         debug_status(b"set_static_event_callbacks\0", status);
-        unregister_wsk();
-        return status;
     }
 
     let tcp_v4 = setup_listener(AF_INET, IPPROTO_TCP, &TCP_CONTEXT_V4);
@@ -2495,6 +2567,7 @@ fn unregister_wsk() {
     cancel_pending_mapping(abi::Status::Cancelled);
     fail_active_flow_sync();
     close_all_listeners();
+    STATIC_EVENT_CALLBACKS_ENABLED.store(false, Ordering::Release);
     unsafe {
         let registration = core::ptr::addr_of_mut!(WSK_REGISTRATION).cast();
         if WSK_PROVIDER_CAPTURED {
