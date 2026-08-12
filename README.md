@@ -208,11 +208,19 @@ Do not mix an installed Windows Kit version such as `10.0.26100.0` with the
 pinned `10.0.28000.2526` WDK content when generating the driver bindings.
 
 The driver is a kernel-mode binary and must be signed before Windows will load
-it. For development, use a test certificate and test-signing mode according to
-the Windows driver-signing workflow; production deployments require a
-Microsoft-approved signing path. After signing, install the driver as a
-kernel service from an elevated prompt, replacing the path with the built
-driver location:
+it. For development, the repository includes a helper that creates or reuses
+a local test code-signing certificate, trusts it in the local machine stores,
+and signs the driver with the Windows SDK `signtool`:
+
+```powershell
+.\scripts\sign-wsk-driver.ps1 `
+  -DriverPath .\target\x86_64-pc-windows-msvc\release\shadow_socket_proxy_wsk_driver.dll `
+  -EnableTestSigning
+```
+
+Reboot after enabling test signing. Test certificates are for development
+only; production deployments require a Microsoft-approved signing path. After
+reboot, install the driver as a kernel service from an elevated prompt:
 
 ```powershell
 sc.exe create ShadowSocketProxyWsk type= kernel start= demand `
