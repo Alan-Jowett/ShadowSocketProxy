@@ -243,6 +243,24 @@ Get-WinEvent -LogName System -MaxEvents 100 |
 The driver emits the failing initialization stage and NTSTATUS through
 `DbgPrintEx` for `IoCreateDevice`, `IoCreateSymbolicLink`, `WskRegister`,
 `WskCaptureProviderNPI`, static callback registration, and listener setup.
+After changing the driver, rebuild and run the signing helper again; the
+service loads the file recorded by `sc.exe`, not the latest Cargo output
+automatically. Verify the service path and driver timestamp before retrying:
+
+```powershell
+sc.exe qc ShadowSocketProxyWsk
+Get-Item .\target\x86_64-pc-windows-msvc\release\shadow_socket_proxy_wsk_driver.dll |
+  Select-Object FullName, LastWriteTime, Length
+```
+
+Windows may filter `DbgPrintEx` output for third-party drivers. Enable the
+`IHVDRIVER` debug-print component from an elevated prompt, then reboot:
+
+```powershell
+reg.exe add "HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Debug Print Filter" `
+  /v IHVDRIVER /t REG_DWORD /d 0xF /f
+```
+
 Capture these messages with Sysinternals DebugView running elevated with
 **Capture Kernel** enabled, or with a kernel WinDbg session, then retry:
 
