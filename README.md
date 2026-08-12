@@ -182,6 +182,26 @@ cargo build --locked --release -p shadow-socket-proxy-host `
   --features "tls-psk,wsk"
 ```
 
+If `wdk-sys` reports many `E0080` layout-assertion failures such as
+`size_of::<_DRIVER_OBJECT>() - 336usize`, the bindings were generated from
+stale or mismatched Windows Kit headers. Remove the target directory and
+explicitly use the pinned NuGet content before rebuilding:
+
+```powershell
+cargo clean --target x86_64-pc-windows-msvc
+$env:SSP_WSK_WDK_ROOT = "$env:USERPROFILE\.nuget\packages\microsoft.windows.wdk.x64\10.0.28000.2526\c"
+$env:SSP_WSK_SDK_ROOT = "$env:USERPROFILE\.nuget\packages\microsoft.windows.sdk.cpp\10.0.28000.2526\c"
+$env:WDKContentRoot = $env:SSP_WSK_WDK_ROOT
+
+cargo build --locked --release -p shadow-socket-proxy-wsk-driver `
+  --features kernel --target x86_64-pc-windows-msvc
+cargo build --locked --release -p shadow-socket-proxy-host `
+  --features "tls-psk,wsk"
+```
+
+Do not mix an installed Windows Kit version such as `10.0.26100.0` with the
+pinned `10.0.28000.2526` WDK content when generating the driver bindings.
+
 The driver is a kernel-mode binary and must be signed before Windows will load
 it. For development, use a test certificate and test-signing mode according to
 the Windows driver-signing workflow; production deployments require a
