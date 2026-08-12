@@ -383,6 +383,8 @@ jobs:
               exit 1
             fi
           done
+      - name: Check optional WSK broker feature
+        run: cargo check --locked -p shadow-socket-proxy-host --features wsk
 
       - name: Build canonical BPF and fixture runner
         run: make -C crates/bpf clean all
@@ -531,6 +533,9 @@ jobs:
 
       - name: Build host-proxy with TLS-PSK
         run: cargo build --locked -p shadow-socket-proxy-host --features tls-psk
+
+      - name: Check host-proxy WSK broker feature
+        run: cargo check --locked -p shadow-socket-proxy-host --features tls-psk,wsk
 
       - name: Test host-proxy with TLS-PSK
         run: |

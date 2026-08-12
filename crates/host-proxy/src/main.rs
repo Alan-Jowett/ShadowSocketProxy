@@ -11,6 +11,9 @@ use std::{net::SocketAddr, path::PathBuf};
 #[cfg(any(feature = "tls-psk", feature = "tls-rustls"))]
 use std::{sync::Arc, time::Duration};
 
+#[cfg(all(feature = "wsk", target_os = "windows"))]
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use clap::Parser;
 #[cfg(feature = "tls-psk")]
 use shadow_socket_proxy_host::TlsPskMappingClient;
@@ -18,7 +21,8 @@ use shadow_socket_proxy_host::TlsPskMappingClient;
 use shadow_socket_proxy_host::TlsRustlsMappingClient;
 #[cfg(any(feature = "tls-psk", feature = "tls-rustls"))]
 use shadow_socket_proxy_host::{Proxy, ProxyConfig};
-#[cfg(any(feature = "tls-psk", feature = "tls-rustls"))]
+#[cfg(all(feature = "wsk", target_os = "windows"))]
+use shadow_socket_proxy_host::wsk::WskDeviceClient;
 use tokio::sync::watch;
 
 #[cfg(all(feature = "tls-psk", feature = "tls-rustls"))]
@@ -77,6 +81,26 @@ struct Args {
     #[arg(long, default_value_t = 256)]
     /// Maximum number of flows requested in one maintenance page.
     flow_scan_batch: u32,
+    #[cfg(feature = "wsk")]
+    #[arg(long)]
+    /// Use the installed WSK driver instead of Tokio TCP/UDP listeners.
+    wsk: bool,
+}
+
+#[cfg(all(feature = "wsk", target_os = "windows"))]
+fn client_nonce() -> shadow_socket_proxy_host::wsk::abi::SessionNonce {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+        .to_le_bytes();
+    let address = (&now as *const [u8; 16] as usize).to_le_bytes();
+    let mut bytes = [0u8; 32];
+    bytes[..16].copy_from_slice(&now);
+    for (index, byte) in address.iter().enumerate() {
+        bytes[16 + index] = *byte;
+    }
+    shadow_socket_proxy_host::wsk::abi::SessionNonce::new(bytes)
 }
 
 /// Selects the inline secret or reads and trims the configured secret file.
@@ -275,6 +299,69 @@ async fn run() {
     );
     let proxy =
         Proxy::new(config.clone(), Arc::new(client.clone())).expect("validated configuration");
+
+    #[cfg(all(feature = "wsk", target_os = "windows"))]
+    if args.wsk {
+        if args.listen.port() != 15_000 {
+            eprintln!("WSK mode requires --listen port 15000");
+            std::process::exit(2);
+        }
+        let device = match WskDeviceClient::connect(client_nonce()) {
+            Ok(device) => device,
+            Err(error) => {
+                eprintln!("WSK device initialization failed: {error}");
+                std::process::exit(1);
+            }
+        };
+        if let Err(error) = client
+            .activate(&args.bpf_elf, &args.interface, args.listen)
+            .await
+        {
+            eprintln!("control service activation failed: {error}");
+            std::process::exit(1);
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let (shutdown, receiver) = watch::channel(false);
+        let broker_client = Arc::new(client.clone());
+        let broker_stop = stop.clone();
+        let mut broker_task = tokio::task::spawn_blocking(move || {
+            WskDeviceClient::run_mapping_broker(device, broker_client, broker_stop)
+        });
+        let maintenance = proxy.run_wsk_maintenance(receiver);
+        tokio::pin!(maintenance);
+        let result = tokio::select! {
+            result = &mut broker_task => result
+                .map_err(|error| shadow_socket_proxy_host::ProxyError::Control(error.to_string()))
+                .and_then(|result| result.map_err(|error| shadow_socket_proxy_host::ProxyError::Control(error.to_string()))),
+            result = &mut maintenance => {
+                let _ = result;
+                Ok(())
+            },
+            result = tokio::signal::ctrl_c() => {
+                result.map_err(shadow_socket_proxy_host::ProxyError::Io)
+            }
+        };
+        stop.store(true, Ordering::Release);
+        let _ = shutdown.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(6), &mut broker_task).await;
+        if let Err(error) =
+            tokio::time::timeout(Duration::from_secs(5), client.detach(&args.interface))
+                .await
+                .map_err(|_| {
+                    shadow_socket_proxy_host::ProxyError::Control("control detach timed out".into())
+                })
+                .and_then(|result| result)
+        {
+            eprintln!("control service detachment failed: {error}");
+            std::process::exit(1);
+        }
+        if let Err(error) = result {
+            eprintln!("host proxy failed: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     let (tcp_listener, udp_socket) = match proxy.bind().await {
         Ok(listeners) => listeners,
         Err(error) => {

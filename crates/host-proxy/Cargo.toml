@@ -24,6 +24,7 @@ required-features = ["tls-rustls"]
 default = []
 tls-psk = ["dep:hyper-util", "dep:openssl", "dep:tokio-openssl"]
 tls-rustls = ["dep:hyper-util", "dep:shadow-socket-proxy-tls-rustls", "dep:tokio-rustls"]
+wsk = ["dep:shadow-socket-proxy-wsk-driver"]
 
 [dependencies]
 async-trait = "0.1"
@@ -36,6 +37,7 @@ tonic = { version = "0.12", features = ["transport"] }
 tower = "0.5"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+shadow-socket-proxy-wsk-driver = { path = "../wsk-driver", optional = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 hyper-util = { version = "0.1", features = ["tokio"], optional = true }

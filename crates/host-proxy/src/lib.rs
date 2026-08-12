@@ -34,6 +34,11 @@ pub mod proto {
     tonic::include_proto!("shadow_socket_proxy.control.v1");
 }
 
+/// Optional versioned WSK broker/device client. The default feature set does
+/// not open a device and retains the existing host-proxy behavior.
+#[cfg(feature = "wsk")]
+pub mod wsk;
+
 /// IP protocol number used in TCP mapping lookups.
 const TCP_PROTOCOL: u8 = 6;
 /// IP protocol number used in UDP mapping lookups.
@@ -474,7 +479,7 @@ async fn control_operation<T>(
 #[allow(clippy::too_many_arguments)]
 async fn run_maintenance<C: MappingClient + FlowClient + 'static>(
     client: Arc<C>,
-    associations: Arc<UdpAssociations<C>>,
+    associations: Option<Arc<UdpAssociations<C>>>,
     cleanup_interval: Duration,
     udp_idle_timeout: Duration,
     idle_ttl: Duration,
@@ -519,9 +524,11 @@ async fn run_maintenance<C: MappingClient + FlowClient + 'static>(
                         let age = flow.observed_now_ns.saturating_sub(flow.last_used_ns);
                         let tcp = flow.original.protocol == TCP_PROTOCOL;
                         if flow.original.protocol == UDP_PROTOCOL {
-                            associations
-                                .observe_flow(&flow.synthetic, flow.flow_id, flow.generation)
-                                .await;
+                            if let Some(associations) = &associations {
+                                associations
+                                    .observe_flow(&flow.synthetic, flow.flow_id, flow.generation)
+                                    .await;
+                            }
                         }
                         let terminal = tcp
                             && flow.fin_seen_mask == 0b11
@@ -571,13 +578,15 @@ async fn run_maintenance<C: MappingClient + FlowClient + 'static>(
                                             | FlowDeleteOutcome::AlreadyAbsent
                                     )
                                 {
-                                    associations
-                                        .invalidate(
-                                            &flow.synthetic,
-                                            flow.flow_id,
-                                            flow.generation,
-                                        )
-                                        .await;
+                                    if let Some(associations) = &associations {
+                                        associations
+                                            .invalidate(
+                                                &flow.synthetic,
+                                                flow.flow_id,
+                                                flow.generation,
+                                            )
+                                            .await;
+                                    }
                                 }
                             }
                             if report.retryable {
@@ -714,7 +723,7 @@ impl<C: MappingClient + FlowClient + 'static> Proxy<C> {
         ));
         let maintenance = tokio::spawn(run_maintenance(
             self.client.clone(),
-            udp.clone(),
+            Some(udp.clone()),
             self.config.cleanup_interval,
             self.config.udp_idle_timeout,
             self.config.idle_ttl,
@@ -761,6 +770,22 @@ impl<C: MappingClient + FlowClient + 'static> Proxy<C> {
             "host proxy shutdown"
         );
         result
+    }
+
+    /// Runs control-plane flow maintenance while the WSK driver owns sockets.
+    #[cfg(feature = "wsk")]
+    pub async fn run_wsk_maintenance(&self, shutdown: watch::Receiver<bool>) {
+        run_maintenance(
+            self.client.clone(),
+            None,
+            self.config.cleanup_interval,
+            self.config.udp_idle_timeout,
+            self.config.idle_ttl,
+            self.config.tcp_terminal_grace,
+            self.config.flow_scan_batch,
+            shutdown,
+        )
+        .await;
     }
 }
 
@@ -4161,7 +4186,7 @@ mod tests {
         ));
         let maintenance = tokio::spawn(run_maintenance(
             client.clone(),
-            associations,
+            Some(associations),
             Duration::from_secs(1),
             Duration::from_secs(1),
             Duration::from_secs(1),
@@ -4194,7 +4219,7 @@ mod tests {
         ));
         let maintenance = tokio::spawn(run_maintenance(
             client,
-            associations,
+            Some(associations),
             Duration::from_secs(1),
             Duration::from_secs(1),
             Duration::from_secs(1),

@@ -8,5 +8,12 @@ members = [
     "crates/e2e-runner",
     "crates/host-proxy",
     "crates/tls-rustls",
+    "crates/wsk-driver",
 ]
 resolver = "2"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

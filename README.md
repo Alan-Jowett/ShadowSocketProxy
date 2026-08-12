@@ -116,9 +116,49 @@ cargo build -p shadow-socket-proxy-host --features tls-rustls
 The PSK build requires a PSK-capable OpenSSL installation and accepts
 `--psk-secret`, `SSP_TLS_PSK_SECRET`, or `--psk-secret-file`. The rustls build
 uses the certificate flags above and does not require OpenSSL. The proxy
-requires a nonzero
-`--udp-idle-timeout-secs` and never falls back to direct forwarding when a
-mapping lookup fails. The listen address must be a specific local IPv4 or IPv6
+requires a nonzero `--udp-idle-timeout-secs` and never falls back to direct
+forwarding when a mapping lookup fails.
+
+The optional `wsk` feature adds the versioned user-mode broker/device ABI and
+runtime selection for the kernel-owned forwarding path:
+
+```text
+cargo check -p shadow-socket-proxy-host --features wsk
+```
+
+On Windows, pass `--wsk` to run the authenticated inverted-call mapping
+broker and host-owned maintenance while the installed driver owns TCP/UDP
+listeners. WSK mode currently requires the driver's fixed port `15000`.
+
+`crates/wsk-driver` provides fixed ABI structs, session nonces, request IDs,
+generations, broker state validation, and a Windows `DeviceIoControl` transport.
+Its `kernel` feature is a WDM cdylib boundary: it discovers the pinned
+`Microsoft.Windows.WDK.x64` or `.ARM64` NuGet package, generates WSK bindings
+from checked-in wrappers for `ws2.h`, `ws2def.h`, and `wsk.h`, exports
+`DriverEntry`, installs device IOCTL dispatch, and registers a WSK provider.
+The driver binds fixed loopback TCP and UDP listeners on port `15000`, uses an
+inverted-call mapping wait per admitted flow, validates the broker's exact
+synthetic/original tuple completion, applies mapping and idle-flow timeouts, and
+forwards established TCP and UDP indications directly between WSK sockets using
+provider-owned MDL buffers. Payload forwarding does not issue per-packet IOCTLs
+or use a user-mode fallback. The kernel flow state uses a bounded shared table
+of 64 TCP flows and UDP associations; admission fails closed when all slots are
+occupied.
+Missing WDK/SDK packages fail with an explicit build error.
+The official WDK crates also require `WDKContentRoot`; for the pinned x64
+NuGet package, set it to
+`%USERPROFILE%\.nuget\packages\microsoft.windows.wdk.x64\10.0.28000.2526\c`
+before invoking the Windows kernel build.
+
+The target-gated kernel compile can be checked with:
+
+```powershell
+cargo check --locked --target x86_64-pc-windows-msvc `
+  -p shadow-socket-proxy-wsk-driver --features kernel
+```
+
+Configure the listener and control service with CLI options; provide the PSK through `--psk-secret`,
+`SSP_TLS_PSK_SECRET`, or `--psk-secret-file`. The listen address must be a specific local IPv4 or IPv6
 address, not a wildcard address, so UDP lookups preserve the actual local
 destination tuple. `--listen-backlog` defaults to 1024 and is passed to native
 `listen` on Windows. Winsock calls a conditional-accept callback only for the

@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 ShadowSocketProxy contributors
+
+[package]
+name = "shadow-socket-proxy-wsk-driver"
+version = "0.1.0"
+edition = "2021"
+description = "ShadowSocketProxy WDM WSK driver and user-mode broker ABI"
+license = "MIT"
+
+[package.metadata.wdk.driver-model]
+driver-type = "WDM"
+
+[lib]
+path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
+
+[build-dependencies]
+bindgen = "0.71.1"
+wdk-build = "0.5.1"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+wdk = { version = "0.4.1", optional = true }
+wdk-alloc = { version = "0.4.1", optional = true }
+wdk-panic = { version = "0.4.1", optional = true }
+wdk-sys = { version = "0.5.1", optional = true }
+
+[features]
+default = []
+kernel = ["dep:wdk", "dep:wdk-alloc", "dep:wdk-panic", "dep:wdk-sys"]
