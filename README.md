@@ -155,19 +155,24 @@ must leave these directories available:
 %USERPROFILE%\.nuget\packages\microsoft.windows.sdk.cpp\10.0.28000.2526\c
 ```
 
-The WSK binding generator also requires LLVM's `libclang.dll`. Install LLVM
-if it is not already present, then point bindgen at its `bin` directory:
+The WSK binding generator also requires LLVM's `libclang.dll`. Use LLVM
+21.1.2 for this repository. Newer LLVM releases, including LLVM 22.x, can
+make `wdk-sys` generate incorrect layout assertions and fail with Rust `E0080`
+errors during compilation.
 
 ```powershell
-winget install --id LLVM.LLVM --exact `
+winget install --id LLVM.LLVM --version 21.1.2 --exact `
   --accept-source-agreements --accept-package-agreements
 
+$env:LLVM_HOME = "$env:ProgramFiles\LLVM"
 $env:LIBCLANG_PATH = "$env:ProgramFiles\LLVM\bin"
 $env:PATH = "$env:LIBCLANG_PATH;$env:PATH"
 ```
 
 Verify that the configured directory contains `libclang.dll` before building.
 If LLVM is installed elsewhere, set `LIBCLANG_PATH` to that directory instead.
+Do not disable bindgen layout tests to bypass these errors; those tests protect
+the ABI of kernel structures.
 
 Build the user-mode proxy and kernel driver from an elevated Windows
 PowerShell prompt. The driver target must match the installed WDK
