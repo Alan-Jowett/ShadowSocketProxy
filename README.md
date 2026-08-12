@@ -132,8 +132,32 @@ listeners. WSK mode currently requires the driver's fixed port `15000`.
 
 ### Build and run WSK mode
 
-Build the user-mode proxy and kernel driver from an elevated Windows PowerShell
-prompt. The driver target must match the installed WDK architecture:
+Install the native Windows toolchain before building. In Visual Studio
+Installer, add **Desktop development with C++**, the matching Windows 10/11
+SDK, and the Windows Driver Kit (WDK). The WDK build scripts also consume the
+pinned NuGet content packages, so install the exact versions used by this
+repository from an available `nuget.exe`:
+
+```powershell
+$nugetRoot = "$env:USERPROFILE\.nuget\packages"
+nuget.exe install Microsoft.Windows.WDK.x64 `
+  -Version 10.0.28000.2526 -OutputDirectory $nugetRoot
+nuget.exe install Microsoft.Windows.SDK.CPP `
+  -Version 10.0.28000.2526 -OutputDirectory $nugetRoot
+```
+
+If `nuget.exe` is not on `PATH`, install the NuGet CLI first or download
+`nuget.exe` from [nuget.org](https://www.nuget.org/downloads). The commands
+must leave these directories available:
+
+```text
+%USERPROFILE%\.nuget\packages\microsoft.windows.wdk.x64\10.0.28000.2526\c
+%USERPROFILE%\.nuget\packages\microsoft.windows.sdk.cpp\10.0.28000.2526\c
+```
+
+Build the user-mode proxy and kernel driver from an elevated Windows
+PowerShell prompt. The driver target must match the installed WDK
+architecture:
 
 ```powershell
 $env:WDKContentRoot = "$env:USERPROFILE\.nuget\packages\microsoft.windows.wdk.x64\10.0.28000.2526\c"
