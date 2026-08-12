@@ -3,14 +3,28 @@
 
 # ShadowSocketProxy Container Control Service Design
 
+## Identifier scope and uniqueness
+
+Identifiers are scoped to this control-service specification artifact. Design
+definitions (`D-*`) are unique within `design.md`; `CHG-*`, `REQ-*`, and
+`TC-*` names are references to their owning sibling artifacts. New TLS names
+that cross specification-artifact boundaries use globally unique,
+artifact-qualified spellings. Existing unqualified `CHG-*` duplicates across
+independent legacy specifications are baseline, not a result of the TLS
+change.
+
 ## 1. Scope and Traceability
 
-This design implements REQ-001 through REQ-008 from
+This design implements REQ-CS-001 through REQ-CS-009 from
 `requirements.md`. The trace chain is:
 
 ```text
-USER-REQUEST -> REQ-* -> D-* -> TC-* -> implementation/test artifacts
+USER-REQUEST -> REQ-CS-* -> D-CS-* -> TC-CS-* -> implementation/test artifacts
 ```
+
+Control-service traceability identifiers use the `REQ-CS-*`, `D-CS-*`, and
+`TC-CS-*` namespaces so they remain distinct from the host-proxy and BPF
+specifications.
 
 The final BPF packet-rewriting program remains outside this change. The crate
 integrates with a supplied ELF through a versioned ABI and a replaceable
@@ -18,7 +32,7 @@ backend.
 
 ## 2. Component Architecture
 
-### D-001 — Service process
+### D-CS-001 — Service process
 
 The Linux Rust binary contains:
 
@@ -34,7 +48,7 @@ The Linux Rust binary contains:
 The gRPC layer depends on traits rather than directly on kernel APIs so RPC
 tests can exercise failures deterministically.
 
-### D-002 — Production BPF backend
+### D-CS-002 — Production BPF backend
 
 The production backend loads the supplied ELF, locates the versioned mapping
 hash map, and attaches the program to TC ingress and egress for every
@@ -58,7 +72,7 @@ versioned symbols `ssp_flow_map_v1`, `ssp_tc_ingress_v1`, and
 exposes only the `BpfBackend`/`LinuxTcAdapter` operations to the gRPC adapter.
 Non-Linux builds retain an explicit unsupported adapter.
 
-### D-003 — Versioned mapping ABI
+### D-CS-003 — Versioned mapping ABI
 
 ABI version `1` uses a fixed, endian-defined representation:
 
@@ -76,7 +90,7 @@ UDP and QUIC set activity/protocol flags but do not synthesize TCP states.
 The ABI header includes a schema version. Unknown versions fail decoding and
 are counted in status/logs rather than silently interpreted.
 
-### D-004 — Mapping consistency
+### D-CS-004 — Mapping consistency
 
 List obtains a bounded snapshot by enumerating the backend map once and
 decoding each entry. Point lookup performs an exact key lookup. Entries that
@@ -84,7 +98,7 @@ change or disappear between enumeration and response are reported using
 per-entry status metadata; a backend failure fails the RPC. The service never
 returns an original tuple for a different synthetic key.
 
-### D-006 — Runtime configuration
+### D-CS-006 — Runtime configuration
 
 Configuration is held in an atomic `ArcSwap`-style snapshot with a monotonically
 increasing revision. Set-config validates all fields against bounds and
@@ -98,7 +112,7 @@ The configuration includes dataplane idle TTL, TCP terminal grace, active-flow
 capacity, listener/target settings, and bounded log capacity. Host maintenance
 interval, scan batch, and retry policy are not control-service configuration.
 
-### D-007 — Host-owned flow lifecycle adapter
+### D-CS-007 — Host-owned flow lifecycle adapter
 
 The authenticated control API exposes typed `EnumerateFlows` and `DeleteFlow`
 operations for the host-proxy. Enumeration returns bounded, opaque-cursor
@@ -116,7 +130,7 @@ journal entry exactly once. The service does not decide when a flow is stale,
 retry partial cleanup, or maintain local UDP associations; those policies
 remain host-proxy responsibilities.
 
-### D-008 — gRPC API
+### D-CS-008 — gRPC API
 
 The protobuf contract includes:
 
@@ -134,23 +148,54 @@ All RPCs use the same authenticated server policy. Resource exhaustion,
 invalid arguments, not-found, cursor-expired, ABI mismatch, backend failure,
 and unauthenticated requests map to distinct gRPC status codes.
 
-### D-009 — TLS-PSK transport
+### D-CS-009 — Feature-selected TLS transport
 
-The endpoint is TCP gRPC over a TLS-PSK-capable transport adapter. The
-implementation MUST use a TLS stack that supports configured PSK identity and
-secret callbacks; it MUST fail startup if the requested mode cannot be
-constructed. The PSK is loaded from protected deployment configuration and
-never returned by an RPC or logged.
+The endpoint is TCP gRPC over one compile-time-selected transport. The
+`tls-psk` feature uses the existing OpenSSL adapter and its configured PSK
+identity/secret callbacks. The `tls-rustls` feature uses a shared rustls
+adapter. The features are mutually exclusive and neither is default; a
+runnable binary built without a feature fails before serving.
 
-Because common Rust gRPC defaults do not expose TLS-PSK, the transport uses
-OpenSSL 0.10 with `tokio-openssl`. The server restricts negotiation to TLS 1.2
-PSK cipher `PSK-AES256-GCM-SHA384`, selects h2 through ALPN, and feeds
-handshaken streams to tonic with `serve_with_incoming`. The adapter is the
-only component permitted to depend on OpenSSL; builds without PSK support fail
-startup rather than falling back to metadata authentication, plaintext, or
-mTLS.
+The rustls adapter loads a local PEM certificate chain and private key and
+requires a normalized SHA-256 peer-leaf pin. Both sides present their
+self-signed certificate and verify the peer's exact DER leaf hash before
+validating it with rustls/webpki as a pinned trust anchor. Validation covers
+certificate signature, validity, and applicable key-usage checks; hostname
+matching is intentionally omitted. TLS 1.2 and 1.3 are enabled and h2 is
+required by ALPN. The adapter feeds handshaken streams to tonic with
+`serve_with_incoming` and custom connectors. Executable validation uses
+authenticated tonic RPCs over those streams for TLS 1.2 and TLS 1.3; raw ALPN
+or byte exchanges are only transport-level checks. Rustls builds have no
+OpenSSL dependency.
 
-### D-010 — Log synchronization
+The three rustls settings are startup-only CLI/environment pairs:
+`--tls-cert-file`/`SSP_TLS_CERT_FILE`,
+`--tls-key-file`/`SSP_TLS_KEY_FILE`, and
+`--tls-peer-cert-sha256`/`SSP_TLS_PEER_CERT_SHA256`. A duplicate CLI-plus-
+environment value or malformed/missing file or pin is rejected at startup;
+a peer handshake pin mismatch is rejected per connection. Startup
+configuration and bind failures remain fatal, while post-startup handshake
+failures are isolated to the connection that failed.
+Each listener stores one peer-leaf pin, so multiple clients connecting to the
+same listener MUST share the pinned client certificate. The Windows/WSL E2E
+driver uses one client identity for both the host proxy and runner; supporting
+multiple peer pins is outside this change.
+The incoming stream preserves listener-accept errors for lifecycle handling and
+drops only failures after a socket is accepted, before tonic sees them. This
+includes malformed, unauthenticated, non-h2, and timed-out handshakes. Those
+per-connection rejections do not terminate the listener, stop the control
+service, or trigger BPF lifecycle cleanup, and there is no plaintext or
+cross-mode fallback. Full-server PSK and rustls tests exercise a wrong
+credential or pinned-client failure on the running listener before a valid
+authenticated tonic RPC; they start with an owned in-memory attachment and
+assert readiness, retained ownership, and zero backend detach calls.
+
+Each runnable TLS-selected binary also has an explicit no-feature startup
+failure. CI executes all three binaries built without either TLS feature and
+requires their nonzero feature-selection diagnostics while feature-neutral
+library and test compilation remains supported.
+
+### D-CS-010 — Log synchronization
 
 The bounded log ring assigns a strictly increasing sequence to each record.
 `PullLogs(cursor, limit)` returns records with sequence greater than cursor.
@@ -158,12 +203,14 @@ If the cursor is older than the oldest retained sequence, the RPC returns
 `FAILED_PRECONDITION` with a cursor-expired detail. Capacity updates retain
 the newest records and invalidate cursors that no longer exist.
 
-### D-011 — Lifecycle and shutdown
+### D-CS-011 — Lifecycle and shutdown
 
 Startup validates configuration, prepares the TLS endpoint, and initializes
 the BPF backend before reporting readiness. Shutdown stops accepting RPCs,
 attempts owned detachment, and reports cleanup failures. Host-proxy owns
-maintenance cancellation and flow cleanup.
+maintenance cancellation and flow cleanup. A failed post-accept TLS handshake
+is not a shutdown signal; a listener-accept error remains a service-level
+transport failure, alongside explicit shutdown, for lifecycle cleanup.
 
 ## 3. Invariants
 
@@ -181,14 +228,15 @@ maintenance cancellation and flow cleanup.
 
 | Requirement | Design | Validation | Implementation surfaces |
 |---|---|---|---|
-| REQ-001 | D-001, D-002, D-003 | TC-001, TC-002 | crate, ABI module, backend trait |
-| REQ-002 | D-002, D-011 | TC-003–TC-006 | attach/detach RPC, TC backend |
-| REQ-003 | D-003, D-004, D-007 | TC-007–TC-011 | protobuf, mapping service |
-| REQ-004 | D-003 | TC-012–TC-015 | ABI codec, fixtures |
-| REQ-005 | Retired by issue #12 | Host-proxy maintenance validation | no control-service worker |
-| REQ-006 | D-007, D-009 | TC-022–TC-025 | TLS adapter, auth interceptor |
-| REQ-007 | D-006, D-008 | TC-026–TC-029 | config store/RPC |
-| REQ-008 | D-010 | TC-030–TC-033 | log ring/PullLogs |
+| REQ-CS-001 | D-CS-001, D-CS-002, D-CS-003 | TC-CS-001, TC-CS-002 | crate, ABI module, backend trait |
+| REQ-CS-002 | D-CS-002, D-CS-011 | TC-CS-003–TC-CS-006 | attach/detach RPC, TC backend |
+| REQ-CS-003 | D-CS-003, D-CS-004, D-CS-007 | TC-CS-007–TC-CS-011 | protobuf, mapping service |
+| REQ-CS-004 | D-CS-003 | TC-CS-012–TC-CS-015 | ABI codec, fixtures |
+| REQ-CS-005 | Retired by issue #12 | Host-proxy maintenance validation | no control-service worker |
+| REQ-CS-006 | D-CS-007, D-CS-009 | TC-CS-022–TC-CS-025, TC-CS-049 | TLS adapter, auth interceptor, per-connection liveness |
+| REQ-CS-009 | D-CS-009 | TC-CS-041–TC-CS-049 | feature selection, rustls adapter, CLI/env startup, authenticated tonic, and handshake-liveness tests |
+| REQ-CS-007 | D-CS-006, D-CS-008 | TC-CS-026–TC-CS-029 | config store/RPC |
+| REQ-CS-008 | D-CS-010 | TC-CS-030–TC-CS-033 | log ring/PullLogs |
 
 ## 5. Explicit No-Impact Decisions
 

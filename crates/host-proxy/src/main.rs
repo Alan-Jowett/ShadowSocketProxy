@@ -1,12 +1,28 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 ShadowSocketProxy contributors
-//! Parses host-proxy options, loads the PSK, and runs TCP/UDP forwarding.
+//! Parses host-proxy options, initializes the selected TLS client, and runs
+//! TCP/UDP forwarding.
 
-use std::{fs, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+#[cfg(feature = "tls-psk")]
+use std::fs;
+#[cfg(feature = "tls-rustls")]
+use std::path::Path;
+use std::{net::SocketAddr, path::PathBuf};
+#[cfg(any(feature = "tls-psk", feature = "tls-rustls"))]
+use std::{sync::Arc, time::Duration};
 
 use clap::Parser;
-use shadow_socket_proxy_host::{Proxy, ProxyConfig, TlsPskMappingClient};
+#[cfg(feature = "tls-psk")]
+use shadow_socket_proxy_host::TlsPskMappingClient;
+#[cfg(feature = "tls-rustls")]
+use shadow_socket_proxy_host::TlsRustlsMappingClient;
+#[cfg(any(feature = "tls-psk", feature = "tls-rustls"))]
+use shadow_socket_proxy_host::{Proxy, ProxyConfig};
+#[cfg(any(feature = "tls-psk", feature = "tls-rustls"))]
 use tokio::sync::watch;
+
+#[cfg(all(feature = "tls-psk", feature = "tls-rustls"))]
+compile_error!("tls-psk and tls-rustls are mutually exclusive");
 
 #[derive(Debug, Parser)]
 #[command(name = "shadow-socket-proxy-host")]
@@ -20,17 +36,26 @@ struct Args {
     /// queue-head attempt regardless of this value.
     listen_backlog: u32,
     #[arg(long, default_value = "https://127.0.0.1:50051")]
-    /// TLS-PSK control-service endpoint.
+    /// TLS control-service endpoint.
     control_endpoint: String,
     #[arg(long)]
-    /// Identity sent during control-service authentication.
-    psk_identity: String,
+    /// Identity sent during TLS-PSK control-service authentication.
+    psk_identity: Option<String>,
     #[arg(long, env = "SSP_TLS_PSK_SECRET")]
     /// Inline PSK secret, mutually exclusive with `psk_secret_file`.
     psk_secret: Option<String>,
     #[arg(long)]
     /// File containing the PSK secret when inline credentials are omitted.
     psk_secret_file: Option<PathBuf>,
+    #[arg(long)]
+    /// PEM certificate chain used by the rustls control client.
+    tls_cert_file: Option<PathBuf>,
+    #[arg(long)]
+    /// PEM private key used by the rustls control client.
+    tls_key_file: Option<PathBuf>,
+    #[arg(long)]
+    /// SHA-256 pin for the control service's leaf certificate.
+    tls_peer_cert_sha256: Option<String>,
     #[arg(long)]
     /// BPF ELF path as visible from the Linux control service.
     bpf_elf: String,
@@ -55,6 +80,7 @@ struct Args {
 }
 
 /// Selects the inline secret or reads and trims the configured secret file.
+#[cfg(feature = "tls-psk")]
 fn load_secret(args: &Args) -> Result<Vec<u8>, String> {
     match (&args.psk_secret, &args.psk_secret_file) {
         (Some(_), Some(_)) => Err("provide only one PSK secret source".into()),
@@ -64,12 +90,118 @@ fn load_secret(args: &Args) -> Result<Vec<u8>, String> {
     }
 }
 
-#[tokio::main]
+#[cfg(any(feature = "tls-psk", feature = "tls-rustls"))]
+/// Runtime certificate and peer-pin settings for rustls mode.
+type RustlsOptions = (Option<PathBuf>, Option<PathBuf>, Option<String>);
+
+#[cfg(any(feature = "tls-psk", feature = "tls-rustls"))]
+/// Selects a setting from either the command line or its environment variable.
+fn select_value<T>(
+    cli: Option<T>,
+    env_name: &str,
+    value: impl FnOnce(String) -> T,
+) -> Result<Option<T>, String> {
+    let environment = match std::env::var_os(env_name) {
+        None => None,
+        Some(value) => Some(
+            value
+                .into_string()
+                .map_err(|_| format!("{env_name} is not valid UTF-8"))?,
+        ),
+    };
+    if cli.is_some() && environment.is_some() {
+        return Err(format!(
+            "{env_name} must not be combined with its command-line option"
+        ));
+    }
+    if cli.is_some() {
+        return Ok(cli);
+    }
+    Ok(environment.filter(|value| !value.is_empty()).map(value))
+}
+
+#[cfg(any(feature = "tls-psk", feature = "tls-rustls"))]
+/// Resolves rustls certificate and peer-pin settings.
+fn resolve_rustls_options(args: &Args) -> Result<RustlsOptions, String> {
+    Ok((
+        select_value(
+            args.tls_cert_file.clone(),
+            "SSP_TLS_CERT_FILE",
+            PathBuf::from,
+        )?,
+        select_value(args.tls_key_file.clone(), "SSP_TLS_KEY_FILE", PathBuf::from)?,
+        select_value(
+            args.tls_peer_cert_sha256.clone(),
+            "SSP_TLS_PEER_CERT_SHA256",
+            |value| value,
+        )?,
+    ))
+}
+
+#[cfg(feature = "tls-psk")]
+/// Connects to the control service using the selected PSK credentials.
+async fn connect_client(
+    args: &Args,
+    secret: &[u8],
+) -> Result<TlsPskMappingClient, shadow_socket_proxy_host::ProxyError> {
+    let identity = args.psk_identity.as_deref().ok_or_else(|| {
+        shadow_socket_proxy_host::ProxyError::InvalidConfiguration(
+            "PSK identity is required in tls-psk mode".into(),
+        )
+    })?;
+    TlsPskMappingClient::connect(&args.control_endpoint, identity, secret).await
+}
+
+#[cfg(feature = "tls-rustls")]
+/// Connects to the control service using the selected rustls credentials.
+async fn connect_client(
+    args: &Args,
+    tls_cert_file: &Path,
+    tls_key_file: &Path,
+    tls_peer_cert_sha256: &str,
+) -> Result<TlsRustlsMappingClient, shadow_socket_proxy_host::ProxyError> {
+    TlsRustlsMappingClient::connect(
+        &args.control_endpoint,
+        tls_cert_file,
+        tls_key_file,
+        tls_peer_cert_sha256,
+    )
+    .await
+}
+
+#[cfg(any(feature = "tls-psk", feature = "tls-rustls"))]
+/// Builds the host-proxy runtime configuration.
+fn proxy_config(args: &Args, psk_identity: String, psk_secret: Vec<u8>) -> ProxyConfig {
+    ProxyConfig {
+        listen: args.listen,
+        listen_backlog: args.listen_backlog,
+        control_endpoint: args.control_endpoint.clone(),
+        psk_identity,
+        psk_secret,
+        udp_idle_timeout: Duration::from_secs(args.udp_idle_timeout_secs),
+        cleanup_interval: Duration::from_secs(args.cleanup_interval_secs),
+        idle_ttl: Duration::from_secs(args.idle_ttl_secs),
+        tcp_terminal_grace: Duration::from_secs(args.tcp_terminal_grace_secs),
+        flow_scan_batch: args.flow_scan_batch,
+    }
+}
+
+#[cfg(any(feature = "tls-psk", feature = "tls-rustls"))]
 /// Validates options, connects the platform mapping client, and runs until the
 /// shutdown watch is triggered or forwarding fails.
-async fn main() {
+async fn run() {
     tracing_subscriber::fmt::init();
     let args = Args::parse();
+
+    let (tls_cert_file, tls_key_file, tls_peer_cert_sha256) = match resolve_rustls_options(&args) {
+        Ok(options) => options,
+        Err(error) => {
+            eprintln!("invalid TLS configuration: {error}");
+            std::process::exit(2);
+        }
+    };
+
+    #[cfg(feature = "tls-psk")]
     let secret = match load_secret(&args) {
         Ok(secret) => secret,
         Err(error) => {
@@ -77,26 +209,60 @@ async fn main() {
             std::process::exit(2);
         }
     };
-    let config = ProxyConfig {
-        listen: args.listen,
-        listen_backlog: args.listen_backlog,
-        control_endpoint: args.control_endpoint.clone(),
-        psk_identity: args.psk_identity.clone(),
-        psk_secret: secret.clone(),
-        udp_idle_timeout: Duration::from_secs(args.udp_idle_timeout_secs),
-        cleanup_interval: Duration::from_secs(args.cleanup_interval_secs),
-        idle_ttl: Duration::from_secs(args.idle_ttl_secs),
-        tcp_terminal_grace: Duration::from_secs(args.tcp_terminal_grace_secs),
-        flow_scan_batch: args.flow_scan_batch,
-    };
+
+    #[cfg(feature = "tls-psk")]
+    if tls_cert_file.is_some() || tls_key_file.is_some() || tls_peer_cert_sha256.is_some() {
+        eprintln!("rustls TLS settings require building with the tls-rustls feature");
+        std::process::exit(2);
+    }
+
+    #[cfg(feature = "tls-rustls")]
+    if args.psk_identity.is_some() || args.psk_secret.is_some() || args.psk_secret_file.is_some() {
+        eprintln!("PSK settings cannot be combined with the tls-rustls feature");
+        std::process::exit(2);
+    }
+
+    #[cfg(feature = "tls-rustls")]
+    let (tls_cert_file, tls_key_file, tls_peer_cert_sha256) =
+        match (tls_cert_file, tls_key_file, tls_peer_cert_sha256) {
+            (Some(cert), Some(key), Some(pin)) => (cert, key, pin),
+            _ => {
+                eprintln!(
+                    "invalid TLS configuration: --tls-cert-file, --tls-key-file, and \
+                 --tls-peer-cert-sha256 are required"
+                );
+                std::process::exit(2);
+            }
+        };
+
+    #[cfg(feature = "tls-psk")]
+    let config = proxy_config(
+        &args,
+        args.psk_identity.clone().unwrap_or_default(),
+        secret.clone(),
+    );
+    #[cfg(feature = "tls-rustls")]
+    let config = proxy_config(&args, String::new(), Vec::new());
     if let Err(error) = config.validate() {
         eprintln!("invalid configuration: {error}");
         std::process::exit(2);
     }
+    #[cfg(feature = "tls-psk")]
+    if let Err(error) = config.validate_tls_psk() {
+        eprintln!("invalid configuration: {error}");
+        std::process::exit(2);
+    }
+    #[cfg(feature = "tls-psk")]
+    let client = match connect_client(&args, &secret).await {
+        Ok(client) => client,
+        Err(error) => {
+            eprintln!("control service initialization failed: {error}");
+            std::process::exit(1);
+        }
+    };
+    #[cfg(feature = "tls-rustls")]
     let client =
-        match TlsPskMappingClient::connect(&args.control_endpoint, &args.psk_identity, &secret)
-            .await
-        {
+        match connect_client(&args, &tls_cert_file, &tls_key_file, &tls_peer_cert_sha256).await {
             Ok(client) => client,
             Err(error) => {
                 eprintln!("control service initialization failed: {error}");
@@ -169,5 +335,35 @@ async fn main() {
     if let Err(error) = result {
         eprintln!("host proxy failed: {error}");
         std::process::exit(1);
+    }
+}
+
+#[tokio::main]
+/// Selects a TLS feature at compile time and rejects an unconfigured
+/// runnable binary at startup.
+async fn main() {
+    #[cfg(not(any(feature = "tls-psk", feature = "tls-rustls")))]
+    {
+        eprintln!(
+            "shadow-socket-proxy-host requires exactly one of the tls-psk or tls-rustls features"
+        );
+        std::process::exit(2);
+    }
+
+    #[cfg(any(feature = "tls-psk", feature = "tls-rustls"))]
+    run().await;
+}
+
+#[cfg(all(test, any(feature = "tls-psk", feature = "tls-rustls")))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn duplicate_cli_and_environment_tls_values_are_rejected() {
+        let env_name = "SSP_TEST_HOST_TLS_DUPLICATE";
+        std::env::set_var(env_name, "environment");
+        let result = select_value(Some("command-line".to_owned()), env_name, |value| value);
+        std::env::remove_var(env_name);
+        assert!(result.is_err());
     }
 }

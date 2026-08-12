@@ -10,6 +10,7 @@ use std::{
 
 /// Compiles the shared protobuf and emits the platform cfg used by TLS-PSK code.
 fn main() {
+    reject_combined_tls_features();
     let protoc = protoc_bin_vendored::protoc_bin_path().expect("protoc is available");
     std::env::set_var("PROTOC", protoc);
     tonic_build::configure()
@@ -21,6 +22,15 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(ssp_openssl_no_psk)");
     if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux") {
         detect_openssl_psk();
+    }
+}
+
+/// Rejects selecting both mutually exclusive TLS transports.
+fn reject_combined_tls_features() {
+    if env::var_os("CARGO_FEATURE_TLS_PSK").is_some()
+        && env::var_os("CARGO_FEATURE_TLS_RUSTLS").is_some()
+    {
+        panic!("tls-psk and tls-rustls are mutually exclusive");
     }
 }
 

@@ -180,6 +180,8 @@ struct MemoryState {
     maxima: MapMaxima,
     /// Simulated TC links.
     attachments: Vec<Attachment>,
+    /// Number of detach operations issued against this backend.
+    detach_calls: usize,
     /// Optional location at which attach should fail and roll back.
     fail_attach: Option<String>,
     /// Optional encoded key that should make deletion fail.
@@ -253,6 +255,11 @@ impl InMemoryBackend {
     /// Returns the last runtime configuration written to the in-memory map.
     pub fn runtime_config(&self) -> Option<RuntimeConfig> {
         self.state.lock().unwrap().runtime_config.clone()
+    }
+
+    /// Returns the number of detach operations issued against this backend.
+    pub fn detach_calls(&self) -> usize {
+        self.state.lock().unwrap().detach_calls
     }
 
     /// Inserts a native flow and all three tuple indexes used by cleanup.
@@ -348,6 +355,7 @@ impl BpfBackend for InMemoryBackend {
     /// Removes every simulated link, or links whose interface is selected.
     async fn detach(&self, interfaces: Option<&[String]>) -> Result<(), BackendError> {
         let mut state = self.state.lock().unwrap();
+        state.detach_calls += 1;
         state.attachments.retain(|attachment| {
             interfaces
                 .map(|selected| !selected.contains(&attachment.interface))

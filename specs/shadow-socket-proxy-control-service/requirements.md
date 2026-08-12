@@ -3,6 +3,19 @@
 
 # ShadowSocketProxy Container Control Service Requirements
 
+## Identifier scope and uniqueness
+
+This control-service specification set is the owning artifact for the
+requirements, design, validation, and audit documents in this directory.
+`CHG-*` and `REQ-*` definitions are owned by this requirements artifact,
+`D-*` definitions by `design.md`, and `TC-*` definitions by `validation.md`.
+Each identifier MUST be defined only once within its owning artifact;
+references may repeat. New TLS identifiers referenced from another
+specification artifact MUST use an artifact-qualified name that is globally
+unique across `specs/`, and every cross-artifact reference MUST preserve that
+qualified spelling. Existing unqualified `CHG-*` duplicates in independent
+legacy specifications are baseline and were not introduced by the TLS change.
+
 ## Change Set
 
 ### CHG-001 — Add the container control-service crate
@@ -63,15 +76,15 @@ enumeration and deletion adapters only.
 
 - **Before:** No authenticated host control endpoint or runtime service
   configuration exists.
-- **After:** A TCP gRPC endpoint secured with the requested TLS shared-PSK
+- **After:** A TCP gRPC endpoint secured with the selected TLS
   policy exposes attach, detach, mapping, health/status, and configuration
   operations. Dataplane idle TTL, TCP terminal grace, active-flow capacity,
   and bounded log capacity can be updated through authenticated configuration
   RPCs and are applied atomically after validation. Host maintenance policy is
   configured only by host-proxy.
 - **Traceability:** User clarifications: host sends attach/detach commands;
-  TCP endpoint secured with TLS shared PSK; all operational values are exposed
-  through gRPC and are runtime-configurable.
+  TCP endpoint secured with the selected TLS policy; all operational values
+  are exposed through gRPC and are runtime-configurable.
 
 ### CHG-007 — Optional bounded log synchronization
 
@@ -83,9 +96,22 @@ enumeration and deletion adapters only.
   sync using a monotonic cursor, bounded retention, and explicit
   cursor-expired errors.
 
+### CHG-CS-TLS-001 — Feature-selected rustls certificate pinning
+
+- **Before:** Runnable control-service, host-proxy, and e2e-runner binaries
+  expose only the OpenSSL TLS-PSK transport.
+- **After:** Each runnable binary selects exactly one mutually exclusive
+  `tls-psk` or `tls-rustls` feature; neither is default. The rustls mode uses
+  TCP gRPC over h2 with TLS 1.2/1.3, mutual self-signed PEM identities, and a
+  normalized SHA-256 pin of the peer leaf certificate DER bytes. Rustls
+  validates the pinned leaf's signature, validity, and key usage without a
+  hostname requirement, and does not require OpenSSL.
+- **Traceability:** `USER-REQUEST: Implement the approved rustls
+  certificate-pinning mode ...`
+
 ## Stable Requirements
 
-### REQ-001 — Linux Rust crate
+### REQ-CS-001 — Linux Rust crate
 
 The deliverable MUST include a buildable Rust crate targeting Linux for the
 container control service. The crate MUST isolate platform/BPF operations
@@ -101,7 +127,7 @@ integration contract.
 **Invariant impact:** Preserves separation between packet processing in BPF and
 control in user mode.
 
-### REQ-002 — TC attachment lifecycle
+### REQ-CS-002 — TC attachment lifecycle
 
 The service MUST accept authenticated attach and detach commands from the host,
 select interfaces from the command, and manage both TC ingress and egress
@@ -119,7 +145,7 @@ to the caller, and shutdown MUST attempt cleanup of service-owned attachments.
 **Invariant impact:** Prevents a control-plane success response from masking
   incomplete packet interception.
 
-### REQ-003 — Mapping read API
+### REQ-CS-003 — Mapping read API
 
 The service MUST expose list and point lookup RPCs for synthetic-to-original
 5-tuple mappings. The schema MUST support IPv4, IPv6, TCP, UDP, and QUIC
@@ -135,7 +161,7 @@ traffic, with protocol and both ports represented explicitly.
 **Invariant impact:** Maintains tuple identity across BPF, gRPC, and host proxy
 lookups.
 
-### REQ-004 — Versioned mapping ABI
+### REQ-CS-004 — Versioned mapping ABI
 
 The service MUST use a versioned BPF key/value ABI. Values MUST contain
 last-seen activity. TCP values MUST encode SYN, SYN/ACK, ACK, FIN, and RST
@@ -151,7 +177,7 @@ applying TCP-only state assumptions.
 **Invariant impact:** Makes stale cleanup and tuple restoration deterministic
 across BPF and user-mode versions.
 
-### REQ-005 — Retired control-service maintenance
+### REQ-CS-005 — Retired control-service maintenance
 
 This former requirement is retired by issue #12. Host-proxy owns stale-flow
 policy and cleanup; the control-service provides typed, generation-safe flow
@@ -163,24 +189,30 @@ persist capacity release before deleting canonical state, and publish that
 generation-addressed release idempotently until BPF consumes it once. It MUST
 remove or safely expire every deletion guard and outcome on all outcomes.
 
-### REQ-006 — Authenticated host control
+### REQ-CS-006 — Authenticated host control
 
-The service MUST expose a TCP gRPC endpoint protected by the requested TLS
-shared-PSK policy. All mutating and inspection RPCs MUST require successful
-authentication. The design MUST identify the selected Rust TLS implementation
-and report incompatibility if it cannot implement the requested PSK policy.
+The service MUST expose a TCP gRPC endpoint protected by the selected TLS
+policy. All mutating and inspection RPCs MUST require successful
+authentication. The existing OpenSSL TLS-PSK behavior is preserved under
+`tls-psk`; rustls certificate pinning is defined by REQ-CS-009. The service MUST
+report incompatibility if the selected transport cannot be constructed.
+Malformed, unauthenticated, or stalled TLS connections MUST be rejected
+individually after the listener starts; a failed handshake MUST NOT terminate
+the listener, stop the control service, or trigger BPF lifecycle cleanup.
 
 **Acceptance criteria**
 
 - Unauthenticated or incorrectly authenticated requests are rejected.
 - Attach, detach, mapping, status, and configuration calls share the same
   authenticated endpoint policy.
-- TLS/PSK configuration failures prevent a misleading ready state.
+- TLS configuration failures prevent a misleading ready state.
+- After malformed, unauthenticated, or stalled connection attempts, a later
+  valid authenticated RPC succeeds without restarting the service.
 
 **Invariant impact:** Prevents unauthorized BPF attachment, map disclosure, or
   runtime policy changes.
 
-### REQ-007 — Atomic runtime configuration
+### REQ-CS-007 — Atomic runtime configuration
 
 The service MUST expose authenticated get/set configuration RPCs for dataplane
 idle TTL, TCP terminal grace, active-flow capacity, listener/target settings,
@@ -200,7 +232,7 @@ values MUST be rejected without partially applying the update.
 **Invariant impact:** Preserves predictable maintenance and resource behavior
 under concurrent host control.
 
-### REQ-008 — Optional bounded log pull
+### REQ-CS-008 — Optional bounded log pull
 
 The service MUST optionally retain service log records in bounded storage and
 expose a pull RPC using a monotonic cursor. If a cursor falls outside retained
@@ -215,6 +247,45 @@ history, the service MUST return an explicit cursor-expired error.
 **Invariant impact:** Provides observable control-plane synchronization without
   unbounded memory growth.
 
+### REQ-CS-009 — Explicit TLS transport selection and rustls pinning
+
+The runnable control-service, host-proxy, and e2e-runner binaries MUST require
+exactly one of the mutually exclusive `tls-psk` or `tls-rustls` features;
+neither feature is default. `tls-psk` MUST preserve the existing OpenSSL
+TLS-PSK behavior. `tls-rustls` MUST provide TCP gRPC over h2 with TLS 1.2 and
+TLS 1.3, mutual self-signed PEM certificate/key authentication, and a
+normalized SHA-256 pin over the peer leaf certificate's exact DER bytes.
+Normalization is case-insensitive and accepts an optional `0x` prefix plus
+whitespace, `:`, or `-` separators.
+
+Rustls peer verification MUST use the pinned leaf as its trust anchor while
+validating certificate signature, validity, and appropriate key usage. It MUST
+not require hostname matching. The startup-only settings
+`--tls-cert-file`/`SSP_TLS_CERT_FILE`,
+`--tls-key-file`/`SSP_TLS_KEY_FILE`, and
+`--tls-peer-cert-sha256`/`SSP_TLS_PEER_CERT_SHA256` MUST reject missing,
+malformed, or duplicate CLI-plus-environment values and MUST never fall back
+to another transport or plaintext.
+Each listener has one configured peer-leaf pin. Multiple clients connecting to
+the same listener MUST therefore share the pinned client certificate; the
+Windows/WSL E2E flow uses one client identity for both the host proxy and
+runner, and multiple peer pins are not part of this change.
+
+Once startup succeeds, malformed TLS input, peer-authentication failures,
+missing h2 negotiation, and handshake timeouts are per-connection rejections.
+They MUST NOT propagate as a terminal incoming-stream error or shut down the
+control service; only transport configuration, bind, or explicit service
+shutdown failures may end the server lifecycle.
+
+The runnable control-service, host-proxy, and e2e-runner binaries built without
+either TLS feature MUST exit nonzero with an explicit feature-selection
+diagnostic. Supporting library and test targets MAY still compile in that
+feature-neutral configuration.
+
+**Invariant impact:** Prevents an ambiguous build or runtime configuration
+from weakening control-plane authentication, while leaving the data plane
+unchanged.
+
 ## Non-Goals
 
 - Implementing the final packet-rewriting BPF logic; the first deliverable uses
@@ -226,8 +297,8 @@ history, the service MUST return an explicit cursor-expired error.
 
 ## Open Design Constraints
 
-- The requested TLS shared-PSK mode is not universally supported by Rust gRPC
-  TLS stacks. The design phase MUST resolve the concrete backend or identify
-  an explicit, user-approved compatibility alternative before implementation.
+- The approved transport alternatives are OpenSSL TLS-PSK and rustls pinned
+  mutual TLS. The alternatives are compile-time selected and never combined
+  in one runnable binary.
 - The versioned ABI MUST define byte order, address encoding, clock source,
   state encoding, and map pin/ownership behavior.

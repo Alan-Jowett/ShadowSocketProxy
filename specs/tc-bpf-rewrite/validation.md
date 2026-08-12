@@ -3,6 +3,16 @@
 
 # TC BPF Rewrite Validation
 
+## Identifier scope and uniqueness
+
+Identifiers are scoped to this TC/BPF specification artifact. Test case
+definitions (`TC-*`) are unique within `validation.md`; `CHG-*`, `REQ-*`, and
+`D-*` names remain references to their owning artifacts. New TLS names that
+cross specification-artifact boundaries use globally unique,
+artifact-qualified spellings. Existing unqualified `CHG-*` duplicates across
+independent legacy specifications are baseline, not a result of the TLS
+change.
+
 ## Strategy
 
 Rust ABI, backend, service, and lifecycle tests run on every supported host.
@@ -11,6 +21,13 @@ tests are environment-gated and must fail clearly when explicitly requested
 without the required kernel/toolchain. Ordered packet fixtures cover target
 miss, flow creation, forward/reverse rewrite, control bypass, FIN/ACK, and
 RST.
+
+Privileged live TC attach/link validation is a pre-existing,
+Linux-environment-gated deferred item outside the TLS change scope. The
+existing ELF/kernel gate remains documented and is not replaced with a fake
+or newly added privileged integration test. This has no impact on the TLS
+change: rustls/PSK validation is isolated to transport and CI feature paths,
+and no BPF packet or attach/link behavior is modified.
 
 ## Test Cases
 
@@ -43,7 +60,7 @@ RST.
 | TC-TC-025 | REQ-TC-004/006 | Kernel test-run sequence | `bpf_prog_test_run_opts` asserts bytes, action, checksums, retained RST state, target miss, control bypass, FIN/ACK, and deletion commit/abort behavior. |
 | TC-TC-026 | REQ-TC-006 | Protobuf wire compatibility | Retired policy tags are reserved; active legacy fields retain their original tags; new fields use fresh tags. |
 | TC-CI-001 | REQ-CI-001 | Workflow triggers and platform | Pull requests and pushes to `main` select Ubuntu and use locked repository/toolchain inputs. |
-| TC-CI-002 | REQ-CI-002 | Rust format/lint/build/test gates | Any failure of the four exact workspace commands fails the workflow. |
+| TC-CI-002 | REQ-CI-002 | Feature-neutral Rust format/lint/build/test gates | Any failure of the feature-neutral workspace commands fails the workflow; TLS alternatives are validated by their isolated jobs. |
 | TC-CI-003 | REQ-CI-003 | Canonical BPF build | Required native tools are installed and `make -C crates/bpf clean all` produces the expected ELF; compile failure fails the workflow. |
 | TC-CI-004 | REQ-CI-004 | Runner loading and capability failure | The checked-in runner loads the ELF and exits nonzero for missing capabilities, invalid symbols/maps, verifier rejection, or setup failure. |
 | TC-CI-005 | REQ-CI-004 | Ordered kernel fixture sequence | The runner executes target miss, flow creation, forward/reverse rewrite, control bypass, FIN/ACK teardown, RST retention, and deletion commit/abort; every expected action, packet byte, checksum, and map-state assertion passes. |
@@ -52,6 +69,10 @@ RST.
 | TC-CI-008 | REQ-CI-007 | Windows host-proxy build | With TLS-PSK enabled and the pinned OpenSSL environment, formatting, strict clippy, and the locked host-proxy build succeed. |
 | TC-CI-009 | REQ-CI-007 | Windows host-proxy tests | `cargo test --locked -p shadow-socket-proxy-host --features tls-psk` succeeds on `windows-latest`. |
 | TC-CI-010 | REQ-CI-008 | Local Windows reproduction | The pinned OpenSSL installation and the Windows host-proxy validation commands pass locally before the PR is opened. |
+| TC-CI-011 | REQ-CI-009 | Isolated rustls Linux/Windows jobs | Linux runs control-service authenticated tonic h2 coverage plus shared rustls tests; Windows runs the rustls host-proxy client, executable startup-negative, and e2e-runner checks; neither job installs or configures OpenSSL. |
+| TC-CI-012 | REQ-CI-009 | Mutually exclusive feature selection | Separate PSK-capable jobs build each runnable package with both TLS features and require the explicit mutually-exclusive diagnostic. |
+| TC-CI-013 | REQ-CI-009 | No-TLS runnable binary smoke | The feature-neutral job builds and executes the control-service, host-proxy, and e2e-runner binaries without either TLS feature; each exits nonzero with the explicit feature-selection diagnostic while library/test compilation remains supported. |
+| TC-CI-014 | REQ-CI-009 | Linux control-service TLS-PSK tests | The OpenSSL-capable Linux control artifact job runs `cargo test --locked -p shadow-socket-proxy-control --no-default-features --features tls-psk` in addition to its PSK release build. |
 | TC-CI-E2E-001 | REQ-CI-E2E-001 | Build/upload BPF artifact | Canonical ELF is downloadable and valid. |
 | TC-CI-E2E-002 | REQ-CI-E2E-001 | Build/upload control artifact | Linux control executable and runtime manifest are downloadable. |
 | TC-CI-E2E-003 | REQ-CI-E2E-001 | Build/upload host artifact | Windows host executable and required runtime assets are downloadable. |
@@ -102,6 +123,7 @@ RST.
 | REQ-CI-006 | D-CI-005, D-CI-006 | TC-CI-007 | Windows workflow, winget/OpenSSL setup |
 | REQ-CI-007 | D-CI-005, D-CI-007 | TC-CI-008..009 | Windows workflow, host-proxy crate |
 | REQ-CI-008 | D-CI-006, D-CI-007 | TC-CI-010 | Local Windows environment and validation commands |
+| REQ-CI-009 | D-CI-005, D-CI-006, D-CI-007 | TC-CI-011..014 | Isolated rustls jobs, Windows PSK workflow, Linux control-service PSK tests, and feature-selection/no-TLS guards |
 | REQ-CI-E2E-001 | D-CI-E2E-001 | TC-CI-E2E-001..003 | Separate workflow artifacts only; no branch/release publication. |
 | REQ-CI-E2E-002 | D-CI-E2E-002 | TC-CI-E2E-004..005 | WSL-root deployment and Windows host execution. |
 | REQ-CI-E2E-003 | D-CI-E2E-003 | TC-CI-E2E-006 | Authenticated TCP marker path. |

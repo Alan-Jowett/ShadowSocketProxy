@@ -48,25 +48,56 @@ the shared protobuf contract in `crates/proto` and the Linux TC BPF artifact
 source in `crates/bpf`:
 
 ```text
-cargo build --target x86_64-unknown-linux-gnu
-cargo test
+cargo build --target x86_64-unknown-linux-gnu -p shadow-socket-proxy-control --features tls-psk
+cargo test --workspace --no-default-features
 ```
 
-It provides the versioned mapping ABI, replaceable BPF/TC backend, maintenance
-worker, protobuf/gRPC service, configuration snapshots, and bounded log pull.
+It provides the versioned mapping ABI, replaceable BPF/TC backend,
+protobuf/gRPC service, configuration snapshots, and bounded log pull.
+Host-proxy owns the maintenance worker, expiry policy, retries, flow deletion,
+and local UDP association behavior; for maintenance, control-service exposes
+only typed flow-operation adapters.
 On Linux, the production backend uses Aya for ELF loading, versioned
 map/program discovery, TC ingress/egress links, transactional rollback, and
-map operations. The TCP gRPC endpoint uses OpenSSL with TLS 1.2 PSK and h2
-ALPN; invalid credentials or a build without PSK support fail startup rather
-than falling back to plaintext, metadata-only auth, or mTLS. Linux builds
-require an OpenSSL development installation whose build enables PSK.
+map operations. Runnable control-service builds must select exactly one
+transport feature; neither is the default:
+
+```text
+cargo build --locked -p shadow-socket-proxy-control --features tls-psk
+cargo build --locked -p shadow-socket-proxy-control --features tls-rustls
+```
+
+Feature-neutral library and test compilation remains supported, but each
+runnable TLS-selected binary built without either feature exits nonzero with an
+explicit `tls-psk`/`tls-rustls` feature-selection diagnostic.
+
+`tls-psk` preserves the OpenSSL TLS 1.2 PSK and h2 ALPN behavior. `tls-rustls`
+uses TCP gRPC over h2 with TLS 1.2/1.3, mutual self-signed PEM certificates,
+and a normalized SHA-256 pin of the peer leaf certificate's exact DER bytes.
+Rustls validates the pinned leaf's signature, validity, and key usage without
+requiring a hostname. Missing, malformed, or ambiguous startup settings fail;
+there is no plaintext or cross-mode fallback. Rustls builds do not require
+OpenSSL.
+
+Rustls runtime settings are startup-only and may be supplied by either CLI
+flags or their environment variables (not both):
+
+```text
+--tls-cert-file <PEM>             SSP_TLS_CERT_FILE
+--tls-key-file <PEM>              SSP_TLS_KEY_FILE
+--tls-peer-cert-sha256 <HEX>      SSP_TLS_PEER_CERT_SHA256
+```
+
+The pin parser is case-insensitive and normalizes an optional `0x` prefix,
+whitespace, `:` separators, and `-` separators.
 
 ## Windows host shadow proxy
 
 The Windows host proxy is in `crates/host-proxy`. It listens for redirected
 TCP and UDP flows, resolves each observed synthetic tuple through the
 authenticated `GetMapping` RPC, connects TCP flows to the original destination,
-and forwards UDP datagrams with response relaying.
+and forwards UDP datagrams with response relaying. It also owns the maintenance
+worker and lifecycle policy for stale flows.
 
 Build the default workspace target with:
 
@@ -74,15 +105,18 @@ Build the default workspace target with:
 cargo build -p shadow-socket-proxy-host
 ```
 
-Windows deployments that provide a PSK-capable OpenSSL installation must build
-the runnable proxy with:
+Windows deployments can choose either transport; neither feature is enabled by
+default:
 
 ```text
 cargo build -p shadow-socket-proxy-host --features tls-psk
+cargo build -p shadow-socket-proxy-host --features tls-rustls
 ```
 
-Configure the listener and control service with CLI options; provide the PSK through `--psk-secret`,
-`SSP_TLS_PSK_SECRET`, or `--psk-secret-file`. The proxy requires a nonzero
+The PSK build requires a PSK-capable OpenSSL installation and accepts
+`--psk-secret`, `SSP_TLS_PSK_SECRET`, or `--psk-secret-file`. The rustls build
+uses the certificate flags above and does not require OpenSSL. The proxy
+requires a nonzero
 `--udp-idle-timeout-secs` and never falls back to direct forwarding when a
 mapping lookup fails. The listen address must be a specific local IPv4 or IPv6
 address, not a wildcard address, so UDP lookups preserve the actual local
@@ -101,10 +135,11 @@ WSL interface through the Windows proxy. The proxy creates the actual outbound
 connections, so only use a disposable WSL distribution or a quiet demo
 environment.
 
-The host needs Windows, WSL 2, a WSL distribution with BPF/TC support, Rust
-1.96.1 available in both Windows and WSL, and a PSK-capable OpenSSL
-installation. The examples use an Ubuntu distribution named `Ubuntu`, a
-repository at `C:\dev\ShadowSocketProxy`, and the default WSL interface
+The host needs Windows, WSL 2, a WSL distribution with BPF/TC support, and
+Rust 1.96.1 available in both Windows and WSL. The PSK example additionally
+requires a PSK-capable OpenSSL installation. The examples use an Ubuntu
+distribution named `Ubuntu`, a repository at `C:\dev\ShadowSocketProxy`, and
+the default WSL interface
 `eth0`.
 
 ### Build the components
@@ -121,10 +156,11 @@ wsl -d Ubuntu -u root -- sh -c `
 wsl -d Ubuntu -- bash -lc `
   'cd /mnt/c/dev/ShadowSocketProxy &&
    make -C crates/bpf clean all &&
-   cargo build --locked --release -p shadow-socket-proxy-control'
+   cargo build --locked --release -p shadow-socket-proxy-control --features tls-psk'
 ```
 
-Install the Windows OpenSSL development package and build the host components:
+For the PSK mode, install the Windows OpenSSL development package and build the
+host components:
 
 ```powershell
 winget install --id ShiningLight.OpenSSL.Dev --version 4.0.1 --exact `
@@ -141,7 +177,21 @@ $env:OPENSSL_LIB_DIR = Join-Path $opensslRoot 'lib\VC\x64\MD'
 cargo build --locked --release -p shadow-socket-proxy-host --features tls-psk
 ```
 
-### Start the demo
+For rustls mode, no OpenSSL installation is needed:
+
+```powershell
+cargo build --locked --release -p shadow-socket-proxy-host --features tls-rustls
+```
+
+Generate one self-signed certificate/key pair for each endpoint and pass each
+process its own pair plus the SHA-256 pin of the peer certificate DER. A
+rustls listener has one configured peer-leaf pin, so every client connecting
+to that listener must use the same pinned client certificate; the E2E driver
+therefore shares one client pair between the host proxy and runner. The same
+three `--tls-*` options can be supplied through `SSP_TLS_*` variables;
+supplying a value through both forms is rejected.
+
+### Start the demo with TLS-PSK
 
 Open three PowerShell terminals in the repository. First, calculate the WSL
 gateway address and create one PSK shared by the control service and proxy:
@@ -229,6 +279,59 @@ wsl -d Ubuntu -- python3 -c `
   "import socket; s = socket.create_connection(('1.1.1.1', 443), 10); print(s.getpeername()); s.close()"
 ```
 
+### Start the demo with rustls certificate pinning
+
+Build the control service and Windows binaries with the rustls feature:
+
+```powershell
+wsl -d Ubuntu -- bash -lc `
+  'cd /mnt/c/dev/ShadowSocketProxy &&
+   cargo build --locked --release -p shadow-socket-proxy-control --features tls-rustls'
+cargo build --locked --release -p shadow-socket-proxy-host --features tls-rustls
+cargo build --locked --release -p shadow-socket-proxy-e2e-runner --features tls-rustls
+```
+
+Use one self-signed PEM certificate/key pair for the control service and one
+shared client PEM certificate/key pair for the host proxy and runner. Compute
+the SHA-256 pins from each certificate's exact DER bytes. The control service
+must be configured with the client certificate pin; the Windows clients must
+be configured with the control certificate pin.
+
+In the first PowerShell terminal, start the rustls control service:
+
+```powershell
+$clientPin = '<sha256-of-client-certificate-der>'
+
+wsl -d Ubuntu -u root -- env `
+  RUST_LOG=info `
+  SSP_LISTEN_ADDR=127.0.0.1:50051 `
+  SSP_TC_HOOK_LAYOUT=wsl `
+  SSP_TLS_CERT_FILE=/mnt/c/dev/ShadowSocketProxy/certs/control-cert.pem `
+  SSP_TLS_KEY_FILE=/mnt/c/dev/ShadowSocketProxy/certs/control-key.pem `
+  SSP_TLS_PEER_CERT_SHA256=$clientPin `
+  /mnt/c/dev/ShadowSocketProxy/target/release/shadow-socket-proxy-control
+```
+
+In the second PowerShell terminal, start the rustls Windows host proxy:
+
+```powershell
+$gateway = (wsl -d Ubuntu -- ip route show default).Split()[2]
+$controlPin = '<sha256-of-control-certificate-der>'
+
+.\target\release\shadow-socket-proxy-host.exe `
+  --listen "${gateway}:15000" `
+  --control-endpoint https://127.0.0.1:50051 `
+  --tls-cert-file .\certs\client-cert.pem `
+  --tls-key-file .\certs\client-key.pem `
+  --tls-peer-cert-sha256 $controlPin `
+  --bpf-elf /mnt/c/dev/ShadowSocketProxy/crates/bpf/shadow-socket-proxy.bpf.o `
+  --interface eth0
+```
+
+Do not provide PSK flags or `SSP_TLS_PSK_*` variables in rustls mode. The
+host proxy and E2E runner must use the same client certificate because the
+control service accepts one configured peer certificate pin.
+
 ### Stop the demo
 
 Press `Ctrl+C` in the proxy terminal; it detaches the BPF links it attached.
@@ -275,17 +378,51 @@ The disposable `site/` directory contains `index.html`, `rustdoc/`, and
 
 ## Windows/WSL end-to-end validation
 
-The checked-in Windows/WSL driver exercises the deployed BPF, control service,
-and host proxy with an ephemeral TLS-PSK. It requires Windows, an installed
-WSL distribution, and the Windows OpenSSL/Rust prerequisites:
+The checked-in Windows/WSL driver defaults to the deployed BPF, control service,
+and host proxy with an ephemeral TLS-PSK. That default requires Windows, an
+installed WSL distribution, and the Windows OpenSSL/Rust prerequisites:
 
 ```powershell
 cargo build --locked --release -p shadow-socket-proxy-e2e-runner --features tls-psk
 .\scripts\run-windows-wsl-e2e.ps1 `
+  -Transport psk `
   -BpfArtifact .\artifacts\bpf\shadow-socket-proxy.bpf.o `
   -ControlArtifact .\artifacts\control\shadow-socket-proxy-control `
   -HostArtifact .\artifacts\host
 ```
+
+For rustls-only end-to-end validation, build all three artifacts with rustls:
+
+```powershell
+wsl -d Ubuntu -- bash -lc `
+  'cd /mnt/c/dev/ShadowSocketProxy &&
+   cargo build --locked --release -p shadow-socket-proxy-control --features tls-rustls'
+cargo build --locked --release -p shadow-socket-proxy-host --features tls-rustls
+cargo build --locked --release -p shadow-socket-proxy-e2e-runner --features tls-rustls
+```
+
+Provide a PEM certificate/key pair for the control service and one shared PEM
+client pair for the host proxy and runner. Set the control-service pin to the
+client certificate's DER SHA-256 and the client pin to the control certificate's
+DER SHA-256, then select the rustls branch of the driver:
+
+```powershell
+.\scripts\run-windows-wsl-e2e.ps1 `
+  -Transport rustls `
+  -BpfArtifact .\crates\bpf\shadow-socket-proxy.bpf.o `
+  -ControlArtifact .\target\release\shadow-socket-proxy-control `
+  -HostArtifact .\target\release `
+  -TlsControlCertificateFile .\certs\control-cert.pem `
+  -TlsControlKeyFile .\certs\control-key.pem `
+  -TlsControlPeerCertSha256 <shared-client-certificate-pin> `
+  -TlsClientCertificateFile .\certs\client-cert.pem `
+  -TlsClientKeyFile .\certs\client-key.pem `
+  -TlsClientPeerCertSha256 <control-certificate-pin>
+```
+
+The driver passes the control identity through `SSP_TLS_*` variables and the
+Windows identities through CLI flags. The rustls branch does not install or use
+OpenSSL; no PSK or hostname fallback is attempted.
 
 The command fails when WSL, BPF/TC, authentication, process, marker,
 mapping, counter, or cleanup prerequisites are unavailable; it never falls

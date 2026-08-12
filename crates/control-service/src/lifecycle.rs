@@ -7,15 +7,21 @@ use std::{net::SocketAddr, sync::Arc};
 
 use thiserror::Error;
 use tokio::sync::watch;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", any(feature = "tls-psk", feature = "tls-rustls")))]
 use tonic::transport::Server;
 
+#[cfg(all(feature = "tls-rustls", not(feature = "tls-psk")))]
+use crate::transport::TlsRustlsConfig;
+#[cfg(all(target_os = "linux", feature = "tls-rustls", not(feature = "tls-psk")))]
+use crate::transport::TlsRustlsServer;
+#[cfg(feature = "tls-psk")]
+use crate::transport::{TlsPskConfig, TlsPskServer};
 use crate::{
     bpf::{BackendError, BpfBackend},
     config::{ConfigError, ConfigStore, RuntimeConfig},
     logs::LogRing,
     service::ControlService,
-    transport::{TlsPskConfig, TlsPskServer},
+    transport::{TlsConfig, TransportError},
 };
 
 #[derive(Debug, Error)]
@@ -25,8 +31,8 @@ pub enum RuntimeError {
     /// Initial or updated runtime configuration was invalid.
     Config(#[from] ConfigError),
     #[error("transport error: {0}")]
-    /// TLS-PSK transport initialization or binding failed.
-    Transport(#[from] crate::transport::TransportError),
+    /// TLS transport initialization or binding failed.
+    Transport(#[from] TransportError),
     #[error("backend cleanup error: {0}")]
     /// BPF detachment or cleanup failed during shutdown.
     Backend(#[from] BackendError),
@@ -47,8 +53,12 @@ pub struct ServiceRuntime<B: BpfBackend + 'static> {
     shutdown: watch::Sender<bool>,
     /// gRPC control service instance.
     pub service: Arc<ControlService>,
-    /// Optional TLS transport server.
+    #[cfg(feature = "tls-psk")]
+    /// OpenSSL TLS-PSK transport server.
     transport: Option<TlsPskServer>,
+    #[cfg(all(target_os = "linux", feature = "tls-rustls", not(feature = "tls-psk")))]
+    /// rustls mutual-certificate transport server.
+    rustls_transport: Option<TlsRustlsServer>,
 }
 
 impl<B: BpfBackend + 'static> ServiceRuntime<B> {
@@ -83,26 +93,85 @@ impl<B: BpfBackend + 'static> ServiceRuntime<B> {
             logs,
             shutdown,
             service,
+            #[cfg(feature = "tls-psk")]
             transport: None,
+            #[cfg(all(target_os = "linux", feature = "tls-rustls", not(feature = "tls-psk")))]
+            rustls_transport: None,
         }
     }
 
-    /// Reads TLS-PSK credentials from the environment and initializes transport.
+    /// Reads the selected TLS credentials from the environment and
+    /// initializes transport. CLI callers should use `start_with_tls` after
+    /// resolving duplicate CLI/environment settings.
     pub async fn start(&mut self) -> Result<(), RuntimeError> {
-        self.transport = Some(TlsPskServer::new(TlsPskConfig {
-            identity: std::env::var("SSP_TLS_PSK_IDENTITY").unwrap_or_default(),
-            secret: std::env::var("SSP_TLS_PSK_SECRET")
-                .map(|value| value.into_bytes())
-                .unwrap_or_default(),
-        })?);
-        Ok(())
+        #[cfg(feature = "tls-psk")]
+        {
+            self.start_with_tls(TlsConfig::Psk(TlsPskConfig {
+                identity: std::env::var("SSP_TLS_PSK_IDENTITY").unwrap_or_default(),
+                secret: std::env::var("SSP_TLS_PSK_SECRET")
+                    .map(|value| value.into_bytes())
+                    .unwrap_or_default(),
+            }))
+            .await
+        }
+
+        #[cfg(all(feature = "tls-rustls", not(feature = "tls-psk")))]
+        {
+            let certificate_file = std::env::var("SSP_TLS_CERT_FILE")
+                .map_err(|_| TransportError::Tls("SSP_TLS_CERT_FILE is required".into()))?;
+            let key_file = std::env::var("SSP_TLS_KEY_FILE")
+                .map_err(|_| TransportError::Tls("SSP_TLS_KEY_FILE is required".into()))?;
+            let peer_pin = std::env::var("SSP_TLS_PEER_CERT_SHA256")
+                .map_err(|_| TransportError::Tls("SSP_TLS_PEER_CERT_SHA256 is required".into()))?;
+            let config = TlsRustlsConfig::load(certificate_file, key_file, &peer_pin)
+                .map_err(|error| TransportError::Tls(error.to_string()))?;
+            self.start_with_tls(TlsConfig::Rustls(config)).await
+        }
+
+        #[cfg(not(any(feature = "tls-psk", feature = "tls-rustls")))]
+        Err(RuntimeError::Transport(TransportError::NoTlsModeSelected))
     }
 
-    /// Serves the gRPC control API with TLS-PSK on Linux; other platforms
-    /// return `UnsupportedTlsPsk`.
+    /// Initializes the selected transport from already-resolved startup
+    /// configuration.
+    pub async fn start_with_tls(&mut self, config: TlsConfig) -> Result<(), RuntimeError> {
+        #[cfg(feature = "tls-psk")]
+        {
+            let TlsConfig::Psk(config) = config;
+            self.transport = Some(TlsPskServer::new(config)?);
+            Ok(())
+        }
+
+        #[cfg(all(target_os = "linux", feature = "tls-rustls", not(feature = "tls-psk")))]
+        {
+            let TlsConfig::Rustls(config) = config;
+            self.rustls_transport = Some(TlsRustlsServer::new(config)?);
+            Ok(())
+        }
+
+        #[cfg(all(
+            feature = "tls-rustls",
+            not(feature = "tls-psk"),
+            not(target_os = "linux")
+        ))]
+        {
+            let _ = config;
+            Err(RuntimeError::Transport(
+                TransportError::UnsupportedTlsRustls,
+            ))
+        }
+
+        #[cfg(not(any(feature = "tls-psk", feature = "tls-rustls")))]
+        {
+            let _ = config;
+            Err(RuntimeError::Transport(TransportError::NoTlsModeSelected))
+        }
+    }
+
+    /// Serves the gRPC control API with the selected TLS transport.
     pub async fn serve(&self) -> Result<(), RuntimeError> {
         let address = self.config.snapshot().listener.socket_addr();
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(all(feature = "tls-psk", not(target_os = "linux")))]
         {
             let _ = address;
             Err(RuntimeError::Transport(
@@ -110,7 +179,19 @@ impl<B: BpfBackend + 'static> ServiceRuntime<B> {
             ))
         }
 
-        #[cfg(target_os = "linux")]
+        #[cfg(all(
+            feature = "tls-rustls",
+            not(feature = "tls-psk"),
+            not(target_os = "linux")
+        ))]
+        {
+            let _ = address;
+            Err(RuntimeError::Transport(
+                crate::transport::TransportError::UnsupportedTlsRustls,
+            ))
+        }
+
+        #[cfg(all(target_os = "linux", feature = "tls-psk"))]
         {
             let transport = self
                 .transport
@@ -126,6 +207,30 @@ impl<B: BpfBackend + 'static> ServiceRuntime<B> {
                 })
                 .await
                 .map_err(RuntimeError::Grpc)
+        }
+
+        #[cfg(all(target_os = "linux", feature = "tls-rustls", not(feature = "tls-psk")))]
+        {
+            let transport = self
+                .rustls_transport
+                .as_ref()
+                .ok_or(crate::transport::TransportError::InvalidConfig)?;
+            let incoming = transport.incoming(address).await?;
+            Server::builder()
+                .add_service(crate::proto::control_server::ControlServer::new(
+                    (*self.service).clone(),
+                ))
+                .serve_with_incoming_shutdown(incoming, async {
+                    let _ = tokio::signal::ctrl_c().await;
+                })
+                .await
+                .map_err(RuntimeError::Grpc)
+        }
+
+        #[cfg(not(any(feature = "tls-psk", feature = "tls-rustls")))]
+        {
+            let _ = address;
+            Err(RuntimeError::Transport(TransportError::NoTlsModeSelected))
         }
     }
 

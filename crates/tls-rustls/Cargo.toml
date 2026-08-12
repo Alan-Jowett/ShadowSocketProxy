@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 ShadowSocketProxy contributors
+
+[package]
+name = "shadow-socket-proxy-tls-rustls"
+version = "0.1.0"
+edition = "2021"
+description = "Shared rustls certificate-pinned transport support for ShadowSocketProxy"
+license = "MIT"
+
+[dependencies]
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "2.2"
+sha2 = "0.10"
+thiserror = "1"
+
+[dev-dependencies]
+rcgen = "0.14"
+time = "0.3"
+tokio = { version = "1", features = ["macros", "net", "io-util", "rt", "time"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }

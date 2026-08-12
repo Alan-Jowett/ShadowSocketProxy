@@ -5,6 +5,14 @@ param(
     [string] $ControlArtifact,
     [Parameter(Mandatory = $true)]
     [string] $HostArtifact,
+    [ValidateSet("psk", "rustls")]
+    [string] $Transport = "psk",
+    [string] $TlsControlCertificateFile,
+    [string] $TlsControlKeyFile,
+    [string] $TlsControlPeerCertSha256,
+    [string] $TlsClientCertificateFile,
+    [string] $TlsClientKeyFile,
+    [string] $TlsClientPeerCertSha256,
     [string] $Distribution,
     [string] $Interface,
     [switch] $TerminateDistribution,
@@ -115,10 +123,58 @@ $controlStdout = Join-Path $WorkDirectory "control.stdout.log"
 $controlStderr = Join-Path $WorkDirectory "control.stderr.log"
 $proxyStdout = Join-Path $WorkDirectory "host-proxy.stdout.log"
 $proxyStderr = Join-Path $WorkDirectory "host-proxy.stderr.log"
+$rustlsEnvironmentBackup = @{}
+
+if ($Transport -eq "rustls") {
+    $rustlsInputs = @(
+        $TlsControlCertificateFile,
+        $TlsControlKeyFile,
+        $TlsControlPeerCertSha256,
+        $TlsClientCertificateFile,
+        $TlsClientKeyFile,
+        $TlsClientPeerCertSha256
+    )
+    $missingRustlsInputs = @(
+        $rustlsInputs | Where-Object { [string]::IsNullOrWhiteSpace($_) }
+    )
+    if ($missingRustlsInputs.Count -ne 0) {
+        throw "rustls transport requires control/client certificate, key, and peer-pin inputs"
+    }
+    $tlsControlCertificate = (Resolve-Path $TlsControlCertificateFile).Path
+    $tlsControlKey = (Resolve-Path $TlsControlKeyFile).Path
+    $tlsClientCertificate = (Resolve-Path $TlsClientCertificateFile).Path
+    $tlsClientKey = (Resolve-Path $TlsClientKeyFile).Path
+    $tlsControlCertificateWsl = ConvertTo-WslPath $tlsControlCertificate
+    $tlsControlKeyWsl = ConvertTo-WslPath $tlsControlKey
+}
 
 try {
+    if ($Transport -eq "rustls") {
+        foreach ($name in @(
+            "SSP_TLS_CERT_FILE",
+            "SSP_TLS_KEY_FILE",
+            "SSP_TLS_PEER_CERT_SHA256",
+            "SSP_TLS_PSK_IDENTITY",
+            "SSP_TLS_PSK_SECRET"
+        )) {
+            $rustlsEnvironmentBackup[$name] = [Environment]::GetEnvironmentVariable($name)
+            Remove-Item "Env:$name" -ErrorAction SilentlyContinue
+        }
+    }
+    $wslPackages = if ($Transport -eq "psk") {
+        "iproute iproute-tc python3 openssl-libs ca-certificates"
+    }
+    else {
+        "iproute iproute-tc python3 ca-certificates"
+    }
+    $wslAptPackages = if ($Transport -eq "psk") {
+        "iproute2 python3 libssl3 ca-certificates"
+    }
+    else {
+        "iproute2 python3 ca-certificates"
+    }
     Invoke-WslRoot $Distribution @("sh", "-c",
-        "if command -v dnf >/dev/null; then dnf install -y iproute iproute-tc python3 openssl-libs ca-certificates; elif command -v apt-get >/dev/null; then apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends iproute2 python3 libssl3 ca-certificates; else echo 'unsupported WSL package manager' >&2; exit 1; fi")
+        "if command -v dnf >/dev/null; then dnf install -y $wslPackages; elif command -v apt-get >/dev/null; then apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends $wslAptPackages; else echo 'unsupported WSL package manager' >&2; exit 1; fi")
     Invoke-WslRoot $Distribution @("chmod", "+x", $bpfWsl, $controlWsl)
     Invoke-WslRoot $Distribution @("sh", "-c",
         "command -v tc >/dev/null || { echo 'tc is required but unavailable' >&2; exit 1; }")
@@ -130,16 +186,28 @@ try {
         $qdiscCreated = $true
     }
 
+    $controlArguments = @(
+        "-d", $Distribution, "-u", "root", "--", "env",
+        "SSP_LISTEN_ADDR=127.0.0.1:$controlPort",
+        "SSP_TC_HOOK_LAYOUT=wsl"
+    )
+    if ($Transport -eq "psk") {
+        $controlArguments += @(
+            "SSP_TLS_PSK_IDENTITY=$identity",
+            "SSP_TLS_PSK_SECRET=$secret"
+        )
+    }
+    else {
+        $controlArguments += @(
+            "SSP_TLS_CERT_FILE=$tlsControlCertificateWsl",
+            "SSP_TLS_KEY_FILE=$tlsControlKeyWsl",
+            "SSP_TLS_PEER_CERT_SHA256=$TlsControlPeerCertSha256"
+        )
+    }
+    $controlArguments += $controlWsl
     $controlProcess = Start-Process wsl.exe -PassThru -WindowStyle Hidden `
         -RedirectStandardOutput $controlStdout -RedirectStandardError $controlStderr `
-        -ArgumentList @(
-            "-d", $Distribution, "-u", "root", "--", "env",
-            "SSP_LISTEN_ADDR=127.0.0.1:$controlPort",
-            "SSP_TC_HOOK_LAYOUT=wsl",
-            "SSP_TLS_PSK_IDENTITY=$identity",
-            "SSP_TLS_PSK_SECRET=$secret",
-            "`"$controlWsl`""
-        )
+        -ArgumentList $controlArguments
     Wait-WslTcpListener $Distribution $controlPort
     if ($controlProcess.HasExited) {
         Get-Content $controlStderr -ErrorAction SilentlyContinue
@@ -147,20 +215,35 @@ try {
     }
 
     $serverProcess = Start-Process pwsh -PassThru -WindowStyle Hidden -ArgumentList @(
-        "-NoProfile", "-File", "`"$server`"", "-BindAddress", $hostGateway,
+        "-NoProfile", "-File", $server, "-BindAddress", $hostGateway,
         "-Port", $serverPort, "-Marker", $marker
     )
     Wait-TcpPort $hostGateway $serverPort
     $env:PATH = "$hostProxy;$env:PATH"
-    $proxyProcess = Start-Process $proxy -PassThru -WindowStyle Hidden `
-        -RedirectStandardOutput $proxyStdout -RedirectStandardError $proxyStderr -ArgumentList @(
+    $proxyArguments = @(
         "--listen", $proxyAddress,
-        "--control-endpoint", $endpoint,
-        "--psk-identity", $identity,
-        "--psk-secret", $secret,
-        "--bpf-elf", "`"$bpfWsl`"",
+        "--control-endpoint", $endpoint
+    )
+    if ($Transport -eq "psk") {
+        $proxyArguments += @(
+            "--psk-identity", $identity,
+            "--psk-secret", $secret
+        )
+    }
+    else {
+        $proxyArguments += @(
+            "--tls-cert-file", $tlsClientCertificate,
+            "--tls-key-file", $tlsClientKey,
+            "--tls-peer-cert-sha256", $TlsClientPeerCertSha256
+        )
+    }
+    $proxyArguments += @(
+        "--bpf-elf", $bpfWsl,
         "--interface", $Interface
     )
+    $proxyProcess = Start-Process $proxy -PassThru -WindowStyle Hidden `
+        -RedirectStandardOutput $proxyStdout -RedirectStandardError $proxyStderr `
+        -ArgumentList $proxyArguments
     Start-Sleep -Milliseconds 500
     if ($proxyProcess.HasExited) {
         Get-Content $proxyStderr -ErrorAction SilentlyContinue
@@ -173,10 +256,24 @@ try {
         Get-Content $proxyStderr -ErrorAction SilentlyContinue
         throw
     }
-    & $runner --control-endpoint $endpoint --psk-identity $identity `
-        --psk-secret $secret --target $target --proxy $proxyAddress `
-        --wsl-distribution $Distribution `
-        --marker $marker
+    $runnerArguments = @("--control-endpoint", $endpoint)
+    if ($Transport -eq "psk") {
+        $runnerArguments += @("--psk-identity", $identity, "--psk-secret", $secret)
+    }
+    else {
+        $runnerArguments += @(
+            "--tls-cert-file", $tlsClientCertificate,
+            "--tls-key-file", $tlsClientKey,
+            "--tls-peer-cert-sha256", $TlsClientPeerCertSha256
+        )
+    }
+    $runnerArguments += @(
+        "--target", $target,
+        "--proxy", $proxyAddress,
+        "--wsl-distribution", $Distribution,
+        "--marker", $marker
+    )
+    & $runner @runnerArguments
     $runnerExitCode = $LASTEXITCODE
     if ($runnerExitCode -ne 0) {
         Get-Content (Join-Path $WorkDirectory "control.stderr.log") -ErrorAction SilentlyContinue
@@ -213,6 +310,14 @@ finally {
         }
         catch {
             $cleanupErrors.Add("WSL termination failed: $_")
+        }
+    }
+    foreach ($entry in $rustlsEnvironmentBackup.GetEnumerator()) {
+        if ($null -eq $entry.Value) {
+            Remove-Item "Env:$($entry.Key)" -ErrorAction SilentlyContinue
+        }
+        else {
+            Set-Item "Env:$($entry.Key)" $entry.Value
         }
     }
     if ($cleanupErrors.Count -ne 0) {
