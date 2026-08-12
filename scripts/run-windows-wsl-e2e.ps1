@@ -262,8 +262,8 @@ try {
     }
     else {
         $runnerArguments += @(
-            "--tls-cert-file", "`"$tlsClientCertificate`"",
-            "--tls-key-file", "`"$tlsClientKey`"",
+            "--tls-cert-file", $tlsClientCertificate,
+            "--tls-key-file", $tlsClientKey,
             "--tls-peer-cert-sha256", $TlsClientPeerCertSha256
         )
     }
