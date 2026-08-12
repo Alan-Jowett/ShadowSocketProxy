@@ -130,6 +130,60 @@ On Windows, pass `--wsk` to run the authenticated inverted-call mapping
 broker and host-owned maintenance while the installed driver owns TCP/UDP
 listeners. WSK mode currently requires the driver's fixed port `15000`.
 
+### Build and run WSK mode
+
+Build the user-mode proxy and kernel driver from an elevated Windows PowerShell
+prompt. The driver target must match the installed WDK architecture:
+
+```powershell
+$env:WDKContentRoot = "$env:USERPROFILE\.nuget\packages\microsoft.windows.wdk.x64\10.0.28000.2526\c"
+
+cargo build --locked --release -p shadow-socket-proxy-wsk-driver `
+  --features kernel --target x86_64-pc-windows-msvc
+cargo build --locked --release -p shadow-socket-proxy-host `
+  --features "tls-psk,wsk"
+```
+
+The driver is a kernel-mode binary and must be signed before Windows will load
+it. For development, use a test certificate and test-signing mode according to
+the Windows driver-signing workflow; production deployments require a
+Microsoft-approved signing path. After signing, install the driver as a
+kernel service from an elevated prompt, replacing the path with the built
+driver location:
+
+```powershell
+sc.exe create ShadowSocketProxyWsk type= kernel start= demand `
+  binPath= "$PWD\target\x86_64-pc-windows-msvc\release\shadow_socket_proxy_wsk_driver.dll"
+sc.exe start ShadowSocketProxyWsk
+```
+
+Start the host proxy with the same control-service options used by the
+Tokio-owned path, plus `--wsk` and a listener port of `15000`:
+
+```powershell
+.\target\release\shadow-socket-proxy-host.exe `
+  --wsk `
+  --listen 127.0.0.1:15000 `
+  --control-endpoint https://127.0.0.1:50051 `
+  --psk-identity $identity `
+  --psk-secret-file .\ssp-demo.psk
+```
+
+In WSK mode, the driver owns the TCP and UDP listeners and forwards established
+payloads directly in kernel mode. The host process handles mapping lookups and
+maintenance only; payload bytes do not traverse user mode once a flow is
+established. Stop the proxy before unloading the driver:
+
+```powershell
+sc.exe stop ShadowSocketProxyWsk
+sc.exe delete ShadowSocketProxyWsk
+```
+
+The driver currently admits at most 64 TCP flows or UDP associations, fails
+closed when capacity is exhausted, expires mapping requests after 5 seconds,
+and removes mapped flows after 60 seconds of inactivity. Live signed-driver,
+multi-flow, cancellation-race, and ARM64 validation are not yet automated.
+
 `crates/wsk-driver` provides fixed ABI structs, session nonces, request IDs,
 generations, broker state validation, and a Windows `DeviceIoControl` transport.
 Its `kernel` feature is a WDM cdylib boundary: it discovers the pinned
