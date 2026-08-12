@@ -199,12 +199,12 @@ try {
     }
     else {
         $controlArguments += @(
-            "SSP_TLS_CERT_FILE=`"$tlsControlCertificateWsl`"",
-            "SSP_TLS_KEY_FILE=`"$tlsControlKeyWsl`"",
+            "SSP_TLS_CERT_FILE=$tlsControlCertificateWsl",
+            "SSP_TLS_KEY_FILE=$tlsControlKeyWsl",
             "SSP_TLS_PEER_CERT_SHA256=$TlsControlPeerCertSha256"
         )
     }
-    $controlArguments += "`"$controlWsl`""
+    $controlArguments += $controlWsl
     $controlProcess = Start-Process wsl.exe -PassThru -WindowStyle Hidden `
         -RedirectStandardOutput $controlStdout -RedirectStandardError $controlStderr `
         -ArgumentList $controlArguments
@@ -215,7 +215,7 @@ try {
     }
 
     $serverProcess = Start-Process pwsh -PassThru -WindowStyle Hidden -ArgumentList @(
-        "-NoProfile", "-File", "`"$server`"", "-BindAddress", $hostGateway,
+        "-NoProfile", "-File", $server, "-BindAddress", $hostGateway,
         "-Port", $serverPort, "-Marker", $marker
     )
     Wait-TcpPort $hostGateway $serverPort
@@ -232,13 +232,13 @@ try {
     }
     else {
         $proxyArguments += @(
-            "--tls-cert-file", "`"$tlsClientCertificate`"",
-            "--tls-key-file", "`"$tlsClientKey`"",
+            "--tls-cert-file", $tlsClientCertificate,
+            "--tls-key-file", $tlsClientKey,
             "--tls-peer-cert-sha256", $TlsClientPeerCertSha256
         )
     }
     $proxyArguments += @(
-        "--bpf-elf", "`"$bpfWsl`"",
+        "--bpf-elf", $bpfWsl,
         "--interface", $Interface
     )
     $proxyProcess = Start-Process $proxy -PassThru -WindowStyle Hidden `
@@ -262,8 +262,8 @@ try {
     }
     else {
         $runnerArguments += @(
-            "--tls-cert-file", "`"$tlsClientCertificate`"",
-            "--tls-key-file", "`"$tlsClientKey`"",
+            "--tls-cert-file", $tlsClientCertificate,
+            "--tls-key-file", $tlsClientKey,
             "--tls-peer-cert-sha256", $TlsClientPeerCertSha256
         )
     }

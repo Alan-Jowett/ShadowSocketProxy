@@ -2,6 +2,7 @@
 // Copyright (c) 2026 ShadowSocketProxy contributors
 //! Starts the control runtime, serves gRPC, and detaches BPF state on exit.
 
+#[cfg(any(feature = "tls-psk", feature = "tls-rustls"))]
 use clap::Parser;
 #[cfg(any(feature = "tls-psk", feature = "tls-rustls"))]
 use shadow_socket_proxy_control::{
@@ -9,6 +10,7 @@ use shadow_socket_proxy_control::{
 };
 #[cfg(any(feature = "tls-psk", feature = "tls-rustls"))]
 use std::net::SocketAddr;
+#[cfg(any(feature = "tls-psk", feature = "tls-rustls"))]
 use std::path::PathBuf;
 
 #[cfg(feature = "tls-rustls")]
@@ -17,6 +19,7 @@ use shadow_socket_proxy_control::transport::TlsRustlsConfig;
 #[cfg(all(feature = "tls-psk", feature = "tls-rustls"))]
 compile_error!("tls-psk and tls-rustls are mutually exclusive");
 
+#[cfg(any(feature = "tls-psk", feature = "tls-rustls"))]
 #[derive(Debug, Parser)]
 #[command(name = "shadow-socket-proxy-control")]
 /// Startup-only control-service options.
@@ -155,12 +158,15 @@ async fn main() {
         std::process::exit(1);
     }
     eprintln!("control service: ready for BPF attachment at {address}");
-    if let Err(error) = runtime.serve().await {
+    let serve_result = runtime.serve().await;
+    let shutdown_result = runtime.shutdown().await;
+    if let Err(error) = &serve_result {
         eprintln!("shadow-socket-proxy-control server failed: {error}");
-        std::process::exit(1);
     }
-    if let Err(error) = runtime.shutdown().await {
+    if let Err(error) = &shutdown_result {
         eprintln!("shadow-socket-proxy-control shutdown failed: {error}");
+    }
+    if serve_result.is_err() || shutdown_result.is_err() {
         std::process::exit(1);
     }
 }
