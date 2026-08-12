@@ -191,7 +191,7 @@ therefore shares one client pair between the host proxy and runner. The same
 three `--tls-*` options can be supplied through `SSP_TLS_*` variables;
 supplying a value through both forms is rejected.
 
-### Start the demo
+### Start the demo with TLS-PSK
 
 Open three PowerShell terminals in the repository. First, calculate the WSL
 gateway address and create one PSK shared by the control service and proxy:
@@ -278,6 +278,59 @@ through the Windows proxy. For example:
 wsl -d Ubuntu -- python3 -c `
   "import socket; s = socket.create_connection(('1.1.1.1', 443), 10); print(s.getpeername()); s.close()"
 ```
+
+### Start the demo with rustls certificate pinning
+
+Build the control service and Windows binaries with the rustls feature:
+
+```powershell
+wsl -d Ubuntu -- bash -lc `
+  'cd /mnt/c/dev/ShadowSocketProxy &&
+   cargo build --locked --release -p shadow-socket-proxy-control --features tls-rustls'
+cargo build --locked --release -p shadow-socket-proxy-host --features tls-rustls
+cargo build --locked --release -p shadow-socket-proxy-e2e-runner --features tls-rustls
+```
+
+Use one self-signed PEM certificate/key pair for the control service and one
+shared client PEM certificate/key pair for the host proxy and runner. Compute
+the SHA-256 pins from each certificate's exact DER bytes. The control service
+must be configured with the client certificate pin; the Windows clients must
+be configured with the control certificate pin.
+
+In the first PowerShell terminal, start the rustls control service:
+
+```powershell
+$clientPin = '<sha256-of-client-certificate-der>'
+
+wsl -d Ubuntu -u root -- env `
+  RUST_LOG=info `
+  SSP_LISTEN_ADDR=127.0.0.1:50051 `
+  SSP_TC_HOOK_LAYOUT=wsl `
+  SSP_TLS_CERT_FILE=/mnt/c/dev/ShadowSocketProxy/certs/control-cert.pem `
+  SSP_TLS_KEY_FILE=/mnt/c/dev/ShadowSocketProxy/certs/control-key.pem `
+  SSP_TLS_PEER_CERT_SHA256=$clientPin `
+  /mnt/c/dev/ShadowSocketProxy/target/release/shadow-socket-proxy-control
+```
+
+In the second PowerShell terminal, start the rustls Windows host proxy:
+
+```powershell
+$gateway = (wsl -d Ubuntu -- ip route show default).Split()[2]
+$controlPin = '<sha256-of-control-certificate-der>'
+
+.\target\release\shadow-socket-proxy-host.exe `
+  --listen "${gateway}:15000" `
+  --control-endpoint https://127.0.0.1:50051 `
+  --tls-cert-file .\certs\client-cert.pem `
+  --tls-key-file .\certs\client-key.pem `
+  --tls-peer-cert-sha256 $controlPin `
+  --bpf-elf /mnt/c/dev/ShadowSocketProxy/crates/bpf/shadow-socket-proxy.bpf.o `
+  --interface eth0
+```
+
+Do not provide PSK flags or `SSP_TLS_PSK_*` variables in rustls mode. The
+host proxy and E2E runner must use the same client certificate because the
+control service accepts one configured peer certificate pin.
 
 ### Stop the demo
 
