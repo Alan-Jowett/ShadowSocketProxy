@@ -22,7 +22,7 @@ use crate::{
 };
 use wdk_sys::{
     ntddk::{
-        IoAcquireCancelSpinLock, IoAllocateIrp, IoCreateDevice, IoCreateSymbolicLink,
+        DbgPrintEx, IoAcquireCancelSpinLock, IoAllocateIrp, IoCreateDevice, IoCreateSymbolicLink,
         IoDeleteDevice, IoDeleteSymbolicLink, IoFreeIrp, IoReleaseCancelSpinLock,
         IoSetCompletionRoutineEx, IofCompleteRequest, KeCancelTimer, KeFlushQueuedDpcs,
         KeInitializeDpc, KeInitializeEvent, KeInitializeTimerEx, KeQueryInterruptTimePrecise,
@@ -41,6 +41,8 @@ const STATUS_NOT_SUPPORTED: NTSTATUS = 0xC000_00BB_u32 as NTSTATUS;
 const STATUS_BUFFER_TOO_SMALL: NTSTATUS = 0xC000_0023_u32 as NTSTATUS;
 const STATUS_REQUEST_NOT_ACCEPTED: NTSTATUS = 0xC000_00D0_u32 as NTSTATUS;
 const STATUS_MORE_PROCESSING_REQUIRED: NTSTATUS = 0xC000_0016_u32 as NTSTATUS;
+const DPFLTR_IHVDRIVER_ID: u32 = 77;
+const DPFLTR_ERROR_LEVEL: u32 = 0;
 
 const FILE_DEVICE_NETWORK: u32 = 0x12;
 const FILE_DEVICE_SECURE_OPEN: u32 = 0x0000_0100;
@@ -79,6 +81,19 @@ const fn wide<const N: usize>(bytes: &[u8; N]) -> [u16; N] {
 
 const DEVICE_NAME: [u16; 25] = wide(b"\\Device\\ShadowSocketProxy");
 const DOS_DEVICE_NAME: [u16; 29] = wide(b"\\DosDevices\\ShadowSocketProxy");
+
+fn debug_status(stage: &[u8], status: NTSTATUS) {
+    let format = b"ShadowSocketProxy: %s failed with status 0x%08X\0";
+    unsafe {
+        let _ = DbgPrintEx(
+            DPFLTR_IHVDRIVER_ID,
+            DPFLTR_ERROR_LEVEL,
+            format.as_ptr().cast::<i8>(),
+            stage.as_ptr().cast::<i8>(),
+            status as u32,
+        );
+    }
+}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -328,6 +343,7 @@ pub unsafe extern "system" fn driver_entry(
         )
     };
     if status != STATUS_SUCCESS || device.is_null() {
+        debug_status(b"IoCreateDevice\0", status);
         return if status == STATUS_SUCCESS {
             STATUS_INSUFFICIENT_RESOURCES
         } else {
@@ -338,6 +354,7 @@ pub unsafe extern "system" fn driver_entry(
     let mut dos_device_name = unicode_string(&DOS_DEVICE_NAME);
     let status = unsafe { IoCreateSymbolicLink(&mut dos_device_name, &mut device_name) };
     if status != STATUS_SUCCESS {
+        debug_status(b"IoCreateSymbolicLink\0", status);
         unsafe {
             IoDeleteDevice(device);
         }
@@ -356,6 +373,7 @@ pub unsafe extern "system" fn driver_entry(
 
     let status = register_wsk();
     if status != STATUS_SUCCESS {
+        debug_status(b"register_wsk\0", status);
         unsafe {
             let _ = IoDeleteSymbolicLink(&mut dos_device_name);
             IoDeleteDevice(device);
@@ -2418,6 +2436,7 @@ fn register_wsk() -> NTSTATUS {
         let registration = core::ptr::addr_of_mut!(WSK_REGISTRATION).cast();
         let status = wsk::WskRegister(&mut client_npi, registration);
         if status != STATUS_SUCCESS {
+            debug_status(b"WskRegister\0", status);
             return status;
         }
         WSK_REGISTERED = true;
@@ -2425,6 +2444,7 @@ fn register_wsk() -> NTSTATUS {
         let provider = core::ptr::addr_of_mut!(WSK_PROVIDER_NPI).cast();
         let status = wsk::WskCaptureProviderNPI(registration, WSK_INFINITE_WAIT, provider);
         if status != STATUS_SUCCESS {
+            debug_status(b"WskCaptureProviderNPI\0", status);
             wsk::WskDeregister(registration);
             WSK_REGISTERED = false;
             return status;
@@ -2434,6 +2454,7 @@ fn register_wsk() -> NTSTATUS {
 
     let status = set_static_event_callbacks();
     if status != STATUS_SUCCESS {
+        debug_status(b"set_static_event_callbacks\0", status);
         unregister_wsk();
         return status;
     }
@@ -2443,6 +2464,7 @@ fn register_wsk() -> NTSTATUS {
     let udp_v4 = setup_listener(AF_INET, IPPROTO_UDP, &UDP_CONTEXT_V4);
     let udp_v6 = setup_listener(AF_INET6, IPPROTO_UDP, &UDP_CONTEXT_V6);
     if tcp_v4.is_none() || tcp_v6.is_none() || udp_v4.is_none() || udp_v6.is_none() {
+        debug_status(b"setup_listener\0", STATUS_NOT_SUPPORTED);
         if let Some(socket) = tcp_v4 {
             let _ = close_socket_sync(socket);
         }

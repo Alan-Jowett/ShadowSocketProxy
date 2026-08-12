@@ -228,6 +228,35 @@ sc.exe create ShadowSocketProxyWsk type= kernel start= demand `
 sc.exe start ShadowSocketProxyWsk
 ```
 
+If `sc.exe start` returns error 50 (`ERROR_NOT_SUPPORTED`), inspect the
+driver's initialization status rather than treating it as a generic service
+failure. Query the service and recent Service Control Manager events first:
+
+```powershell
+sc.exe queryex ShadowSocketProxyWsk
+sc.exe qc ShadowSocketProxyWsk
+Get-WinEvent -LogName System -MaxEvents 100 |
+  Where-Object ProviderName -eq 'Service Control Manager' |
+  Select-Object -First 10 TimeCreated, Id, LevelDisplayName, Message
+```
+
+The driver emits the failing initialization stage and NTSTATUS through
+`DbgPrintEx` for `IoCreateDevice`, `IoCreateSymbolicLink`, `WskRegister`,
+`WskCaptureProviderNPI`, static callback registration, and listener setup.
+Capture these messages with Sysinternals DebugView running elevated with
+**Capture Kernel** enabled, or with a kernel WinDbg session, then retry:
+
+```powershell
+sc.exe stop ShadowSocketProxyWsk
+sc.exe start ShadowSocketProxyWsk
+```
+
+Convert the logged status to a symbolic NTSTATUS with `!error 0xSTATUS` in
+WinDbg. A failure at `WskRegister` or provider capture usually indicates that
+WSK is unavailable in the current environment; a listener setup failure
+usually indicates that the fixed loopback port `15000` is already occupied or
+that a WSK socket operation was rejected.
+
 Start the host proxy with the same control-service options used by the
 Tokio-owned path, plus `--wsk` and a listener port of `15000`:
 
