@@ -1785,6 +1785,12 @@ fn create_outbound_socket(original: &abi::MappingTuple, index: usize) -> Option<
     };
     match original.address_family {
         4 => {
+            let mut local = SockAddrIn {
+                family: AF_INET,
+                port: 0,
+                address: [0; 4],
+                zero: [0; 8],
+            };
             let mut remote = SockAddrIn {
                 family: AF_INET,
                 port: original.destination_port.to_be(),
@@ -1801,7 +1807,7 @@ fn create_outbound_socket(original: &abi::MappingTuple, index: usize) -> Option<
                     provider.Client,
                     socket_type,
                     original.protocol as u32,
-                    null_mut(),
+                    (&mut local as *mut SockAddrIn).cast(),
                     (&mut remote as *mut SockAddrIn).cast(),
                     0,
                     core::ptr::addr_of_mut!(FLOW_SLOTS[index].outbound_context).cast(),
@@ -1832,6 +1838,13 @@ fn create_outbound_socket(original: &abi::MappingTuple, index: usize) -> Option<
             }
         }
         6 => {
+            let mut local = SockAddrIn6 {
+                family: AF_INET6,
+                port: 0,
+                flow_info: 0,
+                address: [0; 16],
+                scope_id: 0,
+            };
             let mut remote = SockAddrIn6 {
                 family: AF_INET6,
                 port: original.destination_port.to_be(),
@@ -1844,7 +1857,7 @@ fn create_outbound_socket(original: &abi::MappingTuple, index: usize) -> Option<
                     provider.Client,
                     socket_type,
                     original.protocol as u32,
-                    null_mut(),
+                    (&mut local as *mut SockAddrIn6).cast(),
                     (&mut remote as *mut SockAddrIn6).cast(),
                     0,
                     core::ptr::addr_of_mut!(FLOW_SLOTS[index].outbound_context).cast(),
