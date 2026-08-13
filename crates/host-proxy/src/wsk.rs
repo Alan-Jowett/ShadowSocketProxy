@@ -60,29 +60,58 @@ impl WskDeviceClient {
             }
             let tuple = tuple_from_abi(request.synthetic)
                 .ok_or(BrokerError::DeviceStatus(abi::Status::InvalidAbi))?;
+            tracing::info!(synthetic = ?tuple, "wsk mapping lookup");
             let original = match handle.block_on(client.get_mapping(&tuple)) {
-                Ok(mapping) => mapping_to_abi(request.synthetic, mapping)
-                    .ok_or(BrokerError::DeviceStatus(abi::Status::InvalidAbi))?,
+                Ok(mapping) => {
+                    tracing::info!(
+                        synthetic = ?tuple,
+                        original = ?mapping,
+                        "wsk mapping resolved"
+                    );
+                    mapping_to_abi(request.synthetic, mapping)
+                        .ok_or(BrokerError::DeviceStatus(abi::Status::InvalidAbi))?
+                }
                 Err(ProxyError::MappingNotFound | ProxyError::InvalidMapping(_)) => {
-                    eprintln!(
-                        "host proxy: no control-service mapping for synthetic {:?}; \
-                         leaving flow fail-closed",
-                        tuple
+                    tracing::warn!(
+                        synthetic = ?tuple,
+                        "no control-service mapping; leaving flow fail-closed"
                     );
                     continue;
                 }
-                Err(_) => {
+                Err(error) => {
+                    tracing::error!(
+                        synthetic = ?tuple,
+                        error = %error,
+                        "control-service mapping lookup failed"
+                    );
                     return Err(BrokerError::Transport(std::io::Error::other(
                         "control-service mapping lookup failed",
-                    )))
+                    )));
                 }
             };
             if let Err(error) = device.complete_mapping(&request, original) {
-                eprintln!(
-                    "host proxy: driver rejected mapping completion for synthetic {:?}: {error}",
-                    tuple
-                );
-                return Err(error);
+                match error {
+                    BrokerError::DeviceStatus(
+                        abi::Status::ResourceUnavailable
+                        | abi::Status::InvalidMapping
+                        | abi::Status::Cancelled,
+                    ) => {
+                        tracing::warn!(
+                            synthetic = ?tuple,
+                            error = %error,
+                            "driver rejected mapping for this flow; continuing"
+                        );
+                        continue;
+                    }
+                    error => {
+                        tracing::error!(
+                            synthetic = ?tuple,
+                            error = %error,
+                            "driver rejected mapping completion"
+                        );
+                        return Err(error);
+                    }
+                }
             }
         }
         Ok(())
