@@ -876,7 +876,7 @@ fn clear_session() {
 }
 
 fn generate_nonce() -> abi::SessionNonce {
-    let counter = unsafe { KeQueryInterruptTimePrecise(null_mut()) };
+    let counter = now_100ns();
     let address_entropy = (&counter as *const u64 as usize) as u64;
     let mut seed = NONCE_SEED.fetch_add(
         (counter as u32)
@@ -949,7 +949,8 @@ unsafe extern "C" fn close_irp_completion(
 }
 
 fn now_100ns() -> u64 {
-    unsafe { KeQueryInterruptTimePrecise(null_mut()) }
+    let mut qpc_timestamp = 0u64;
+    unsafe { KeQueryInterruptTimePrecise(&mut qpc_timestamp) }
 }
 
 fn synchronous_wsk_call<F>(operation: F) -> Result<(NTSTATUS, u64), NTSTATUS>
