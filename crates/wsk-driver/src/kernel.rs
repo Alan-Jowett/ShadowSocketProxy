@@ -43,6 +43,7 @@ const STATUS_REQUEST_NOT_ACCEPTED: NTSTATUS = 0xC000_00D0_u32 as NTSTATUS;
 const STATUS_MORE_PROCESSING_REQUIRED: NTSTATUS = 0xC000_0016_u32 as NTSTATUS;
 const DPFLTR_IHVDRIVER_ID: u32 = 77;
 const DPFLTR_ERROR_LEVEL: u32 = 0;
+const DPFLTR_INFO_LEVEL: u32 = 4;
 
 const FILE_DEVICE_NETWORK: u32 = 0x12;
 const FILE_DEVICE_SECURE_OPEN: u32 = 0x0000_0100;
@@ -96,6 +97,70 @@ fn debug_status(stage: &[u8], status: NTSTATUS) {
             format.as_ptr().cast::<i8>(),
             stage.as_ptr().cast::<i8>(),
             status as u32,
+        );
+    }
+}
+
+fn debug_connect_attempt(original: &abi::MappingTuple, index: usize, socket_type: u16) {
+    unsafe {
+        if original.address_family == 4 {
+            let format = b"ShadowSocketProxy: WskSocketConnect attempt slot=%u protocol=%u family=%u type=%u local=wildcard:0 remote=%02X.%02X.%02X.%02X:%u\0";
+            let _ = DbgPrintEx(
+                DPFLTR_IHVDRIVER_ID,
+                DPFLTR_INFO_LEVEL,
+                format.as_ptr().cast::<i8>(),
+                index as u32,
+                original.protocol as u32,
+                original.address_family as u32,
+                socket_type as u32,
+                original.destination_address[0] as u32,
+                original.destination_address[1] as u32,
+                original.destination_address[2] as u32,
+                original.destination_address[3] as u32,
+                original.destination_port as u32,
+            );
+        } else {
+            let format = b"ShadowSocketProxy: WskSocketConnect attempt slot=%u protocol=%u family=%u type=%u local=wildcard:0 remote=%02X%02X:%02X%02X:%02X%02X:%02X%02X:%02X%02X:%02X%02X:%02X%02X:%02X%02X:%u\0";
+            let _ = DbgPrintEx(
+                DPFLTR_IHVDRIVER_ID,
+                DPFLTR_INFO_LEVEL,
+                format.as_ptr().cast::<i8>(),
+                index as u32,
+                original.protocol as u32,
+                original.address_family as u32,
+                socket_type as u32,
+                original.destination_address[0] as u32,
+                original.destination_address[1] as u32,
+                original.destination_address[2] as u32,
+                original.destination_address[3] as u32,
+                original.destination_address[4] as u32,
+                original.destination_address[5] as u32,
+                original.destination_address[6] as u32,
+                original.destination_address[7] as u32,
+                original.destination_address[8] as u32,
+                original.destination_address[9] as u32,
+                original.destination_address[10] as u32,
+                original.destination_address[11] as u32,
+                original.destination_address[12] as u32,
+                original.destination_address[13] as u32,
+                original.destination_address[14] as u32,
+                original.destination_address[15] as u32,
+                original.destination_port as u32,
+            );
+        }
+    }
+}
+
+fn debug_connect_result(stage: &[u8], status: NTSTATUS, information: u64) {
+    let format = b"ShadowSocketProxy: %s status=0x%08X information=%llu\0";
+    unsafe {
+        let _ = DbgPrintEx(
+            DPFLTR_IHVDRIVER_ID,
+            DPFLTR_ERROR_LEVEL,
+            format.as_ptr().cast::<i8>(),
+            stage.as_ptr().cast::<i8>(),
+            status as u32,
+            information,
         );
     }
 }
@@ -1783,6 +1848,7 @@ fn create_outbound_socket(original: &abi::MappingTuple, index: usize) -> Option<
     } else {
         SOCK_DGRAM
     };
+    debug_connect_attempt(original, index, socket_type);
     match original.address_family {
         4 => {
             let mut local = SockAddrIn {
@@ -1820,20 +1886,25 @@ fn create_outbound_socket(original: &abi::MappingTuple, index: usize) -> Option<
             }) {
                 Ok(result) => result,
                 Err(status) => {
-                    debug_status(b"WskSocketConnect IPv4\0", status);
+                    debug_connect_result(b"WskSocketConnect IPv4 dispatch\0", status, 0);
                     return None;
                 }
             };
             if result.0 == STATUS_SUCCESS && result.1 != 0 {
                 let socket = result.1 as usize as wsk::PWSK_SOCKET;
                 if enable_socket_event_callbacks(socket, WSK_EVENT_RECEIVE | WSK_EVENT_DISCONNECT) {
+                    debug_connect_result(b"WskSocketConnect IPv4 success\0", result.0, result.1);
                     Some(socket)
                 } else {
+                    debug_status(
+                        b"WskSocketConnect IPv4 callback setup\0",
+                        STATUS_NOT_SUPPORTED,
+                    );
                     let _ = close_socket_sync(socket);
                     None
                 }
             } else {
-                debug_status(b"WskSocketConnect IPv4 completion\0", result.0);
+                debug_connect_result(b"WskSocketConnect IPv4 completion\0", result.0, result.1);
                 None
             }
         }
@@ -1870,20 +1941,25 @@ fn create_outbound_socket(original: &abi::MappingTuple, index: usize) -> Option<
             }) {
                 Ok(result) => result,
                 Err(status) => {
-                    debug_status(b"WskSocketConnect IPv6\0", status);
+                    debug_connect_result(b"WskSocketConnect IPv6 dispatch\0", status, 0);
                     return None;
                 }
             };
             if result.0 == STATUS_SUCCESS && result.1 != 0 {
                 let socket = result.1 as usize as wsk::PWSK_SOCKET;
                 if enable_socket_event_callbacks(socket, WSK_EVENT_RECEIVE | WSK_EVENT_DISCONNECT) {
+                    debug_connect_result(b"WskSocketConnect IPv6 success\0", result.0, result.1);
                     Some(socket)
                 } else {
+                    debug_status(
+                        b"WskSocketConnect IPv6 callback setup\0",
+                        STATUS_NOT_SUPPORTED,
+                    );
                     let _ = close_socket_sync(socket);
                     None
                 }
             } else {
-                debug_status(b"WskSocketConnect IPv6 completion\0", result.0);
+                debug_connect_result(b"WskSocketConnect IPv6 completion\0", result.0, result.1);
                 None
             }
         }

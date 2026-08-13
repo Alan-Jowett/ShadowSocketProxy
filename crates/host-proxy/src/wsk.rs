@@ -91,14 +91,12 @@ impl WskDeviceClient {
                     continue;
                 }
                 Err(error) => {
-                    tracing::error!(
+                    tracing::warn!(
                         synthetic = ?lookup_tuple,
                         error = %error,
-                        "control-service mapping lookup failed"
+                        "control-service mapping lookup failed; leaving flow fail-closed"
                     );
-                    return Err(BrokerError::Transport(std::io::Error::other(
-                        "control-service mapping lookup failed",
-                    )));
+                    continue;
                 }
             };
             if let Err(error) = device.complete_mapping(&request, original) {
