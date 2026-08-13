@@ -111,7 +111,10 @@ try {
         if ($EnableTestSigning) {
             $signArguments += '-EnableTestSigning'
         }
-        Invoke-Native (Join-Path $repoRoot 'scripts\sign-wsk-driver.ps1') $signArguments
+        & (Join-Path $repoRoot 'scripts\sign-wsk-driver.ps1') @signArguments
+        if (-not $?) {
+            throw 'sign-wsk-driver.ps1 failed'
+        }
     }
 
     Write-Host ''
