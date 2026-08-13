@@ -15,14 +15,14 @@ use std::{sync::Arc, time::Duration};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use clap::Parser;
+#[cfg(all(feature = "wsk", target_os = "windows"))]
+use shadow_socket_proxy_host::wsk::WskDeviceClient;
 #[cfg(feature = "tls-psk")]
 use shadow_socket_proxy_host::TlsPskMappingClient;
 #[cfg(feature = "tls-rustls")]
 use shadow_socket_proxy_host::TlsRustlsMappingClient;
 #[cfg(any(feature = "tls-psk", feature = "tls-rustls"))]
 use shadow_socket_proxy_host::{Proxy, ProxyConfig};
-#[cfg(all(feature = "wsk", target_os = "windows"))]
-use shadow_socket_proxy_host::wsk::WskDeviceClient;
 use tokio::sync::watch;
 
 #[cfg(all(feature = "tls-psk", feature = "tls-rustls"))]

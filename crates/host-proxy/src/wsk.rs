@@ -64,7 +64,12 @@ impl WskDeviceClient {
                 Ok(mapping) => mapping_to_abi(request.synthetic, mapping)
                     .ok_or(BrokerError::DeviceStatus(abi::Status::InvalidAbi))?,
                 Err(ProxyError::MappingNotFound | ProxyError::InvalidMapping(_)) => {
-                    return Err(BrokerError::DeviceStatus(abi::Status::ResourceUnavailable));
+                    eprintln!(
+                        "host proxy: no control-service mapping for synthetic {:?}; \
+                         leaving flow fail-closed",
+                        tuple
+                    );
+                    continue;
                 }
                 Err(_) => {
                     return Err(BrokerError::Transport(std::io::Error::other(
