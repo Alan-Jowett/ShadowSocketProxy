@@ -1766,11 +1766,18 @@ fn handle_mapping_completion(completion: &abi::MappingCompletion) -> abi::Status
 }
 
 fn create_outbound_socket(original: &abi::MappingTuple, index: usize) -> Option<wsk::PWSK_SOCKET> {
-    let provider = provider_npi()?;
+    let Some(provider) = provider_npi() else {
+        debug_status(b"outbound provider_npi\0", STATUS_NOT_SUPPORTED);
+        return None;
+    };
     if provider.Dispatch.is_null() {
+        debug_status(b"outbound provider dispatch\0", STATUS_NOT_SUPPORTED);
         return None;
     }
-    let connect = unsafe { (*provider.Dispatch).WskSocketConnect }?;
+    let Some(connect) = (unsafe { (*provider.Dispatch).WskSocketConnect }) else {
+        debug_status(b"WskSocketConnect dispatch\0", STATUS_NOT_SUPPORTED);
+        return None;
+    };
     let socket_type = if original.protocol == IPPROTO_TCP as u8 {
         SOCK_STREAM
     } else {
@@ -1789,7 +1796,7 @@ fn create_outbound_socket(original: &abi::MappingTuple, index: usize) -> Option<
                 ],
                 zero: [0; 8],
             };
-            let result = synchronous_wsk_call(|irp| unsafe {
+            let result = match synchronous_wsk_call(|irp| unsafe {
                 connect(
                     provider.Client,
                     socket_type,
@@ -1804,8 +1811,13 @@ fn create_outbound_socket(original: &abi::MappingTuple, index: usize) -> Option<
                     null_mut(),
                     irp.cast(),
                 )
-            })
-            .ok()?;
+            }) {
+                Ok(result) => result,
+                Err(status) => {
+                    debug_status(b"WskSocketConnect IPv4\0", status);
+                    return None;
+                }
+            };
             if result.0 == STATUS_SUCCESS && result.1 != 0 {
                 let socket = result.1 as usize as wsk::PWSK_SOCKET;
                 if enable_socket_event_callbacks(socket, WSK_EVENT_RECEIVE | WSK_EVENT_DISCONNECT) {
@@ -1815,6 +1827,7 @@ fn create_outbound_socket(original: &abi::MappingTuple, index: usize) -> Option<
                     None
                 }
             } else {
+                debug_status(b"WskSocketConnect IPv4 completion\0", result.0);
                 None
             }
         }
@@ -1826,7 +1839,7 @@ fn create_outbound_socket(original: &abi::MappingTuple, index: usize) -> Option<
                 address: original.destination_address,
                 scope_id: 0,
             };
-            let result = synchronous_wsk_call(|irp| unsafe {
+            let result = match synchronous_wsk_call(|irp| unsafe {
                 connect(
                     provider.Client,
                     socket_type,
@@ -1841,8 +1854,13 @@ fn create_outbound_socket(original: &abi::MappingTuple, index: usize) -> Option<
                     null_mut(),
                     irp.cast(),
                 )
-            })
-            .ok()?;
+            }) {
+                Ok(result) => result,
+                Err(status) => {
+                    debug_status(b"WskSocketConnect IPv6\0", status);
+                    return None;
+                }
+            };
             if result.0 == STATUS_SUCCESS && result.1 != 0 {
                 let socket = result.1 as usize as wsk::PWSK_SOCKET;
                 if enable_socket_event_callbacks(socket, WSK_EVENT_RECEIVE | WSK_EVENT_DISCONNECT) {
@@ -1852,10 +1870,14 @@ fn create_outbound_socket(original: &abi::MappingTuple, index: usize) -> Option<
                     None
                 }
             } else {
+                debug_status(b"WskSocketConnect IPv6 completion\0", result.0);
                 None
             }
         }
-        _ => None,
+        _ => {
+            debug_status(b"WskSocketConnect family\0", STATUS_INVALID_PARAMETER);
+            None
+        }
     }
 }
 

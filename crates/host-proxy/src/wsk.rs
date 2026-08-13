@@ -77,7 +77,13 @@ impl WskDeviceClient {
                     )))
                 }
             };
-            device.complete_mapping(&request, original)?;
+            if let Err(error) = device.complete_mapping(&request, original) {
+                eprintln!(
+                    "host proxy: driver rejected mapping completion for synthetic {:?}: {error}",
+                    tuple
+                );
+                return Err(error);
+            }
         }
         Ok(())
     }
