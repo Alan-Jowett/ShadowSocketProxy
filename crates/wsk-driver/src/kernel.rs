@@ -309,14 +309,13 @@ static mut FLOW_TABLE: FlowTable<FLOW_TABLE_CAPACITY> = FlowTable::new();
 static mut FLOW_SLOTS: [FlowSocketSlot; FLOW_TABLE_CAPACITY] =
     [const { FlowSocketSlot::new() }; FLOW_TABLE_CAPACITY];
 
-// The WDK declares this identifier as an extern but the NuGet kernel import
-// libraries do not export it. Keep the documented WSK interface identifier in
-// the driver so the static-event control request remains linkable.
+// The WDK declares this identifier as an extern, but keep the value local so
+// callback control requests do not depend on resolving the UUID import symbol.
 static WSK_INTERFACE_ID: wsk::NPIID = wsk::NPIID {
-    Data1: 0x1414_9bc5,
-    Data2: 0x1228,
-    Data3: 0x4a34,
-    Data4: [0x98, 0xe6, 0xcc, 0x41, 0xf4, 0x46, 0xaa, 0xee],
+    Data1: 0x1415_dff1,
+    Data2: 0x4f61,
+    Data3: 0x45bd,
+    Data4: [0x84, 0x3d, 0x08, 0x6c, 0x9a, 0xd0, 0x23, 0x42],
 };
 
 /// The WDM entry point exported by the cdylib.
