@@ -1362,7 +1362,7 @@ fn expire_mapping_state() {
         && now >= PENDING_MAPPING_DEADLINE.load(Ordering::Acquire)
     {
         if let Some(irp) = take_pending_mapping_irp() {
-            complete_mapping_wait_irp(irp, abi::Status::Cancelled);
+            complete_mapping_wait_irp(irp, abi::Status::Timeout);
         }
     }
 

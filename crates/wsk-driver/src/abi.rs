@@ -39,6 +39,8 @@ pub enum Status {
     InternalError = 8,
     /// The synthetic or original tuple failed exact mapping validation.
     InvalidMapping = 9,
+    /// The bounded mapping wait expired without a flow.
+    Timeout = 10,
 }
 
 impl Status {
@@ -55,6 +57,7 @@ impl Status {
             7 => Some(Self::Cancelled),
             8 => Some(Self::InternalError),
             9 => Some(Self::InvalidMapping),
+            10 => Some(Self::Timeout),
             _ => None,
         }
     }

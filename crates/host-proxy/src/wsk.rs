@@ -50,7 +50,11 @@ impl WskDeviceClient {
     {
         let handle = Handle::current();
         while !stop.load(Ordering::Acquire) {
-            let request = device.wait_for_mapping()?;
+            let request = match device.wait_for_mapping() {
+                Ok(request) => request,
+                Err(BrokerError::DeviceStatus(abi::Status::Timeout)) => continue,
+                Err(error) => return Err(error),
+            };
             if stop.load(Ordering::Acquire) {
                 break;
             }
