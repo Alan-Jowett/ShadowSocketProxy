@@ -2,12 +2,11 @@
 // Copyright (c) 2026 ShadowSocketProxy contributors
 //! User-mode broker-side IOCTL transport and session state machine.
 
+#[cfg(windows)]
+use std::sync::Arc;
 use std::{
     fmt, io,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
-    },
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use crate::abi::{

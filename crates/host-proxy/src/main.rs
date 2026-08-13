@@ -23,6 +23,7 @@ use shadow_socket_proxy_host::TlsPskMappingClient;
 use shadow_socket_proxy_host::TlsRustlsMappingClient;
 #[cfg(any(feature = "tls-psk", feature = "tls-rustls"))]
 use shadow_socket_proxy_host::{Proxy, ProxyConfig};
+#[cfg(any(feature = "tls-psk", feature = "tls-rustls"))]
 use tokio::sync::watch;
 
 #[cfg(all(feature = "tls-psk", feature = "tls-rustls"))]

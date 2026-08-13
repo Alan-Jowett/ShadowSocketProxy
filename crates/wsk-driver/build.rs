@@ -1,16 +1,14 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 ShadowSocketProxy contributors
 
+use std::env;
+#[cfg(target_os = "windows")]
 use std::{
-    env, fs,
+    fs,
     path::{Path, PathBuf},
 };
+#[cfg(target_os = "windows")]
 use wdk_build::BuilderExt;
-
-const WDK_VERSION: &str = "10.0.28000.2526";
-const WDK_PACKAGE_X64: &str = "microsoft.windows.wdk.x64";
-const WDK_PACKAGE_ARM64: &str = "microsoft.windows.wdk.arm64";
-const SDK_PACKAGE: &str = "microsoft.windows.sdk.cpp";
 
 fn main() {
     println!("cargo:rerun-if-changed=include\\wsk_wrapper.h");
@@ -28,17 +26,26 @@ fn main() {
         println!("cargo:rerun-if-env-changed={variable}");
     }
 
-    if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows")
-        || env::var_os("CARGO_FEATURE_KERNEL").is_none()
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows")
+        && env::var_os("CARGO_FEATURE_KERNEL").is_some()
     {
-        return;
-    }
-
-    if let Err(error) = configure_kernel_build() {
-        panic!("WSK kernel build prerequisites are unavailable: {error}");
+        #[cfg(target_os = "windows")]
+        if let Err(error) = configure_kernel_build() {
+            panic!("WSK kernel build prerequisites are unavailable: {error}");
+        }
     }
 }
 
+#[cfg(target_os = "windows")]
+const WDK_VERSION: &str = "10.0.28000.2526";
+#[cfg(target_os = "windows")]
+const WDK_PACKAGE_X64: &str = "microsoft.windows.wdk.x64";
+#[cfg(target_os = "windows")]
+const WDK_PACKAGE_ARM64: &str = "microsoft.windows.wdk.arm64";
+#[cfg(target_os = "windows")]
+const SDK_PACKAGE: &str = "microsoft.windows.sdk.cpp";
+
+#[cfg(target_os = "windows")]
 fn configure_kernel_build() -> Result<(), String> {
     let arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
     let package = match arch.as_str() {
@@ -126,6 +133,7 @@ fn configure_kernel_build() -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(target_os = "windows")]
 fn locate_wdk_root(package: &str) -> Result<PathBuf, String> {
     let mut candidates = Vec::new();
     if let Some(root) = env::var_os("SSP_WSK_WDK_ROOT") {
@@ -153,6 +161,7 @@ fn locate_wdk_root(package: &str) -> Result<PathBuf, String> {
         })
 }
 
+#[cfg(target_os = "windows")]
 fn locate_sdk_root() -> Option<PathBuf> {
     env::var_os("SSP_WSK_SDK_ROOT")
         .map(PathBuf::from)
@@ -162,6 +171,7 @@ fn locate_sdk_root() -> Option<PathBuf> {
         .find(|root| has_header(root, "ws2def.h"))
 }
 
+#[cfg(target_os = "windows")]
 fn nuget_package_root(package: &str) -> Option<PathBuf> {
     let root = env::var_os("SSP_WSK_NUGET_ROOT")
         .or_else(|| env::var_os("NUGET_PACKAGES"))
@@ -178,6 +188,7 @@ fn nuget_package_root(package: &str) -> Option<PathBuf> {
     )
 }
 
+#[cfg(target_os = "windows")]
 fn normalize_content_root(root: PathBuf) -> PathBuf {
     if root.join("Include").is_dir() {
         root
@@ -188,10 +199,12 @@ fn normalize_content_root(root: PathBuf) -> PathBuf {
     }
 }
 
+#[cfg(target_os = "windows")]
 fn has_header(root: &Path, header: &str) -> bool {
     include_directory(root, header).is_ok()
 }
 
+#[cfg(target_os = "windows")]
 fn include_directory(root: &Path, header: &str) -> Result<PathBuf, String> {
     let include = root.join("Include");
     let entries = fs::read_dir(&include)

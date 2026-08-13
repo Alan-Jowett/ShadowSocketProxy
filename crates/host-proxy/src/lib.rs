@@ -43,6 +43,8 @@ pub mod wsk;
 const TCP_PROTOCOL: u8 = 6;
 /// IP protocol number used in UDP mapping lookups.
 const UDP_PROTOCOL: u8 = 17;
+/// TCP flow-state bit indicating that a reset was observed.
+const TCP_RST_FLAG: u32 = 1 << 4;
 /// Upper bound for a host-issued control RPC or maintenance operation.
 const CONTROL_RPC_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -459,6 +461,22 @@ fn duration_to_nanos(duration: Duration, name: &str) -> Result<u64, ProxyError> 
     })
 }
 
+/// Returns whether an enumerated flow has exceeded its safe cleanup deadline.
+fn flow_is_expired(
+    is_tcp: bool,
+    tcp_state_flags: u32,
+    terminal: bool,
+    age_ns: u64,
+    idle_threshold_ns: u64,
+    tcp_terminal_grace_ns: u64,
+) -> bool {
+    let reset_expired =
+        is_tcp && tcp_state_flags & TCP_RST_FLAG != 0 && age_ns >= tcp_terminal_grace_ns;
+    reset_expired
+        || (!terminal && age_ns >= idle_threshold_ns)
+        || (terminal && age_ns >= tcp_terminal_grace_ns)
+}
+
 /// Runs a control operation with a local deadline and cooperative shutdown.
 async fn control_operation<T>(
     shutdown: &mut watch::Receiver<bool>,
@@ -538,9 +556,14 @@ async fn run_maintenance<C: MappingClient + FlowClient + 'static>(
                         } else {
                             idle_ttl_ns
                         };
-                        let expired = flow.tcp_state_flags & (1 << 4) != 0
-                            || (!terminal && age >= idle_threshold)
-                            || (terminal && age >= tcp_terminal_grace_ns);
+                        let expired = flow_is_expired(
+                            tcp,
+                            flow.tcp_state_flags,
+                            terminal,
+                            age,
+                            idle_threshold,
+                            tcp_terminal_grace_ns,
+                        );
                         if expired {
                             pending_deletes.insert((flow.flow_id, flow.generation), flow);
                         }
@@ -4234,6 +4257,18 @@ mod tests {
             .await
             .expect("shutdown cancels the pending maintenance RPC")
             .unwrap();
+    }
+
+    #[test]
+    fn reset_flow_waits_for_tcp_grace_after_recent_activity() {
+        assert!(!flow_is_expired(true, TCP_RST_FLAG, false, 29, 60, 30));
+        assert!(flow_is_expired(true, TCP_RST_FLAG, false, 30, 60, 30));
+    }
+
+    #[test]
+    fn non_reset_flow_keeps_existing_idle_expiry() {
+        assert!(!flow_is_expired(true, 0, false, 59, 60, 30));
+        assert!(flow_is_expired(true, 0, false, 60, 60, 30));
     }
 
     #[test]

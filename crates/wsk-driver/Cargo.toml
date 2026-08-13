@@ -17,6 +17,8 @@ crate-type = ["cdylib", "rlib"]
 
 [build-dependencies]
 bindgen = "0.71.1"
+
+[target.'cfg(target_os = "windows")'.build-dependencies]
 wdk-build = "0.5.1"
 
 [target.'cfg(target_os = "windows")'.dependencies]
