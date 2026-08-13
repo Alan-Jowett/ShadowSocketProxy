@@ -178,6 +178,26 @@ Build the user-mode proxy and kernel driver from an elevated Windows
 PowerShell prompt. The driver target must match the installed WDK
 architecture:
 
+The repository also provides a script that sets the pinned WDK, SDK, and
+LLVM environment variables and builds both artifacts:
+
+```powershell
+.\scripts\build-wsk.ps1
+```
+
+Use `-Clean` after changing WDK/SDK roots. Add `-SignDriver` to sign the
+driver, or `-EnableTestSigning` to sign it and enable Windows test signing:
+
+```powershell
+.\scripts\build-wsk.ps1 -Clean -EnableTestSigning
+```
+
+The script also discovers the Windows OpenSSL development installation used by
+the `tls-psk` host build. Set `OPENSSL_DIR` and, when necessary,
+`OPENSSL_LIB_DIR` to override discovery.
+
+To run the individual build commands manually:
+
 ```powershell
 $env:WDKContentRoot = "$env:USERPROFILE\.nuget\packages\microsoft.windows.wdk.x64\10.0.28000.2526\c"
 
