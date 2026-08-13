@@ -1865,11 +1865,11 @@ fn create_outbound_datagram(
     let (family, context) = match original.address_family {
         4 => (
             AF_INET,
-            core::ptr::addr_of_mut!(FLOW_SLOTS[index].outbound_context).cast(),
+            unsafe { core::ptr::addr_of_mut!(FLOW_SLOTS[index].outbound_context).cast() },
         ),
         6 => (
             AF_INET6,
-            core::ptr::addr_of_mut!(FLOW_SLOTS[index].outbound_context).cast(),
+            unsafe { core::ptr::addr_of_mut!(FLOW_SLOTS[index].outbound_context).cast() },
         ),
         _ => return None,
     };
@@ -2461,15 +2461,7 @@ unsafe extern "C" fn wsk_receive_event(
         return STATUS_SUCCESS;
     };
     if entry.key.synthetic.protocol as u32 == IPPROTO_UDP {
-        let (outbound, listener) = {
-            let _lock = lock_flow_table();
-            unsafe { (FLOW_SLOTS[index].outbound, FLOW_SLOTS[index].udp_listener) }
-        };
-        if !forward_datagram_to_client(index, outbound, listener, data_indication) {
-            begin_flow_close_async(index);
-        } else {
-            touch_flow(index);
-        }
+        begin_flow_close_async(index);
         return STATUS_SUCCESS;
     }
     if entry.state != FlowState::Mapped {
@@ -2561,7 +2553,7 @@ fn forward_datagram_to_outbound(
             )
         };
         if remote_family == 4 {
-            let remote = SockAddrIn {
+            let mut remote = SockAddrIn {
                 family: AF_INET,
                 port: remote_port.to_be(),
                 address: [
@@ -2576,13 +2568,13 @@ fn forward_datagram_to_outbound(
                 destination,
                 &mut buffer,
                 0,
-                (&remote as *const SockAddrIn).cast(),
+                (&mut remote as *mut SockAddrIn).cast(),
                 0,
                 null_mut(),
                 irp.cast(),
             )
         } else if remote_family == 6 {
-            let remote = SockAddrIn6 {
+            let mut remote = SockAddrIn6 {
                 family: AF_INET6,
                 port: remote_port.to_be(),
                 flow_info: 0,
@@ -2593,7 +2585,7 @@ fn forward_datagram_to_outbound(
                 destination,
                 &mut buffer,
                 0,
-                (&remote as *const SockAddrIn6).cast(),
+                (&mut remote as *mut SockAddrIn6).cast(),
                 0,
                 null_mut(),
                 irp.cast(),
@@ -2609,7 +2601,7 @@ fn forward_datagram_to_client(
     index: usize,
     source: wsk::PWSK_SOCKET,
     destination: wsk::PWSK_SOCKET,
-    indication: wsk::PWSK_DATA_INDICATION,
+    indication: wsk::PWSK_DATAGRAM_INDICATION,
 ) -> bool {
     if source.is_null() || destination.is_null() || indication.is_null() {
         return false;
@@ -2634,7 +2626,7 @@ fn forward_datagram_to_client(
         return false;
     }
     context.source = source;
-    context.indication = indication.cast();
+    context.indication = indication;
     let status = unsafe {
         IoSetCompletionRoutineEx(
             DEVICE_OBJECT,
