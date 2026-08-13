@@ -209,6 +209,10 @@ static WSK_CLIENT_DATAGRAM_DISPATCH: wsk::WSK_CLIENT_DATAGRAM_DISPATCH =
     wsk::WSK_CLIENT_DATAGRAM_DISPATCH {
         WskReceiveFromEvent: Some(wsk_receive_from_event),
     };
+static WSK_CLIENT_OUTBOUND_DATAGRAM_DISPATCH: wsk::WSK_CLIENT_DATAGRAM_DISPATCH =
+    wsk::WSK_CLIENT_DATAGRAM_DISPATCH {
+        WskReceiveFromEvent: Some(wsk_outbound_receive_from_event),
+    };
 static WSK_CLIENT_CONNECTION_DISPATCH: wsk::WSK_CLIENT_CONNECTION_DISPATCH =
     wsk::WSK_CLIENT_CONNECTION_DISPATCH {
         WskReceiveEvent: Some(wsk_receive_event),
@@ -314,6 +318,9 @@ struct FlowSocketSlot {
     udp_listener: wsk::PWSK_SOCKET,
     client_address: [u8; 28],
     client_len: u8,
+    udp_remote_address: [u8; 16],
+    udp_remote_port: u16,
+    udp_remote_family: u8,
     close_pending: u8,
     inbound_context: FlowCallbackContext,
     outbound_context: FlowCallbackContext,
@@ -345,6 +352,9 @@ impl FlowSocketSlot {
             udp_listener: null_mut(),
             client_address: [0; 28],
             client_len: 0,
+            udp_remote_address: [0; 16],
+            udp_remote_port: 0,
+            udp_remote_family: 0,
             close_pending: 0,
             inbound_context: FlowCallbackContext {
                 slot: null_mut(),
@@ -1581,6 +1591,9 @@ fn reserve_flow(
                 slot.udp_listener = udp_listener;
                 slot.client_address = client_address;
                 slot.client_len = client_len;
+                slot.udp_remote_address = [0; 16];
+                slot.udp_remote_port = 0;
+                slot.udp_remote_family = 0;
                 slot.close_pending = 0;
                 slot.inbound_forward = StreamForwardContext::new();
                 slot.outbound_forward = StreamForwardContext::new();
@@ -1644,6 +1657,9 @@ fn reset_flow_slot(slot: &mut FlowSocketSlot) {
     slot.udp_listener = null_mut();
     slot.client_address = [0; 28];
     slot.client_len = 0;
+    slot.udp_remote_address = [0; 16];
+    slot.udp_remote_port = 0;
+    slot.udp_remote_family = 0;
     slot.close_pending = 0;
     slot.inbound_forward = StreamForwardContext::new();
     slot.outbound_forward = StreamForwardContext::new();
@@ -1794,6 +1810,16 @@ fn handle_mapping_completion(completion: &abi::MappingCompletion) -> abi::Status
         close_slot_sync(index);
         return error.status();
     }
+    if completion.original.protocol == IPPROTO_UDP as u8 {
+        let _lock = lock_flow_table();
+        unsafe {
+            if let Some(slot) = flow_slot(index) {
+                slot.udp_remote_address = completion.original.destination_address;
+                slot.udp_remote_port = completion.original.destination_port;
+                slot.udp_remote_family = completion.original.address_family;
+            }
+        }
+    }
     {
         let _lock = lock_flow_table();
         if unsafe { !FLOW_TABLE.mark_completing(index, entry.request_id, entry.generation) } {
@@ -1831,7 +1857,102 @@ fn handle_mapping_completion(completion: &abi::MappingCompletion) -> abi::Status
     abi::Status::Ok
 }
 
+fn create_outbound_datagram(
+    original: &abi::MappingTuple,
+    index: usize,
+) -> Option<wsk::PWSK_SOCKET> {
+    let (family, context) = match original.address_family {
+        4 => (
+            AF_INET,
+            core::ptr::addr_of_mut!(FLOW_SLOTS[index].outbound_context).cast(),
+        ),
+        6 => (
+            AF_INET6,
+            core::ptr::addr_of_mut!(FLOW_SLOTS[index].outbound_context).cast(),
+        ),
+        _ => return None,
+    };
+    let socket = create_wsk_socket(
+        family,
+        SOCK_DGRAM,
+        IPPROTO_UDP,
+        WSK_FLAG_DATAGRAM_SOCKET,
+        context,
+        (&WSK_CLIENT_OUTBOUND_DATAGRAM_DISPATCH as *const wsk::WSK_CLIENT_DATAGRAM_DISPATCH).cast(),
+    )?;
+    if !bind_ephemeral_datagram(socket, family, index)
+        || !enable_socket_event_callbacks(socket, WSK_EVENT_RECEIVE_FROM)
+    {
+        let _ = close_socket_sync(socket);
+        return None;
+    }
+    debug_connect_result(
+        b"WskSocket UDP success\0",
+        index,
+        STATUS_SUCCESS,
+        socket as usize as u64,
+    );
+    Some(socket)
+}
+
+fn bind_ephemeral_datagram(socket: wsk::PWSK_SOCKET, family: u16, index: usize) -> bool {
+    if socket.is_null() || unsafe { (*socket).Dispatch.is_null() } {
+        return false;
+    }
+    let dispatch = unsafe { (*socket).Dispatch as *const wsk::WSK_PROVIDER_DATAGRAM_DISPATCH };
+    let Some(bind) = (unsafe { (*dispatch).WskBind }) else {
+        return false;
+    };
+    let result = if family == AF_INET {
+        let mut address = SockAddrIn {
+            family,
+            port: 0,
+            address: [0; 4],
+            zero: [0; 8],
+        };
+        synchronous_wsk_call(|irp| unsafe {
+            bind(
+                socket,
+                (&mut address as *mut SockAddrIn).cast(),
+                0,
+                irp.cast(),
+            )
+        })
+    } else {
+        let mut address = SockAddrIn6 {
+            family,
+            port: 0,
+            flow_info: 0,
+            address: [0; 16],
+            scope_id: 0,
+        };
+        synchronous_wsk_call(|irp| unsafe {
+            bind(
+                socket,
+                (&mut address as *mut SockAddrIn6).cast(),
+                0,
+                irp.cast(),
+            )
+        })
+    };
+    match result {
+        Ok((status, _)) if status == STATUS_SUCCESS => true,
+        Ok((status, information)) => {
+            debug_connect_result(b"WskSocket UDP bind\0", index, status, information);
+            false
+        }
+        Err(status) => {
+            debug_connect_result(b"WskSocket UDP bind dispatch\0", index, status, 0);
+            false
+        }
+    }
+}
+
 fn create_outbound_socket(original: &abi::MappingTuple, index: usize) -> Option<wsk::PWSK_SOCKET> {
+    if original.protocol == IPPROTO_UDP as u8 {
+        debug_connect_attempt(original, index, SOCK_DGRAM);
+        return create_outbound_datagram(original, index);
+    }
     let Some(provider) = provider_npi() else {
         debug_status(b"outbound provider_npi\0", STATUS_NOT_SUPPORTED);
         return None;
@@ -2272,6 +2393,40 @@ unsafe extern "C" fn wsk_receive_from_event(
     STATUS_SUCCESS
 }
 
+unsafe extern "C" fn wsk_outbound_receive_from_event(
+    socket_context: PVOID,
+    _flags: u32,
+    data_indication: wsk::PWSK_DATAGRAM_INDICATION,
+) -> NTSTATUS {
+    if socket_context.is_null() || data_indication.is_null() {
+        return STATUS_SUCCESS;
+    }
+    let callback = unsafe { &*socket_context.cast::<FlowCallbackContext>() };
+    let index = flow_slot_index(callback.slot);
+    if index >= FLOW_TABLE_CAPACITY {
+        return STATUS_SUCCESS;
+    }
+    let (outbound, listener, mapped) = {
+        let _lock = lock_flow_table();
+        unsafe {
+            (
+                FLOW_SLOTS[index].outbound,
+                FLOW_SLOTS[index].udp_listener,
+                FLOW_TABLE
+                    .get(index)
+                    .map(|entry| entry.state == FlowState::Mapped)
+                    .unwrap_or(false),
+            )
+        }
+    };
+    if !mapped || !forward_datagram_to_client(index, outbound, listener, data_indication) {
+        begin_flow_close_async(index);
+    } else {
+        touch_flow(index);
+    }
+    STATUS_SUCCESS
+}
+
 unsafe extern "C" fn wsk_receive_event(
     socket_context: PVOID,
     _flags: u32,
@@ -2354,12 +2509,11 @@ fn forward_datagram_to_outbound(
     if source.is_null() || destination.is_null() || indication.is_null() {
         return false;
     }
-    let dispatch =
-        unsafe { (*destination).Dispatch as *const wsk::WSK_PROVIDER_CONNECTION_DISPATCH };
+    let dispatch = unsafe { (*destination).Dispatch as *const wsk::WSK_PROVIDER_DATAGRAM_DISPATCH };
     if dispatch.is_null() {
         return false;
     }
-    let Some(send) = (unsafe { (*dispatch).WskSend }) else {
+    let Some(send_to) = (unsafe { (*dispatch).WskSendTo }) else {
         return false;
     };
     let irp = unsafe { IoAllocateIrp(1, 0) };
@@ -2395,7 +2549,58 @@ fn forward_datagram_to_outbound(
         return false;
     }
     let mut buffer = unsafe { (*indication).Buffer };
-    let status = unsafe { send(destination, &mut buffer, 0, irp.cast()) };
+    let status = unsafe {
+        let (remote_address, remote_port, remote_family) = {
+            let _lock = lock_flow_table();
+            let slot = &FLOW_SLOTS[index];
+            (
+                slot.udp_remote_address,
+                slot.udp_remote_port,
+                slot.udp_remote_family,
+            )
+        };
+        if remote_family == 4 {
+            let remote = SockAddrIn {
+                family: AF_INET,
+                port: remote_port.to_be(),
+                address: [
+                    remote_address[0],
+                    remote_address[1],
+                    remote_address[2],
+                    remote_address[3],
+                ],
+                zero: [0; 8],
+            };
+            send_to(
+                destination,
+                &mut buffer,
+                0,
+                (&remote as *const SockAddrIn).cast(),
+                0,
+                null_mut(),
+                irp.cast(),
+            )
+        } else if remote_family == 6 {
+            let remote = SockAddrIn6 {
+                family: AF_INET6,
+                port: remote_port.to_be(),
+                flow_info: 0,
+                address: remote_address,
+                scope_id: 0,
+            };
+            send_to(
+                destination,
+                &mut buffer,
+                0,
+                (&remote as *const SockAddrIn6).cast(),
+                0,
+                null_mut(),
+                irp.cast(),
+            )
+        } else {
+            STATUS_INVALID_PARAMETER
+        }
+    };
     status == STATUS_SUCCESS || status == STATUS_PENDING
 }
 
@@ -2498,17 +2703,11 @@ unsafe extern "C" fn datagram_response_completion(
     if !context.is_null() {
         let forward = unsafe { &mut *context.cast::<DatagramForwardContext>() };
         if !forward.source.is_null() && !forward.indication.is_null() {
-            let dispatch = unsafe {
-                (*forward.source).Dispatch as *const wsk::WSK_PROVIDER_CONNECTION_DISPATCH
-            };
+            let dispatch =
+                unsafe { (*forward.source).Dispatch as *const wsk::WSK_PROVIDER_DATAGRAM_DISPATCH };
             if !dispatch.is_null() {
                 if let Some(release) = unsafe { (*dispatch).WskRelease } {
-                    let _ = unsafe {
-                        release(
-                            forward.source,
-                            forward.indication.cast::<wsk::WSK_DATA_INDICATION>(),
-                        )
-                    };
+                    let _ = unsafe { release(forward.source, forward.indication) };
                 }
             }
         }
