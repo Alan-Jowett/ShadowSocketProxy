@@ -103,7 +103,12 @@ try {
         'tls-psk,wsk'
     )
 
-    $driverPath = Join-Path $repoRoot "target\$driverTarget\release\shadow_socket_proxy_wsk_driver.dll"
+    $driverDllPath = Join-Path $repoRoot "target\$driverTarget\release\shadow_socket_proxy_wsk_driver.dll"
+    $driverPath = Join-Path $repoRoot "target\$driverTarget\release\shadow_socket_proxy_wsk_driver.sys"
+    if (Test-Path -LiteralPath $driverPath) {
+        Remove-Item -LiteralPath $driverPath -Force
+    }
+    Move-Item -LiteralPath $driverDllPath -Destination $driverPath
     $hostPath = Join-Path $repoRoot 'target\release\shadow-socket-proxy-host.exe'
 
     if ($SignDriver -or $EnableTestSigning) {

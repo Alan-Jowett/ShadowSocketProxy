@@ -10,7 +10,7 @@ extern crate std;
 /// Fixed-layout device messages and validation.
 pub mod abi;
 /// User-mode IOCTL transport and broker lifecycle.
-#[cfg(not(feature = "kernel"))]
+#[cfg(any(not(feature = "kernel"), not(target_os = "windows")))]
 pub mod broker;
 /// Allocation-free bounded flow-table state used by the WSK implementation.
 pub mod flow_table;

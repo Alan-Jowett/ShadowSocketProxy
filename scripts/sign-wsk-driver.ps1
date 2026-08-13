@@ -2,7 +2,7 @@
 
 [CmdletBinding()]
 param(
-    [string]$DriverPath = (Join-Path (Get-Location) 'target\x86_64-pc-windows-msvc\release\shadow_socket_proxy_wsk_driver.dll'),
+    [string]$DriverPath = (Join-Path (Get-Location) 'target\x86_64-pc-windows-msvc\release\shadow_socket_proxy_wsk_driver.sys'),
     [string]$Subject = 'CN=ShadowSocketProxy WSK Test Driver',
     [switch]$EnableTestSigning
 )
@@ -43,46 +43,23 @@ if ($null -eq $certificate) {
         -CertStoreLocation Cert:\LocalMachine\My
 }
 
-$temporaryRoot = Join-Path $env:TEMP ("ssp-wsk-sign-" + [guid]::NewGuid())
-$pfxPath = Join-Path $temporaryRoot 'driver-signing.pfx'
-$cerPath = Join-Path $temporaryRoot 'driver-signing.cer'
-New-Item -ItemType Directory -Path $temporaryRoot | Out-Null
-
-try {
-    $plainPassword = Read-Host 'Enter a temporary password for the signing PFX'
-    $password = ConvertTo-SecureString $plainPassword -AsPlainText -Force
-    $pfxArguments = @{
-        Cert = $certificate
-        FilePath = $pfxPath
-    }
-    $pfxArguments['Password'] = $password
-    Export-PfxCertificate @pfxArguments | Out-Null
-    Export-Certificate -Cert $certificate -FilePath $cerPath | Out-Null
-
-    Import-Certificate -FilePath $cerPath -CertStoreLocation Cert:\LocalMachine\Root | Out-Null
-    Import-Certificate -FilePath $cerPath -CertStoreLocation Cert:\LocalMachine\TrustedPublisher | Out-Null
-
-    & $signTool.FullName sign /v /fd SHA256 /f $pfxPath /p $plainPassword $DriverPath
-    if ($LASTEXITCODE -ne 0) {
-        throw "signtool sign failed with exit code $LASTEXITCODE"
-    }
-
-    & $signTool.FullName verify /pa /v $DriverPath
-    if ($LASTEXITCODE -ne 0) {
-        throw "signtool verify failed with exit code $LASTEXITCODE"
-    }
-
-    if ($EnableTestSigning) {
-        & bcdedit.exe /set testsigning on
-        if ($LASTEXITCODE -ne 0) {
-            throw "bcdedit failed with exit code $LASTEXITCODE"
-        }
-        Write-Host 'Test signing was enabled. Reboot Windows before starting the driver.'
-    }
-
-    Write-Host "Signed driver: $DriverPath"
-    Write-Host "Certificate: $($certificate.Thumbprint)"
+& $signTool.FullName sign /v /fd SHA256 /sm /sha1 $certificate.Thumbprint $DriverPath
+if ($LASTEXITCODE -ne 0) {
+    throw "signtool sign failed with exit code $LASTEXITCODE"
 }
-finally {
-    Remove-Item -LiteralPath $temporaryRoot -Recurse -Force -ErrorAction SilentlyContinue
+
+& $signTool.FullName verify /kp /v $DriverPath
+if ($LASTEXITCODE -ne 0) {
+    throw "kernel-mode signtool verification failed with exit code $LASTEXITCODE"
 }
+
+if ($EnableTestSigning) {
+    & bcdedit.exe /set testsigning on
+    if ($LASTEXITCODE -ne 0) {
+        throw "bcdedit failed with exit code $LASTEXITCODE"
+    }
+    Write-Host 'Test signing was enabled. Reboot Windows before starting the driver.'
+}
+
+Write-Host "Signed driver: $DriverPath"
+Write-Host "Certificate: $($certificate.Thumbprint)"

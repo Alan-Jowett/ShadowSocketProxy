@@ -158,6 +158,8 @@ pub struct AbiHeader {
     pub status: u32,
     /// Session identity.
     pub session_nonce: SessionNonce,
+    /// Explicitly zeroed replacement for the C ABI alignment padding.
+    pub reserved: u32,
     /// Request identity.
     pub request_id: RequestId,
     /// Request incarnation.
@@ -179,6 +181,7 @@ impl AbiHeader {
             opcode: opcode as u32,
             status: Status::Ok as u32,
             session_nonce: nonce,
+            reserved: 0,
             request_id,
             generation,
         }
@@ -199,6 +202,7 @@ impl AbiHeader {
             opcode: opcode as u32,
             status: status as u32,
             session_nonce: nonce,
+            reserved: 0,
             request_id,
             generation,
         }
@@ -214,6 +218,9 @@ impl AbiHeader {
         }
         if self.status != Status::Ok as u32 {
             return Err(AbiError::InvalidStatus(self.status));
+        }
+        if self.reserved != 0 {
+            return Err(AbiError::InvalidAbi);
         }
         Ok(())
     }

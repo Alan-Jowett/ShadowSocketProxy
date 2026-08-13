@@ -115,7 +115,7 @@ fn configure_kernel_build() -> Result<(), String> {
         .allowlist_var("NPI_WSK_INTERFACE_ID")
         .allowlist_function("Wsk(Register|CaptureProviderNPI|ReleaseProviderNPI|Deregister)")
         .generate_comments(false)
-        .layout_tests(false);
+        .layout_tests(true);
     let bindings = builder
         .generate()
         .map_err(|error| format!("bindgen failed for ws2.h/ws2def.h/wsk.h: {error}"))?;
@@ -145,10 +145,6 @@ fn locate_wdk_root(package: &str) -> Result<PathBuf, String> {
     if let Some(root) = nuget_package_root(package) {
         candidates.push(root);
     }
-    if let Some(program_files) = env::var_os("ProgramFiles") {
-        candidates.push(PathBuf::from(program_files).join("Windows Kits\\10"));
-    }
-
     candidates
         .into_iter()
         .map(normalize_content_root)

@@ -234,7 +234,7 @@ and signs the driver with the Windows SDK `signtool`:
 
 ```powershell
 .\scripts\sign-wsk-driver.ps1 `
-  -DriverPath .\target\x86_64-pc-windows-msvc\release\shadow_socket_proxy_wsk_driver.dll `
+  -DriverPath .\target\x86_64-pc-windows-msvc\release\shadow_socket_proxy_wsk_driver.sys `
   -EnableTestSigning
 ```
 
@@ -244,7 +244,7 @@ reboot, install the driver as a kernel service from an elevated prompt:
 
 ```powershell
 sc.exe create ShadowSocketProxyWsk type= kernel start= demand `
-  binPath= "$PWD\target\x86_64-pc-windows-msvc\release\shadow_socket_proxy_wsk_driver.dll"
+  binPath= "$PWD\target\x86_64-pc-windows-msvc\release\shadow_socket_proxy_wsk_driver.sys"
 sc.exe start ShadowSocketProxyWsk
 ```
 
@@ -274,7 +274,7 @@ automatically. Verify the service path and driver timestamp before retrying:
 
 ```powershell
 sc.exe qc ShadowSocketProxyWsk
-Get-Item .\target\x86_64-pc-windows-msvc\release\shadow_socket_proxy_wsk_driver.dll |
+Get-Item .\target\x86_64-pc-windows-msvc\release\shadow_socket_proxy_wsk_driver.sys |
   Select-Object FullName, LastWriteTime, Length
 ```
 

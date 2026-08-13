@@ -71,7 +71,7 @@ const WSK_SET_STATIC_EVENT_CALLBACKS: u32 = wsk::WSK_SET_STATIC_EVENT_CALLBACKS;
 const WSK_SET_OPTION: i32 = wsk::WSK_CONTROL_SOCKET_TYPE::WskSetOption;
 const SO_WSK_EVENT_CALLBACK: u32 = 0x4002;
 const SOL_SOCKET: u32 = 0xffff;
-const WSK_INFINITE_WAIT: u32 = wsk::WSK_INFINITE_WAIT;
+const WSK_CAPTURE_TIMEOUT_MS: u32 = 10_000;
 const TIMER_PERIOD_MS: i32 = 1_000;
 const TIMER_PERIOD_100NS: i64 = 10_000_000;
 const MAPPING_TIMEOUT_100NS: u64 = abi::MAPPING_TIMEOUT_MS * 10_000;
@@ -83,6 +83,7 @@ const NORMAL_PAGE_PRIORITY: u32 = 16;
 const MDL_MAPPING_NO_EXECUTE: u32 = 0x4000_0000;
 const FORWARD_POOL_TAG: u32 = u32::from_ne_bytes(*b"FpsS");
 const UDP_PENDING_BYTES_LIMIT: usize = 64 * 1024;
+const FORWARD_PENDING_BYTES_LIMIT: usize = 1024 * 1024;
 
 const fn wide<const N: usize>(bytes: &[u8; N]) -> [u16; N] {
     let mut output = [0u16; N];
@@ -280,6 +281,7 @@ static SESSION_NONCE: [AtomicU64; 4] = [
 ];
 static SESSION_REQUEST_ID: AtomicU64 = AtomicU64::new(0);
 static SESSION_GENERATION: AtomicU64 = AtomicU64::new(0);
+static SESSION_OWNER: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
 static NONCE_SEED: AtomicU32 = AtomicU32::new(0x9E37_79B9);
 
 static PENDING_MAPPING_IRP: AtomicPtr<wdk_sys::IRP> = AtomicPtr::new(null_mut());
@@ -299,6 +301,7 @@ struct OwnedForwardBuffer {
 struct ForwardIrpContext {
     slot: *mut FlowSocketSlot,
     packet: *mut OwnedForwardBuffer,
+    length: usize,
     remote_address: [u8; 28],
 }
 
@@ -316,6 +319,7 @@ struct FlowSocketSlot {
     close_pending: u32,
     submit_in_progress: u32,
     forward_pending: u32,
+    forward_pending_bytes: usize,
     forward_failed: bool,
     pending_udp_head: *mut OwnedForwardBuffer,
     pending_udp_tail: *mut OwnedForwardBuffer,
@@ -353,6 +357,7 @@ impl FlowSocketSlot {
             close_pending: 0,
             submit_in_progress: 0,
             forward_pending: 0,
+            forward_pending_bytes: 0,
             forward_failed: false,
             pending_udp_head: null_mut(),
             pending_udp_tail: null_mut(),
@@ -446,7 +451,6 @@ pub unsafe extern "system" fn driver_entry(
         (*driver).MajorFunction[IRP_MJ_CLOSE] = Some(dispatch_close);
         (*driver).MajorFunction[IRP_MJ_CLEANUP] = Some(dispatch_cleanup);
         (*driver).MajorFunction[IRP_MJ_DEVICE_CONTROL] = Some(dispatch_device_control);
-        (*device).Flags &= !DO_DEVICE_INITIALIZING;
     }
 
     let status = register_wsk();
@@ -458,6 +462,9 @@ pub unsafe extern "system" fn driver_entry(
             DEVICE_OBJECT = null_mut();
         }
         return status;
+    }
+    unsafe {
+        (*device).Flags &= !DO_DEVICE_INITIALIZING;
     }
     STATUS_SUCCESS
 }
@@ -480,13 +487,31 @@ unsafe extern "C" fn dispatch_create(_device: PDEVICE_OBJECT, irp: PIRP) -> NTST
 }
 
 unsafe extern "C" fn dispatch_close(_device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    clear_session();
+    clear_session_if_owner(irp_file_object(irp));
     complete_irp(irp, STATUS_SUCCESS, 0)
 }
 
 unsafe extern "C" fn dispatch_cleanup(_device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
-    clear_session();
+    clear_session_if_owner(irp_file_object(irp));
     complete_irp(irp, STATUS_SUCCESS, 0)
+}
+
+fn irp_file_object(irp: PIRP) -> *mut c_void {
+    if irp.is_null() {
+        return null_mut();
+    }
+    let stack = unsafe {
+        (*irp)
+            .Tail
+            .Overlay
+            .__bindgen_anon_2
+            .__bindgen_anon_1
+            .CurrentStackLocation
+    };
+    if stack.is_null() {
+        return null_mut();
+    }
+    unsafe { (*stack).FileObject.cast() }
 }
 
 unsafe extern "C" fn dispatch_device_control(_device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
@@ -553,6 +578,7 @@ fn dispatch_open_session(
     }
 
     let request = read_value::<abi::OpenSessionRequest>(buffer, input_length);
+    let owner = irp_file_object(irp);
     let (request_header, validation) = match request {
         Some(request) => {
             let validation = validate_open_request(&request);
@@ -579,10 +605,14 @@ fn dispatch_open_session(
     };
     let mut nonce = abi::SessionNonce::zero();
     if status == Some(abi::Status::Ok) {
-        if SESSION_ACTIVE.load(Ordering::Acquire) || SESSION_TEARDOWN.load(Ordering::Acquire) {
+        if owner.is_null() {
+            status = Some(abi::Status::InvalidState);
+        } else if SESSION_ACTIVE.load(Ordering::Acquire) || SESSION_TEARDOWN.load(Ordering::Acquire)
+        {
             status = Some(abi::Status::InvalidState);
         } else {
             nonce = generate_nonce();
+            SESSION_OWNER.store(owner, Ordering::Release);
             store_nonce(nonce);
             SESSION_REQUEST_ID.store(request_header.request_id.0, Ordering::Release);
             SESSION_GENERATION.store(request_header.generation.0, Ordering::Release);
@@ -651,6 +681,8 @@ fn dispatch_close_session(
                 status = Some(abi::Status::InvalidState);
             } else if request_header.session_nonce != active_nonce {
                 status = Some(abi::Status::InvalidSession);
+            } else if SESSION_OWNER.load(Ordering::Acquire) != irp_file_object(irp) {
+                status = Some(abi::Status::InvalidSession);
             } else {
                 let previous_request_id =
                     abi::RequestId(SESSION_REQUEST_ID.load(Ordering::Acquire));
@@ -664,6 +696,7 @@ fn dispatch_close_session(
                 } else {
                     SESSION_TEARDOWN.store(true, Ordering::Release);
                     SESSION_ACTIVE.store(false, Ordering::Release);
+                    SESSION_OWNER.store(null_mut(), Ordering::Release);
                     store_nonce(abi::SessionNonce::zero());
                     SESSION_REQUEST_ID.store(0, Ordering::Release);
                     SESSION_GENERATION.store(0, Ordering::Release);
@@ -954,6 +987,7 @@ fn clear_session() {
         }
         SESSION_TEARDOWN.store(true, Ordering::Release);
         SESSION_ACTIVE.store(false, Ordering::Release);
+        SESSION_OWNER.store(null_mut(), Ordering::Release);
         store_nonce(abi::SessionNonce::zero());
         SESSION_REQUEST_ID.store(0, Ordering::Release);
         SESSION_GENERATION.store(0, Ordering::Release);
@@ -965,6 +999,12 @@ fn clear_session() {
     fail_active_flow_sync();
     let _lock = lock_session();
     SESSION_TEARDOWN.store(false, Ordering::Release);
+}
+
+fn clear_session_if_owner(owner: *mut c_void) {
+    if SESSION_OWNER.load(Ordering::Acquire) == owner {
+        clear_session();
+    }
 }
 
 fn generate_nonce() -> abi::SessionNonce {
@@ -1460,18 +1500,20 @@ fn expire_mapping_state() {
         }
     }
 
-    let mut expired = [false; FLOW_TABLE_CAPACITY];
+    let mut expired = [(abi::RequestId(0), abi::Generation(0)); FLOW_TABLE_CAPACITY];
     {
         let _lock = lock_flow_table();
         for index in 0..FLOW_TABLE_CAPACITY {
             if unsafe { FLOW_SLOTS[index].forward_failed || FLOW_TABLE.is_expired(index, now) } {
-                expired[index] = true;
+                if let Some(entry) = unsafe { FLOW_TABLE.get(index) } {
+                    expired[index] = (entry.request_id, entry.generation);
+                }
             }
         }
     }
-    for (index, is_expired) in expired.iter().enumerate() {
-        if *is_expired {
-            begin_flow_close_async(index);
+    for (index, (request_id, generation)) in expired.iter().enumerate() {
+        if request_id.0 != 0 {
+            begin_flow_close_async_if_identity(index, *request_id, *generation);
         }
     }
 }
@@ -1662,6 +1704,7 @@ fn reserve_flow(
                 slot.close_pending = 0;
                 slot.submit_in_progress = 0;
                 slot.forward_pending = 0;
+                slot.forward_pending_bytes = 0;
                 slot.forward_failed = false;
                 slot.pending_udp_head = null_mut();
                 slot.pending_udp_tail = null_mut();
@@ -1731,6 +1774,7 @@ fn reset_flow_slot(slot: &mut FlowSocketSlot) {
     slot.close_pending = 0;
     slot.submit_in_progress = 0;
     slot.forward_pending = 0;
+    slot.forward_pending_bytes = 0;
     slot.forward_failed = false;
     slot.pending_udp_head = null_mut();
     slot.pending_udp_tail = null_mut();
@@ -1785,11 +1829,24 @@ fn close_slot_sync(index: usize) {
 }
 
 fn begin_flow_close_async(index: usize) {
+    begin_flow_close_async_if_identity(index, abi::RequestId(0), abi::Generation(0));
+}
+
+fn begin_flow_close_async_if_identity(
+    index: usize,
+    expected_request_id: abi::RequestId,
+    expected_generation: abi::Generation,
+) {
     let pending_udp = {
         let _lock = lock_flow_table();
         let Some(entry) = (unsafe { FLOW_TABLE.get(index) }) else {
             return;
         };
+        if expected_request_id.0 != 0
+            && (entry.request_id != expected_request_id || entry.generation != expected_generation)
+        {
+            return;
+        }
         if entry.state != FlowState::Closing {
             let Some(_) = (unsafe { FLOW_TABLE.mark_closing(index) }) else {
                 return;
@@ -1868,7 +1925,7 @@ fn finish_flow_close(index: usize, outbound: bool) {
     }
 }
 
-fn finish_forward(index: usize, status: NTSTATUS) {
+fn finish_forward(index: usize, status: NTSTATUS, length: usize) {
     let mut start_closes = false;
     let _lock = lock_flow_table();
     unsafe {
@@ -1877,6 +1934,7 @@ fn finish_forward(index: usize, status: NTSTATUS) {
         };
         let slot = &mut FLOW_SLOTS[index];
         slot.forward_pending = slot.forward_pending.saturating_sub(1);
+        slot.forward_pending_bytes = slot.forward_pending_bytes.saturating_sub(length);
         if status != STATUS_SUCCESS && entry.state == FlowState::Mapped {
             slot.forward_failed = true;
         }
@@ -2522,6 +2580,14 @@ unsafe extern "C" fn wsk_outbound_receive_from_event(
     let mut current = data_indication;
     let mut failed = false;
     while !current.is_null() {
+        let remote_matches = {
+            let _lock = lock_flow_table();
+            unsafe { udp_remote_matches(&FLOW_SLOTS[index], (*current).RemoteAddress) }
+        };
+        if !remote_matches {
+            current = unsafe { (*current).Next };
+            continue;
+        }
         let packet = copy_forward_buffer(unsafe { &(*current).Buffer });
         if packet.is_null() || !submit_datagram_packet(index, listener, packet, client) {
             if !packet.is_null() {
@@ -2537,6 +2603,33 @@ unsafe extern "C" fn wsk_outbound_receive_from_event(
         touch_flow(index);
     }
     STATUS_SUCCESS
+}
+
+unsafe fn udp_remote_matches(slot: &FlowSocketSlot, remote: PVOID) -> bool {
+    if remote.is_null() {
+        return false;
+    }
+    match slot.udp_remote_family {
+        4 => {
+            let address = unsafe { &*remote.cast::<SockAddrIn>() };
+            address.family == AF_INET
+                && address.port == slot.udp_remote_port.to_be()
+                && address.address
+                    == [
+                        slot.udp_remote_address[0],
+                        slot.udp_remote_address[1],
+                        slot.udp_remote_address[2],
+                        slot.udp_remote_address[3],
+                    ]
+        }
+        6 => {
+            let address = unsafe { &*remote.cast::<SockAddrIn6>() };
+            address.family == AF_INET6
+                && address.port == slot.udp_remote_port.to_be()
+                && address.address == slot.udp_remote_address
+        }
+        _ => false,
+    }
 }
 
 unsafe extern "C" fn wsk_receive_event(
@@ -2872,6 +2965,7 @@ fn flush_pending_udp_packets(index: usize) -> bool {
 fn begin_forward_submission(
     index: usize,
     destination: wsk::PWSK_SOCKET,
+    length: usize,
 ) -> Option<*mut FlowSocketSlot> {
     let _lock = lock_flow_table();
     let entry = unsafe { FLOW_TABLE.get(index) }?;
@@ -2886,8 +2980,12 @@ fn begin_forward_submission(
         {
             return None;
         }
+        if slot.forward_pending_bytes.saturating_add(length) > FORWARD_PENDING_BYTES_LIMIT {
+            return None;
+        }
         slot.submit_in_progress = slot.submit_in_progress.saturating_add(1);
         slot.forward_pending = slot.forward_pending.saturating_add(1);
+        slot.forward_pending_bytes += length;
         Some(flow_slot_ptr(index))
     }
 }
@@ -2915,11 +3013,14 @@ unsafe extern "C" fn forward_irp_completion(
     context: PVOID,
 ) -> NTSTATUS {
     let status = unsafe { (*irp).IoStatus.__bindgen_anon_1.Status };
+    let information = unsafe { (*irp).IoStatus.Information as usize };
     let mut index = FLOW_TABLE_CAPACITY;
+    let mut length = 0;
     if !context.is_null() {
         let forward = context.cast::<ForwardIrpContext>();
         index = flow_slot_index(unsafe { (*forward).slot });
         let packet = unsafe { (*forward).packet };
+        length = unsafe { (*forward).length };
         free_owned_buffer(packet);
         unsafe {
             ExFreePool(forward.cast());
@@ -2929,7 +3030,12 @@ unsafe extern "C" fn forward_irp_completion(
         IoFreeIrp(irp);
     }
     if index < FLOW_TABLE_CAPACITY {
-        finish_forward(index, status);
+        let completion_status = if status == STATUS_SUCCESS && information == length {
+            STATUS_SUCCESS
+        } else {
+            STATUS_REQUEST_NOT_ACCEPTED
+        };
+        finish_forward(index, completion_status, length);
     }
     STATUS_MORE_PROCESSING_REQUIRED
 }
@@ -2940,10 +3046,11 @@ fn prepare_forward_irp(
     packet: *mut OwnedForwardBuffer,
     remote_address: [u8; 28],
 ) -> Option<(PIRP, *mut ForwardIrpContext)> {
-    let slot = begin_forward_submission(index, destination)?;
+    let length = unsafe { (*packet).buffer.Length as usize };
+    let slot = begin_forward_submission(index, destination, length)?;
     let irp = unsafe { IoAllocateIrp(1, 0) };
     if irp.is_null() {
-        finish_forward(index, STATUS_INSUFFICIENT_RESOURCES);
+        finish_forward(index, STATUS_INSUFFICIENT_RESOURCES, length);
         finish_forward_submission(index);
         return None;
     }
@@ -2953,7 +3060,7 @@ fn prepare_forward_irp(
         unsafe {
             IoFreeIrp(irp);
         }
-        finish_forward(index, STATUS_INSUFFICIENT_RESOURCES);
+        finish_forward(index, STATUS_INSUFFICIENT_RESOURCES, length);
         finish_forward_submission(index);
         return None;
     }
@@ -2961,6 +3068,7 @@ fn prepare_forward_irp(
         context.write(ForwardIrpContext {
             slot,
             packet,
+            length,
             remote_address,
         });
     }
@@ -2980,7 +3088,7 @@ fn prepare_forward_irp(
             ExFreePool(context.cast());
             IoFreeIrp(irp);
         }
-        finish_forward(index, status);
+        finish_forward(index, status, length);
         finish_forward_submission(index);
         return None;
     }
@@ -2992,6 +3100,7 @@ fn submit_stream_packet(
     destination: wsk::PWSK_SOCKET,
     packet: *mut OwnedForwardBuffer,
 ) -> bool {
+    let length = unsafe { (*packet).buffer.Length as usize };
     let Some((irp, context)) = prepare_forward_irp(index, destination, packet, [0; 28]) else {
         return false;
     };
@@ -3008,7 +3117,7 @@ fn submit_stream_packet(
             ExFreePool(context.cast());
             IoFreeIrp(irp);
         }
-        finish_forward(index, STATUS_NOT_SUPPORTED);
+        finish_forward(index, STATUS_NOT_SUPPORTED, length);
         finish_forward_submission(index);
         return false;
     };
@@ -3024,6 +3133,7 @@ fn submit_datagram_packet(
     packet: *mut OwnedForwardBuffer,
     remote_address: [u8; 28],
 ) -> bool {
+    let length = unsafe { (*packet).buffer.Length as usize };
     let Some((irp, context)) = prepare_forward_irp(index, destination, packet, remote_address)
     else {
         return false;
@@ -3040,7 +3150,7 @@ fn submit_datagram_packet(
             ExFreePool(context.cast());
             IoFreeIrp(irp);
         }
-        finish_forward(index, STATUS_NOT_SUPPORTED);
+        finish_forward(index, STATUS_NOT_SUPPORTED, length);
         finish_forward_submission(index);
         return false;
     };
@@ -3076,7 +3186,7 @@ fn register_wsk() -> NTSTATUS {
         WSK_REGISTERED = true;
 
         let provider = core::ptr::addr_of_mut!(WSK_PROVIDER_NPI).cast();
-        let status = wsk::WskCaptureProviderNPI(registration, WSK_INFINITE_WAIT, provider);
+        let status = wsk::WskCaptureProviderNPI(registration, WSK_CAPTURE_TIMEOUT_MS, provider);
         if status != STATUS_SUCCESS {
             debug_status(b"WskCaptureProviderNPI\0", status);
             wsk::WskDeregister(registration);

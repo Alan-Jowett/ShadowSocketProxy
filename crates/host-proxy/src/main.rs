@@ -82,7 +82,7 @@ struct Args {
     #[arg(long, default_value_t = 256)]
     /// Maximum number of flows requested in one maintenance page.
     flow_scan_batch: u32,
-    #[cfg(feature = "wsk")]
+    #[cfg(all(feature = "wsk", target_os = "windows"))]
     #[arg(long)]
     /// Use the installed WSK driver instead of Tokio TCP/UDP listeners.
     wsk: bool,
