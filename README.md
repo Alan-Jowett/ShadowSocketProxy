@@ -247,7 +247,7 @@ Some WSK providers reject the global static callback operation with
 `STATUS_NOT_SUPPORTED`; the driver logs that condition and falls back to
 enabling the required callbacks on each socket.
 The driver uses the WDK-exported WSK NPI identifier
-`{1415DFF1-4F61-45BD-843D-086C9AD02342}` for both callback-control paths.
+`{2227E803-8D8B-11D4-ABAD-009027719E09}` for both callback-control paths.
 After changing the driver, rebuild and run the signing helper again; the
 service loads the file recorded by `sc.exe`, not the latest Cargo output
 automatically. Verify the service path and driver timestamp before retrying:

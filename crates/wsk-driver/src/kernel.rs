@@ -312,10 +312,10 @@ static mut FLOW_SLOTS: [FlowSocketSlot; FLOW_TABLE_CAPACITY] =
 // The WDK declares this identifier as an extern, but keep the value local so
 // callback control requests do not depend on resolving the UUID import symbol.
 static WSK_INTERFACE_ID: wsk::NPIID = wsk::NPIID {
-    Data1: 0x1415_dff1,
-    Data2: 0x4f61,
-    Data3: 0x45bd,
-    Data4: [0x84, 0x3d, 0x08, 0x6c, 0x9a, 0xd0, 0x23, 0x42],
+    Data1: 0x2227_e803,
+    Data2: 0x8d8b,
+    Data3: 0x11d4,
+    Data4: [0xab, 0xad, 0x00, 0x90, 0x27, 0x71, 0x9e, 0x09],
 };
 
 /// The WDM entry point exported by the cdylib.
