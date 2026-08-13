@@ -333,8 +333,9 @@ Its `kernel` feature is a WDM cdylib boundary: it discovers the pinned
 `Microsoft.Windows.WDK.x64` or `.ARM64` NuGet package, generates WSK bindings
 from checked-in wrappers for `ws2.h`, `ws2def.h`, and `wsk.h`, exports
 `DriverEntry`, installs device IOCTL dispatch, and registers a WSK provider.
-The driver binds fixed loopback TCP and UDP listeners on port `15000`, uses an
-inverted-call mapping wait per admitted flow, validates the broker's exact
+The driver binds wildcard TCP and UDP listeners on port `15000` (`0.0.0.0` and
+`::`) so the gateway address supplied with `--listen` is reachable from WSL.
+It uses an inverted-call mapping wait per admitted flow, validates the broker's exact
 synthetic/original tuple completion, applies mapping and idle-flow timeouts, and
 forwards established TCP and UDP indications directly between WSK sockets using
 provider-owned MDL buffers. Payload forwarding does not issue per-packet IOCTLs

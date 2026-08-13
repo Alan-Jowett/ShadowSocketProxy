@@ -154,25 +154,25 @@ static TCP_CONTEXT_V4: ListenerContext = ListenerContext {
     family: 4,
     protocol: IPPROTO_TCP as u8,
     port: 15_000,
-    address: [127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    address: [0; 16],
 };
 static TCP_CONTEXT_V6: ListenerContext = ListenerContext {
     family: 6,
     protocol: IPPROTO_TCP as u8,
     port: 15_000,
-    address: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+    address: [0; 16],
 };
 static UDP_CONTEXT_V4: ListenerContext = ListenerContext {
     family: 4,
     protocol: IPPROTO_UDP as u8,
     port: 15_000,
-    address: [127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    address: [0; 16],
 };
 static UDP_CONTEXT_V6: ListenerContext = ListenerContext {
     family: 6,
     protocol: IPPROTO_UDP as u8,
     port: 15_000,
-    address: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+    address: [0; 16],
 };
 static mut WSK_REGISTRATION: MaybeUninit<wsk::WSK_REGISTRATION> = MaybeUninit::uninit();
 static mut WSK_PROVIDER_NPI: MaybeUninit<wsk::WSK_PROVIDER_NPI> = MaybeUninit::uninit();
@@ -1125,7 +1125,7 @@ fn bind_socket(socket: wsk::PWSK_SOCKET, family: u16, protocol: u32) -> bool {
             let mut address = SockAddrIn {
                 family,
                 port: 15_000u16.to_be(),
-                address: [127, 0, 0, 1],
+                address: [0, 0, 0, 0],
                 zero: [0; 8],
             };
             synchronous_wsk_call(|irp| unsafe {
@@ -1141,7 +1141,7 @@ fn bind_socket(socket: wsk::PWSK_SOCKET, family: u16, protocol: u32) -> bool {
                 family,
                 port: 15_000u16.to_be(),
                 flow_info: 0,
-                address: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+                address: [0; 16],
                 scope_id: 0,
             };
             synchronous_wsk_call(|irp| unsafe {
@@ -1162,7 +1162,7 @@ fn bind_socket(socket: wsk::PWSK_SOCKET, family: u16, protocol: u32) -> bool {
             let mut address = SockAddrIn {
                 family,
                 port: 15_000u16.to_be(),
-                address: [127, 0, 0, 1],
+                address: [0, 0, 0, 0],
                 zero: [0; 8],
             };
             synchronous_wsk_call(|irp| unsafe {
@@ -1178,7 +1178,7 @@ fn bind_socket(socket: wsk::PWSK_SOCKET, family: u16, protocol: u32) -> bool {
                 family,
                 port: 15_000u16.to_be(),
                 flow_info: 0,
-                address: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+                address: [0; 16],
                 scope_id: 0,
             };
             synchronous_wsk_call(|irp| unsafe {
