@@ -737,13 +737,6 @@ fn dispatch_mapping_wait(
     if !pend_mapping_irp(irp) {
         return complete_mapping_wait_response(irp, buffer, request_header, abi::Status::Cancelled);
     }
-    PENDING_MAPPING_DEADLINE.store(
-        now_100ns().saturating_add(MAPPING_TIMEOUT_100NS),
-        Ordering::Release,
-    );
-    unsafe {
-        (*irp).PendingReturned = 1;
-    }
     STATUS_PENDING
 }
 
@@ -1467,7 +1460,12 @@ fn pend_mapping_irp(irp: PIRP) -> bool {
             return false;
         }
         (*irp).CancelRoutine = Some(mapping_cancel_routine);
+        (*irp).PendingReturned = 1;
         PENDING_MAPPING_IRP.store(irp, Ordering::Release);
+        PENDING_MAPPING_DEADLINE.store(
+            now_100ns().saturating_add(MAPPING_TIMEOUT_100NS),
+            Ordering::Release,
+        );
         IoReleaseCancelSpinLock(old_irql);
     }
     true
@@ -1488,16 +1486,19 @@ fn take_pending_mapping_irp() -> Option<PIRP> {
 }
 
 unsafe extern "C" fn mapping_cancel_routine(_device: PDEVICE_OBJECT, irp: PIRP) {
-    if PENDING_MAPPING_IRP
+    let owns_irp = PENDING_MAPPING_IRP
         .compare_exchange(irp, null_mut(), Ordering::AcqRel, Ordering::Acquire)
-        .is_ok()
-    {
+        .is_ok();
+    if owns_irp {
         PENDING_MAPPING_DEADLINE.store(0, Ordering::Release);
     }
     let cancel_irql = unsafe { (*irp).CancelIrql };
     unsafe {
+        (*irp).CancelRoutine = None;
         IoReleaseCancelSpinLock(cancel_irql);
-        complete_irp(irp, STATUS_CANCELLED, 0);
+        if owns_irp {
+            complete_irp(irp, STATUS_CANCELLED, 0);
+        }
     }
 }
 
