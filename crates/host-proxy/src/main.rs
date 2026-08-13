@@ -324,6 +324,8 @@ async fn run() {
         let (shutdown, receiver) = watch::channel(false);
         let broker_client = Arc::new(client.clone());
         let broker_stop = stop.clone();
+        #[cfg(windows)]
+        let broker_cancel = device.cancellation_handle();
         let mut broker_task = tokio::task::spawn_blocking(move || {
             WskDeviceClient::run_mapping_broker(device, broker_client, broker_stop, args.listen)
         });
@@ -347,6 +349,8 @@ async fn run() {
         };
         stop.store(true, Ordering::Release);
         let _ = shutdown.send(true);
+        #[cfg(windows)]
+        broker_cancel.cancel_pending_io();
         if !broker_finished {
             let _ = tokio::time::timeout(Duration::from_secs(6), &mut broker_task).await;
         }

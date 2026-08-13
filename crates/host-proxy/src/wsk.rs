@@ -137,6 +137,12 @@ impl WskDeviceClient {
         self.broker.session_nonce()
     }
 
+    /// Returns a handle clone that can cancel a blocking wait during shutdown.
+    #[cfg(windows)]
+    pub fn cancellation_handle(&self) -> WindowsDevice {
+        self.broker.clone_device()
+    }
+
     /// Waits for one driver-originated synthetic mapping request.
     pub fn wait_for_mapping(&mut self) -> Result<abi::MappingRequest, BrokerError> {
         self.broker.wait_for_mapping()

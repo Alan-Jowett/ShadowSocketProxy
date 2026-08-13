@@ -4,7 +4,10 @@
 
 use std::{
     fmt, io,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
 };
 
 use crate::abi::{
@@ -326,9 +329,10 @@ impl<T: IoctlTransport> IoctlBroker<T> {
 
 /// Windows device transport backed by `DeviceIoControl`.
 #[cfg(windows)]
+#[derive(Clone)]
 pub struct WindowsDevice {
     /// Open handle to the installed device.
-    handle: std::fs::File,
+    handle: Arc<std::fs::File>,
 }
 
 #[cfg(windows)]
@@ -340,7 +344,21 @@ impl WindowsDevice {
             .write(true)
             .open(path)
             .map_err(BrokerError::Transport)?;
-        Ok(Self { handle })
+        Ok(Self {
+            handle: Arc::new(handle),
+        })
+    }
+
+    /// Cancels pending device I/O so a synchronous mapping wait can shut down.
+    pub fn cancel_pending_io(&self) {
+        use std::os::windows::io::AsRawHandle;
+
+        unsafe {
+            let _ = CancelIoEx(
+                self.handle.as_raw_handle() as *mut std::ffi::c_void,
+                std::ptr::null_mut(),
+            );
+        }
     }
 }
 
@@ -385,6 +403,9 @@ extern "system" {
         returned: *mut u32,
         overlapped: *mut std::ffi::c_void,
     ) -> i32;
+
+    /// Cancels pending I/O issued for a device handle.
+    fn CancelIoEx(file: *mut std::ffi::c_void, overlapped: *mut std::ffi::c_void) -> i32;
 }
 
 /// Explicit non-Windows transport used to keep workspace checks portable.
@@ -411,6 +432,19 @@ impl IoctlTransport for WindowsDevice {
         _output_size: usize,
     ) -> Result<Vec<u8>, BrokerError> {
         Err(BrokerError::UnsupportedPlatform)
+    }
+}
+
+#[cfg(windows)]
+impl IoctlBroker<WindowsDevice> {
+    /// Clones the underlying handle for shutdown cancellation.
+    pub fn clone_device(&self) -> WindowsDevice {
+        self.transport.clone()
+    }
+
+    /// Cancels a pending mapping wait on the underlying device handle.
+    pub fn cancel_pending_io(&self) {
+        self.transport.cancel_pending_io();
     }
 }
 
