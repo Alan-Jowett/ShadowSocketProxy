@@ -27,10 +27,12 @@ use wdk_alloc::WdkAllocator;
 
 #[cfg(all(target_os = "windows", feature = "kernel", not(test)))]
 #[global_allocator]
+/// Allocator used by the WDK kernel runtime.
 static GLOBAL_ALLOCATOR: WdkAllocator = WdkAllocator;
 
 #[cfg(all(target_os = "windows", feature = "kernel"))]
 #[doc(hidden)]
+/// Generated WSK bindings used only by the kernel implementation.
 pub mod wsk_bindings {
     #![allow(
         non_camel_case_types,

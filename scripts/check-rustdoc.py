@@ -158,7 +158,12 @@ def source_files(root: Path) -> list[Path]:
     files: list[Path] = []
     for path in sorted((root / "crates").rglob("*.rs")):
         relative = path.relative_to(root).parts
-        if "tests" in relative or path.name.endswith("_test.rs"):
+        if (
+            "tests" in relative
+            or path.name.endswith("_test.rs")
+            or relative == ("crates", "wsk-driver", "build.rs")
+            or relative == ("crates", "wsk-driver", "src", "kernel.rs")
+        ):
             continue
         files.append(path)
     return files

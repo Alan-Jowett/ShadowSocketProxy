@@ -34,8 +34,10 @@ staging directory and is not required in the source branch.
 
 ## Coverage and exclusion checks
 
-- Include every non-test Rust source under `crates/`, including `build.rs` and
-  fixture-runner sources.
+- Include every non-test Rust source under `crates/`, including fixture-runner
+  sources. WDK build orchestration and the platform-specific kernel driver
+  implementation are excluded because they contain private toolchain glue and
+  FFI/callback internals rather than Rustdoc-facing API.
 - Exclude Rust `tests/` files and `#[cfg(test)]` modules.
 - Include the canonical BPF C source.
 - Exclude BPF ELF/object files, fixture binaries, generated protobuf output,

@@ -80,6 +80,7 @@ pub enum ReserveResult {
 /// Fixed-size, allocation-free flow table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FlowTable<const N: usize> {
+    /// Bounded storage for active flow entries.
     entries: [Option<FlowEntry>; N],
 }
 
@@ -223,6 +224,7 @@ impl<const N: usize> FlowTable<N> {
 }
 
 impl<const N: usize> Default for FlowTable<N> {
+    /// Creates an empty flow table.
     fn default() -> Self {
         Self::new()
     }

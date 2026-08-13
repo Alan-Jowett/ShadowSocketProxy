@@ -163,6 +163,7 @@ impl WskDeviceClient {
     }
 }
 
+/// Replaces an unspecified synthetic destination with the configured listener address.
 fn normalize_wildcard_destination(tuple: Tuple, listen: SocketAddr) -> Option<Tuple> {
     if !tuple.destination.ip().is_unspecified() {
         return Some(tuple);
@@ -176,6 +177,7 @@ fn normalize_wildcard_destination(tuple: Tuple, listen: SocketAddr) -> Option<Tu
     })
 }
 
+/// Converts a driver mapping tuple into the host proxy tuple representation.
 fn tuple_from_abi(tuple: abi::MappingTuple) -> Option<Tuple> {
     Some(Tuple {
         source: socket_addr(
@@ -192,6 +194,7 @@ fn tuple_from_abi(tuple: abi::MappingTuple) -> Option<Tuple> {
     })
 }
 
+/// Converts the host-selected original destination into a driver mapping response.
 fn mapping_to_abi(
     synthetic: abi::MappingTuple,
     mapping: crate::OriginalDestination,
@@ -222,6 +225,7 @@ fn mapping_to_abi(
     })
 }
 
+/// Converts a packed IPv4 or IPv6 address into a socket address.
 fn socket_addr(family: u8, address: [u8; 16], port: u16) -> Option<SocketAddr> {
     match family {
         4 => Some(SocketAddr::new(

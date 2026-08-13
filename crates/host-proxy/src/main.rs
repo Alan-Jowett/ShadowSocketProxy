@@ -89,6 +89,7 @@ struct Args {
 }
 
 #[cfg(all(feature = "wsk", target_os = "windows"))]
+/// Creates a per-process nonce for authenticating a WSK broker session.
 fn client_nonce() -> shadow_socket_proxy_host::wsk::abi::SessionNonce {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
