@@ -325,7 +325,7 @@ async fn run() {
         let broker_client = Arc::new(client.clone());
         let broker_stop = stop.clone();
         let mut broker_task = tokio::task::spawn_blocking(move || {
-            WskDeviceClient::run_mapping_broker(device, broker_client, broker_stop)
+            WskDeviceClient::run_mapping_broker(device, broker_client, broker_stop, args.listen)
         });
         let maintenance = proxy.run_wsk_maintenance(receiver);
         tokio::pin!(maintenance);

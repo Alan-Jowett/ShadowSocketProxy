@@ -44,6 +44,7 @@ impl WskDeviceClient {
         mut device: WskDeviceClient,
         client: Arc<C>,
         stop: Arc<AtomicBool>,
+        listen: SocketAddr,
     ) -> Result<(), BrokerError>
     where
         C: MappingClient + 'static,
@@ -60,11 +61,22 @@ impl WskDeviceClient {
             }
             let tuple = tuple_from_abi(request.synthetic)
                 .ok_or(BrokerError::DeviceStatus(abi::Status::InvalidAbi))?;
-            tracing::info!(synthetic = ?tuple, "wsk mapping lookup");
-            let original = match handle.block_on(client.get_mapping(&tuple)) {
+            let lookup_tuple = match normalize_wildcard_destination(tuple.clone(), listen) {
+                Some(tuple) => tuple,
+                None => {
+                    tracing::warn!(
+                        synthetic = ?tuple,
+                        configured_listen = %listen,
+                        "cannot normalize WSK wildcard destination across address families; leaving flow fail-closed"
+                    );
+                    continue;
+                }
+            };
+            tracing::info!(synthetic = ?lookup_tuple, "wsk mapping lookup");
+            let original = match handle.block_on(client.get_mapping(&lookup_tuple)) {
                 Ok(mapping) => {
                     tracing::info!(
-                        synthetic = ?tuple,
+                        synthetic = ?lookup_tuple,
                         original = ?mapping,
                         "wsk mapping resolved"
                     );
@@ -73,14 +85,14 @@ impl WskDeviceClient {
                 }
                 Err(ProxyError::MappingNotFound | ProxyError::InvalidMapping(_)) => {
                     tracing::warn!(
-                        synthetic = ?tuple,
+                        synthetic = ?lookup_tuple,
                         "no control-service mapping; leaving flow fail-closed"
                     );
                     continue;
                 }
                 Err(error) => {
                     tracing::error!(
-                        synthetic = ?tuple,
+                        synthetic = ?lookup_tuple,
                         error = %error,
                         "control-service mapping lookup failed"
                     );
@@ -97,7 +109,7 @@ impl WskDeviceClient {
                         | abi::Status::Cancelled,
                     ) => {
                         tracing::warn!(
-                            synthetic = ?tuple,
+                            synthetic = ?lookup_tuple,
                             error = %error,
                             "driver rejected mapping for this flow; continuing"
                         );
@@ -105,7 +117,7 @@ impl WskDeviceClient {
                     }
                     error => {
                         tracing::error!(
-                            synthetic = ?tuple,
+                            synthetic = ?lookup_tuple,
                             error = %error,
                             "driver rejected mapping completion"
                         );
@@ -145,6 +157,19 @@ impl WskDeviceClient {
     pub fn close(mut self) -> Result<(), BrokerError> {
         self.broker.close_session()
     }
+}
+
+fn normalize_wildcard_destination(tuple: Tuple, listen: SocketAddr) -> Option<Tuple> {
+    if !tuple.destination.ip().is_unspecified() {
+        return Some(tuple);
+    }
+    if tuple.destination.is_ipv4() != listen.is_ipv4() {
+        return None;
+    }
+    Some(Tuple {
+        destination: SocketAddr::new(listen.ip(), tuple.destination.port()),
+        ..tuple
+    })
 }
 
 fn tuple_from_abi(tuple: abi::MappingTuple) -> Option<Tuple> {
@@ -269,5 +294,29 @@ mod tests {
         let converted = mapping_to_abi(synthetic, mapping).unwrap();
         assert_eq!(converted.destination_address[0], 0x20);
         assert_eq!(converted.destination_port, 443);
+    }
+
+    #[test]
+    fn wildcard_destination_uses_configured_listen_address() {
+        let tuple = Tuple {
+            source: "192.0.2.10:40000".parse().unwrap(),
+            destination: "0.0.0.0:15000".parse().unwrap(),
+            protocol: 17,
+        };
+        let normalized =
+            normalize_wildcard_destination(tuple, "172.30.32.1:15000".parse().unwrap()).unwrap();
+        assert_eq!(normalized.destination, "172.30.32.1:15000".parse().unwrap());
+    }
+
+    #[test]
+    fn wildcard_destination_rejects_configured_family_mismatch() {
+        let tuple = Tuple {
+            source: "192.0.2.10:40000".parse().unwrap(),
+            destination: "0.0.0.0:15000".parse().unwrap(),
+            protocol: 17,
+        };
+        assert!(
+            normalize_wildcard_destination(tuple, "[2001:db8::1]:15000".parse().unwrap()).is_none()
+        );
     }
 }
