@@ -329,10 +329,14 @@ async fn run() {
         });
         let maintenance = proxy.run_wsk_maintenance(receiver);
         tokio::pin!(maintenance);
+        let mut broker_finished = false;
         let result = tokio::select! {
-            result = &mut broker_task => result
-                .map_err(|error| shadow_socket_proxy_host::ProxyError::Control(error.to_string()))
-                .and_then(|result| result.map_err(|error| shadow_socket_proxy_host::ProxyError::Control(error.to_string()))),
+            result = &mut broker_task => {
+                broker_finished = true;
+                result
+                    .map_err(|error| shadow_socket_proxy_host::ProxyError::Control(error.to_string()))
+                    .and_then(|result| result.map_err(|error| shadow_socket_proxy_host::ProxyError::Control(error.to_string())))
+            },
             result = &mut maintenance => {
                 let _ = result;
                 Ok(())
@@ -343,7 +347,9 @@ async fn run() {
         };
         stop.store(true, Ordering::Release);
         let _ = shutdown.send(true);
-        let _ = tokio::time::timeout(Duration::from_secs(6), &mut broker_task).await;
+        if !broker_finished {
+            let _ = tokio::time::timeout(Duration::from_secs(6), &mut broker_task).await;
+        }
         if let Err(error) =
             tokio::time::timeout(Duration::from_secs(5), client.detach(&args.interface))
                 .await
