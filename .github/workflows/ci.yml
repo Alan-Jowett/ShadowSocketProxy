@@ -176,10 +176,15 @@ jobs:
             ''
           }
           if ($installedVersion -notmatch '18\.1\.8') {
-            winget install --id LLVM.LLVM --version 18.1.8 --exact `
-              --scope machine --accept-source-agreements --accept-package-agreements
-            if ($LASTEXITCODE -ne 0) {
-              throw "LLVM 18.1.8 installation failed with exit code $LASTEXITCODE"
+            $installer = Join-Path $env:RUNNER_TEMP 'LLVM-18.1.8-win64.exe'
+            Invoke-WebRequest `
+              -Uri 'https://github.com/llvm/llvm-project/releases/download/llvmorg-18.1.8/LLVM-18.1.8-win64.exe' `
+              -OutFile $installer
+            $process = Start-Process -FilePath $installer `
+              -ArgumentList '/S', '/D=C:\Program Files\LLVM' `
+              -Wait -PassThru
+            if ($process.ExitCode -ne 0) {
+              throw "LLVM 18.1.8 installation failed with exit code $($process.ExitCode)"
             }
           }
           if (-not (Test-Path $clang) -or (& $clang --version | Select-Object -First 1) -notmatch '18\.1\.8') {
