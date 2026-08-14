@@ -2537,6 +2537,7 @@ fn finish_flow_close(index: usize, outbound: bool, closed: bool) {
 
 fn finish_forward(index: usize, status: NTSTATUS, length: usize) {
     let mut start_closes = false;
+    let mut report_failure = false;
     let mut resumes = [(null_mut(), null_mut()); 2];
     let mut resume_count = 0;
     let _lock = lock_flow_table();
@@ -2549,6 +2550,7 @@ fn finish_forward(index: usize, status: NTSTATUS, length: usize) {
         slot.forward_pending_bytes = slot.forward_pending_bytes.saturating_sub(length);
         if status != STATUS_SUCCESS && entry.state == FlowState::Mapped {
             slot.forward_failed = true;
+            report_failure = true;
         }
         if status == STATUS_SUCCESS
             && entry.state == FlowState::Mapped
@@ -2591,7 +2593,7 @@ fn finish_forward(index: usize, status: NTSTATUS, length: usize) {
         }
     }
     drop(_lock);
-    if status != STATUS_SUCCESS {
+    if report_failure {
         debug_flow_event(b"forwarding failed\0", index, status);
     }
     for (socket, pause) in resumes.into_iter().take(resume_count) {
@@ -3499,7 +3501,15 @@ unsafe extern "C" fn wsk_disconnect_event(socket_context: PVOID, _flags: u32) ->
         let callback = unsafe { &*socket_context.cast::<FlowCallbackContext>() };
         let index = flow_slot_index(callback.slot);
         if index < FLOW_TABLE_CAPACITY {
-            debug_flow_event(b"WSK disconnect event\0", index, STATUS_SUCCESS);
+            debug_flow_event(
+                if callback.inbound {
+                    b"WSK inbound socket disconnect event\0"
+                } else {
+                    b"WSK outbound socket disconnect event\0"
+                },
+                index,
+                STATUS_SUCCESS,
+            );
             begin_flow_close_async(index);
         }
     }
@@ -3970,6 +3980,7 @@ unsafe extern "C" fn forward_irp_completion(
     let information = unsafe { (*irp).IoStatus.Information as usize };
     let mut index = FLOW_TABLE_CAPACITY;
     let mut length = 0;
+    let mut datagram = false;
     if !context.is_null() {
         let forward = context.cast::<ForwardIrpContext>();
         index = flow_slot_index(unsafe { (*forward).slot });
@@ -3977,7 +3988,7 @@ unsafe extern "C" fn forward_irp_completion(
         let submitted_length = unsafe { (*forward).submitted_length };
         length = unsafe { (*forward).total_length };
         let destination = unsafe { (*forward).destination };
-        let datagram = unsafe { (*forward).datagram };
+        datagram = unsafe { (*forward).datagram };
         let remote_address = unsafe { (*forward).remote_address };
         if status == STATUS_SUCCESS && information > 0 && information < submitted_length {
             unsafe {
@@ -4006,6 +4017,17 @@ unsafe extern "C" fn forward_irp_completion(
         IoFreeIrp(irp);
     }
     if index < FLOW_TABLE_CAPACITY {
+        if status != STATUS_SUCCESS {
+            debug_flow_event(
+                if datagram {
+                    b"WSK datagram send completion failed\0"
+                } else {
+                    b"WSK stream send completion failed\0"
+                },
+                index,
+                status,
+            );
+        }
         let completion_status = if status == STATUS_SUCCESS && information == length {
             STATUS_SUCCESS
         } else {
