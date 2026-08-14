@@ -429,9 +429,13 @@ extern "system" {
         overlapped: *mut std::ffi::c_void,
     ) -> i32;
 
-    /// Cancels pending I/O issued for a device handle.
+    /// Returns a pseudo-handle for the current process.
     fn GetCurrentProcess() -> *mut std::ffi::c_void;
+
+    /// Returns a pseudo-handle for the current thread.
     fn GetCurrentThread() -> *mut std::ffi::c_void;
+
+    /// Duplicates the current thread handle for cross-thread cancellation.
     fn DuplicateHandle(
         source_process: *mut std::ffi::c_void,
         source: *mut std::ffi::c_void,
@@ -441,7 +445,11 @@ extern "system" {
         inherit_handle: i32,
         options: u32,
     ) -> i32;
+
+    /// Cancels synchronous I/O issued by a target thread.
     fn CancelSynchronousIo(thread: *mut std::ffi::c_void) -> i32;
+
+    /// Releases a native Windows handle.
     fn CloseHandle(handle: *mut std::ffi::c_void) -> i32;
 }
 
