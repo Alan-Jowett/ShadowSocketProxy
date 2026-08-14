@@ -249,8 +249,13 @@ impl<T: IoctlTransport> IoctlBroker<T> {
             std::mem::size_of::<MappingRequest>(),
         )?;
         let mapping = from_bytes::<MappingRequest>(&response)?;
-        let status = Status::from_raw(mapping.header.status)
-            .ok_or(AbiError::InvalidStatus(mapping.header.status))?;
+        let status = mapping.header.validate_response(
+            Opcode::SubmitRequest,
+            std::mem::size_of::<MappingRequest>(),
+            nonce,
+            request.header.request_id,
+            request.header.generation,
+        )?;
         if status != Status::Ok {
             return Err(BrokerError::DeviceStatus(status));
         }
@@ -569,8 +574,8 @@ mod tests {
                         Opcode::SubmitRequest,
                         Status::Ok,
                         self.response_nonce,
-                        RequestId(77),
-                        Generation(88),
+                        request.header.request_id,
+                        request.header.generation,
                         std::mem::size_of::<MappingRequest>(),
                     ),
                     synthetic: MappingTuple {
@@ -675,7 +680,7 @@ mod tests {
         let mut broker = IoctlBroker::new(transport);
         broker.open_session(nonce(1)).unwrap();
         let mapping = broker.wait_for_mapping().unwrap();
-        assert_eq!(mapping.header.request_id, RequestId(77));
+        assert_ne!(mapping.header.request_id, RequestId(0));
         let original = MappingTuple {
             protocol: 6,
             address_family: 4,
