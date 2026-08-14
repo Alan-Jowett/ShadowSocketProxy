@@ -353,6 +353,8 @@ impl<T: IoctlTransport> IoctlBroker<T> {
 pub struct WindowsDevice {
     /// Open handle to the installed device.
     handle: Arc<std::fs::File>,
+    /// Serializes synchronous IOCTLs issued through this device handle.
+    ioctl_lock: Arc<Mutex<()>>,
     /// Native handle for the thread currently issuing a synchronous IOCTL.
     issuing_thread: Arc<Mutex<Option<usize>>>,
 }
@@ -368,6 +370,7 @@ impl WindowsDevice {
             .map_err(BrokerError::Transport)?;
         Ok(Self {
             handle: Arc::new(handle),
+            ioctl_lock: Arc::new(Mutex::new(())),
             issuing_thread: Arc::new(Mutex::new(None)),
         })
     }
@@ -389,6 +392,7 @@ impl IoctlTransport for WindowsDevice {
     fn ioctl(&self, code: u32, input: &[u8], output_size: usize) -> Result<Vec<u8>, BrokerError> {
         use std::os::windows::io::AsRawHandle;
 
+        let _ioctl_guard = self.ioctl_lock.lock().unwrap();
         let mut thread = std::ptr::null_mut();
         unsafe {
             if DuplicateHandle(
