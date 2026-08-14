@@ -43,6 +43,15 @@ if ($null -eq $certificate) {
         -CertStoreLocation Cert:\LocalMachine\My
 }
 
+foreach ($store in @(
+        'Cert:\LocalMachine\Root',
+        'Cert:\LocalMachine\TrustedPublisher'
+    )) {
+    if (-not (Get-ChildItem $store | Where-Object Thumbprint -eq $certificate.Thumbprint)) {
+        Copy-Item -Path $certificate.PSPath -Destination $store
+    }
+}
+
 & $signTool.FullName sign /v /fd SHA256 /sm /sha1 $certificate.Thumbprint $DriverPath
 if ($LASTEXITCODE -ne 0) {
     throw "signtool sign failed with exit code $LASTEXITCODE"

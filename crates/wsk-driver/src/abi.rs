@@ -538,12 +538,19 @@ pub mod ioctl {
     pub const FILE_DEVICE_NETWORK: u32 = 0x12;
     /// Buffered IOCTL method.
     const METHOD_BUFFERED: u32 = 0;
-    /// IOCTL access mask.
-    const FILE_ANY_ACCESS: u32 = 0;
+    /// Require a handle opened for both device read and write access.
+    const FILE_READ_DATA: u32 = 0x0001;
+    /// Require write access in every broker IOCTL.
+    const FILE_WRITE_DATA: u32 = 0x0002;
+    /// Access bits encoded into every broker IOCTL.
+    const FILE_READ_WRITE_ACCESS: u32 = FILE_READ_DATA | FILE_WRITE_DATA;
 
     /// Builds one stable Windows control code.
     const fn ctl_code(function: u32) -> u32 {
-        (FILE_DEVICE_NETWORK << 16) | (FILE_ANY_ACCESS << 14) | (function << 2) | METHOD_BUFFERED
+        (FILE_DEVICE_NETWORK << 16)
+            | (FILE_READ_WRITE_ACCESS << 14)
+            | (function << 2)
+            | METHOD_BUFFERED
     }
 
     /// Opens a versioned broker/device session.
@@ -800,5 +807,17 @@ mod tests {
             mismatch.validate(session, RequestId(11), Generation(12), synthetic),
             Err(AbiError::InvalidMapping)
         );
+    }
+
+    #[test]
+    fn ioctl_codes_require_read_and_write_access() {
+        for code in [
+            ioctl::OPEN_SESSION,
+            ioctl::CLOSE_SESSION,
+            ioctl::SUBMIT_REQUEST,
+            ioctl::COMPLETE_REQUEST,
+        ] {
+            assert_eq!((code >> 14) & 0x3, 0x3);
+        }
     }
 }

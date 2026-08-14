@@ -11,9 +11,3 @@ members = [
     "crates/wsk-driver",
 ]
 resolver = "2"
-
-[profile.dev]
-panic = "abort"
-
-[profile.release]
-panic = "abort"

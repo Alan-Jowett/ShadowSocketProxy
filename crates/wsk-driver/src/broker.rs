@@ -353,10 +353,7 @@ impl WindowsDevice {
         use std::os::windows::io::AsRawHandle;
 
         unsafe {
-            let _ = CancelIoEx(
-                self.handle.as_raw_handle() as *mut std::ffi::c_void,
-                std::ptr::null_mut(),
-            );
+            let _ = CancelIoEx(self.handle.as_raw_handle(), std::ptr::null_mut());
         }
     }
 }

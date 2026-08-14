@@ -195,14 +195,27 @@ driver, or `-EnableTestSigning` to sign it and enable Windows test signing:
 The script also discovers the Windows OpenSSL development installation used by
 the `tls-psk` host build. Set `OPENSSL_DIR` and, when necessary,
 `OPENSSL_LIB_DIR` to override discovery.
+It scopes the driver's static CRT and `panic=abort` compiler flags to the
+driver build, then restores the caller's flags before building the host.
+Do not add either flag to a target-wide Cargo configuration: the host uses
+dynamic OpenSSL and may use `catch_unwind`.
 
 To run the individual build commands manually:
 
 ```powershell
 $env:WDKContentRoot = "$env:USERPROFILE\.nuget\packages\microsoft.windows.wdk.x64\10.0.28000.2526\c"
 
-cargo build --locked --release -p shadow-socket-proxy-wsk-driver `
-  --features kernel --target x86_64-pc-windows-msvc
+$savedRustFlags = $env:RUSTFLAGS
+try {
+  $env:RUSTFLAGS = @($savedRustFlags, '-C panic=abort', '-C target-feature=+crt-static') `
+    | Where-Object { $_ } | Join-String -Separator ' '
+  cargo build --locked --release -p shadow-socket-proxy-wsk-driver `
+    --features kernel --target x86_64-pc-windows-msvc
+}
+finally {
+  $env:RUSTFLAGS = $savedRustFlags
+}
+
 cargo build --locked --release -p shadow-socket-proxy-host `
   --features "tls-psk,wsk"
 ```
@@ -218,8 +231,17 @@ $env:SSP_WSK_WDK_ROOT = "$env:USERPROFILE\.nuget\packages\microsoft.windows.wdk.
 $env:SSP_WSK_SDK_ROOT = "$env:USERPROFILE\.nuget\packages\microsoft.windows.sdk.cpp\10.0.28000.2526\c"
 $env:WDKContentRoot = $env:SSP_WSK_WDK_ROOT
 
-cargo build --locked --release -p shadow-socket-proxy-wsk-driver `
-  --features kernel --target x86_64-pc-windows-msvc
+$savedRustFlags = $env:RUSTFLAGS
+try {
+  $env:RUSTFLAGS = @($savedRustFlags, '-C panic=abort', '-C target-feature=+crt-static') `
+    | Where-Object { $_ } | Join-String -Separator ' '
+  cargo build --locked --release -p shadow-socket-proxy-wsk-driver `
+    --features kernel --target x86_64-pc-windows-msvc
+}
+finally {
+  $env:RUSTFLAGS = $savedRustFlags
+}
+
 cargo build --locked --release -p shadow-socket-proxy-host `
   --features "tls-psk,wsk"
 ```
@@ -248,6 +270,11 @@ sc.exe create ShadowSocketProxyWsk type= kernel start= demand `
 sc.exe start ShadowSocketProxyWsk
 ```
 
+`IoCreateDeviceSecure` grants the device only to `SYSTEM` and built-in
+Administrators, and every IOCTL requires a handle opened for both read and
+write access. Run the WSK host proxy from an elevated Administrator session;
+the `sc.exe` service installation does not grant broker access by itself.
+
 If `sc.exe start` returns error 50 (`ERROR_NOT_SUPPORTED`), inspect the
 driver's initialization status rather than treating it as a generic service
 failure. Query the service and recent Service Control Manager events first:
@@ -261,7 +288,7 @@ Get-WinEvent -LogName System -MaxEvents 100 |
 ```
 
 The driver emits the failing initialization stage and NTSTATUS through
-`DbgPrintEx` for `IoCreateDevice`, `IoCreateSymbolicLink`, `WskRegister`,
+`DbgPrintEx` for `IoCreateDeviceSecure`, `IoCreateSymbolicLink`, `WskRegister`,
 `WskCaptureProviderNPI`, static callback registration, and listener setup.
 Some WSK providers reject the global static callback operation with
 `STATUS_NOT_SUPPORTED`; the driver logs that condition and falls back to
@@ -339,7 +366,9 @@ It uses an inverted-call mapping wait per admitted flow, validates the broker's 
 synthetic/original tuple completion, applies mapping and idle-flow timeouts, and
 forwards established TCP and UDP indications directly between WSK sockets using
 provider-owned MDL buffers. Payload forwarding does not issue per-packet IOCTLs
-or use a user-mode fallback. The kernel flow state uses a bounded shared table
+or use a user-mode fallback. Session activation requires a nonzero nonce from
+the kernel CNG system RNG; if CNG cannot provide one, the open-session request
+fails without activating the broker. The kernel flow state uses a bounded shared table
 of 64 TCP flows and UDP associations; admission fails closed when all slots are
 occupied.
 Missing WDK/SDK packages fail with an explicit build error.
@@ -348,11 +377,20 @@ NuGet package, set it to
 `%USERPROFILE%\.nuget\packages\microsoft.windows.wdk.x64\10.0.28000.2526\c`
 before invoking the Windows kernel build.
 
-The target-gated kernel compile can be checked with:
+The target-gated kernel compile must use the same driver-only CRT and panic
+settings:
 
 ```powershell
-cargo check --locked --target x86_64-pc-windows-msvc `
-  -p shadow-socket-proxy-wsk-driver --features kernel
+$savedRustFlags = $env:RUSTFLAGS
+try {
+  $env:RUSTFLAGS = @($savedRustFlags, '-C panic=abort', '-C target-feature=+crt-static') `
+    | Where-Object { $_ } | Join-String -Separator ' '
+  cargo check --locked --target x86_64-pc-windows-msvc `
+    -p shadow-socket-proxy-wsk-driver --features kernel
+}
+finally {
+  $env:RUSTFLAGS = $savedRustFlags
+}
 ```
 
 Configure the listener and control service with CLI options; provide the PSK through `--psk-secret`,

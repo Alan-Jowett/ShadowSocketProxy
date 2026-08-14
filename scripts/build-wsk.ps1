@@ -81,17 +81,29 @@ try {
         Invoke-Native 'cargo' @('clean', '--target', $driverTarget)
     }
 
-    Invoke-Native 'cargo' @(
-        'build',
-        '--locked',
-        '--release',
-        '-p',
-        'shadow-socket-proxy-wsk-driver',
-        '--features',
-        'kernel',
-        '--target',
-        $driverTarget
-    )
+    $originalRustFlags = $env:RUSTFLAGS
+    $driverRustFlags = @(
+        $originalRustFlags,
+        '-C panic=abort',
+        '-C target-feature=+crt-static'
+    ) | Where-Object { $_ } | Join-String -Separator ' '
+    try {
+        $env:RUSTFLAGS = $driverRustFlags
+        Invoke-Native 'cargo' @(
+            'build',
+            '--locked',
+            '--release',
+            '-p',
+            'shadow-socket-proxy-wsk-driver',
+            '--features',
+            'kernel',
+            '--target',
+            $driverTarget
+        )
+    }
+    finally {
+        $env:RUSTFLAGS = $originalRustFlags
+    }
 
     Invoke-Native 'cargo' @(
         'build',
