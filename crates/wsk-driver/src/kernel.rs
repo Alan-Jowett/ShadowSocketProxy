@@ -232,7 +232,7 @@ fn debug_flow_event(stage: &[u8], index: usize, status: NTSTATUS) {
     unsafe {
         let _ = DbgPrintEx(
             DPFLTR_IHVDRIVER_ID,
-            DPFLTR_INFO_LEVEL,
+            DPFLTR_ERROR_LEVEL,
             format.as_ptr().cast::<i8>(),
             stage.as_ptr().cast::<i8>(),
             index as u32,
