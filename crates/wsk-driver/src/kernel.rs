@@ -88,7 +88,6 @@ const MDL_MAPPING_NO_EXECUTE: u32 = 0x4000_0000;
 const FORWARD_POOL_TAG: u32 = u32::from_ne_bytes(*b"FpsS");
 const UDP_PENDING_BYTES_LIMIT: usize = 64 * 1024;
 const TCP_PENDING_BYTES_LIMIT: usize = 1024 * 1024;
-const FORWARD_PENDING_BYTES_LIMIT: usize = 1024 * 1024;
 const TCP_FORWARD_HIGH_WATERMARK: usize = 512 * 1024;
 const TCP_FORWARD_LOW_WATERMARK: usize = 256 * 1024;
 const WSK_OPERATION_TIMEOUT_MS: i64 = 10_000;
@@ -3921,9 +3920,6 @@ fn begin_forward_submission(
         {
             return None;
         }
-        if slot.forward_pending_bytes.saturating_add(length) > FORWARD_PENDING_BYTES_LIMIT {
-            return None;
-        }
         slot.submit_in_progress = slot.submit_in_progress.saturating_add(1);
         slot.forward_pending = slot.forward_pending.saturating_add(1);
         slot.forward_pending_bytes += length;
@@ -3980,13 +3976,12 @@ unsafe extern "C" fn forward_irp_completion(
     let information = unsafe { (*irp).IoStatus.Information as usize };
     let mut index = FLOW_TABLE_CAPACITY;
     let mut length = 0;
-    let mut submitted_length = 0;
     let mut datagram = false;
     if !context.is_null() {
         let forward = context.cast::<ForwardIrpContext>();
         index = flow_slot_index(unsafe { (*forward).slot });
         let packet = unsafe { (*forward).packet };
-        submitted_length = unsafe { (*forward).submitted_length };
+        let submitted_length = unsafe { (*forward).submitted_length };
         length = unsafe { (*forward).total_length };
         let destination = unsafe { (*forward).destination };
         datagram = unsafe { (*forward).datagram };
@@ -4029,7 +4024,7 @@ unsafe extern "C" fn forward_irp_completion(
                 status,
             );
         }
-        let completion_status = if status == STATUS_SUCCESS && information == submitted_length {
+        let completion_status = if status == STATUS_SUCCESS {
             STATUS_SUCCESS
         } else {
             STATUS_REQUEST_NOT_ACCEPTED
