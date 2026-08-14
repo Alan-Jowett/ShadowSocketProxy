@@ -213,6 +213,40 @@ fn debug_connect_result(stage: &[u8], index: usize, status: NTSTATUS, informatio
     }
 }
 
+fn debug_flow_event(stage: &[u8], index: usize, status: NTSTATUS) {
+    let (request_id, generation, state, protocol, source_port, destination_port) = {
+        let _lock = lock_flow_table();
+        let Some(entry) = (unsafe { FLOW_TABLE.get(index) }) else {
+            return;
+        };
+        (
+            entry.request_id.0,
+            entry.generation.0,
+            entry.state as u32,
+            entry.key.synthetic.protocol as u32,
+            entry.key.synthetic.source_port as u32,
+            entry.key.synthetic.destination_port as u32,
+        )
+    };
+    let format = b"ShadowSocketProxy: %s slot=%u request=%llu generation=%llu state=%u protocol=%u source_port=%u destination_port=%u status=0x%08X\n\0";
+    unsafe {
+        let _ = DbgPrintEx(
+            DPFLTR_IHVDRIVER_ID,
+            DPFLTR_INFO_LEVEL,
+            format.as_ptr().cast::<i8>(),
+            stage.as_ptr().cast::<i8>(),
+            index as u32,
+            request_id,
+            generation,
+            state,
+            protocol,
+            source_port,
+            destination_port,
+            status as u32,
+        );
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct SockAddrIn {
@@ -1822,22 +1856,43 @@ fn close_socket_sync(socket: wsk::PWSK_SOCKET) -> bool {
 }
 
 fn close_socket_async(socket: wsk::PWSK_SOCKET, context: &mut FlowCloseContext) -> bool {
+    let index = flow_slot_index(context.slot);
     if socket.is_null() {
         return true;
     }
     if unsafe { (*socket).Dispatch.is_null() } {
+        debug_flow_event(
+            b"socket close missing dispatch\0",
+            index,
+            STATUS_NOT_SUPPORTED,
+        );
         return false;
     }
     let dispatch = unsafe { (*socket).Dispatch as *const wsk::WSK_PROVIDER_BASIC_DISPATCH };
     let Some(close) = (unsafe { (*dispatch).WskCloseSocket }) else {
+        debug_flow_event(
+            b"socket close missing operation\0",
+            index,
+            STATUS_NOT_SUPPORTED,
+        );
         return false;
     };
     if !begin_wsk_operation(true) {
+        debug_flow_event(
+            b"socket close rejected while stopping\0",
+            index,
+            STATUS_INVALID_DEVICE_STATE,
+        );
         return false;
     }
     let irp = unsafe { IoAllocateIrp(1, 0) };
     if irp.is_null() {
         finish_wsk_operation();
+        debug_flow_event(
+            b"socket close IRP allocation failed\0",
+            index,
+            STATUS_INSUFFICIENT_RESOURCES,
+        );
         return false;
     }
     let device = unsafe { DEVICE_OBJECT };
@@ -1857,10 +1912,14 @@ fn close_socket_async(socket: wsk::PWSK_SOCKET, context: &mut FlowCloseContext) 
             IoFreeIrp(irp);
         }
         finish_wsk_operation();
+        debug_flow_event(b"socket close completion setup failed\0", index, set_status);
         return false;
     };
     // WSK completes this IRP for immediate and deferred close results.
-    let _ = unsafe { close(socket, irp.cast()) };
+    let status = unsafe { close(socket, irp.cast()) };
+    if status != STATUS_SUCCESS && status != STATUS_PENDING {
+        debug_flow_event(b"socket close submission failed\0", index, status);
+    }
     true
 }
 
@@ -2127,12 +2186,24 @@ fn reserve_flow(
 ) -> FlowReservation {
     let _session = lock_session();
     if WSK_STOPPING.load(Ordering::Acquire) {
+        debug_status(
+            b"flow admission while stopping\0",
+            STATUS_INVALID_DEVICE_STATE,
+        );
         return FlowReservation::Full;
     }
     if !SESSION_ACTIVE.load(Ordering::Acquire) {
+        debug_status(
+            b"flow admission without session\0",
+            STATUS_INVALID_DEVICE_STATE,
+        );
         return FlowReservation::Full;
     }
     if SESSION_TEARDOWN.load(Ordering::Acquire) {
+        debug_status(
+            b"flow admission during teardown\0",
+            STATUS_INVALID_DEVICE_STATE,
+        );
         return FlowReservation::Full;
     }
     let key = flow_key(synthetic, &client_address, client_len);
@@ -2191,16 +2262,24 @@ fn reserve_flow(
     };
     match reservation {
         ReservedFlow::New(index, mapping_irp) => {
+            debug_flow_event(b"flow admitted; mapping pending\0", index, STATUS_PENDING);
             if let Some(mapping_irp) = mapping_irp {
                 if !publish_mapping_request(index, mapping_irp) {
+                    debug_flow_event(b"mapping publication failed\0", index, STATUS_CANCELLED);
                     begin_flow_close_async(index);
                     return FlowReservation::Full;
                 }
             }
             FlowReservation::New(index)
         }
-        ReservedFlow::Existing(index) => FlowReservation::Existing(index),
-        ReservedFlow::Full => FlowReservation::Full,
+        ReservedFlow::Existing(index) => {
+            debug_flow_event(b"existing flow reused\0", index, STATUS_SUCCESS);
+            FlowReservation::Existing(index)
+        }
+        ReservedFlow::Full => {
+            debug_status(b"flow table full\0", STATUS_INSUFFICIENT_RESOURCES);
+            FlowReservation::Full
+        }
     }
 }
 
@@ -2307,6 +2386,7 @@ fn begin_flow_close_async_if_identity(
     expected_request_id: abi::RequestId,
     expected_generation: abi::Generation,
 ) {
+    debug_flow_event(b"flow close requested\0", index, STATUS_CANCELLED);
     let (pending_udp, pending_inbound, pending_outbound) = {
         let _lock = lock_flow_table();
         let Some(entry) = (unsafe { FLOW_TABLE.get(index) }) else {
@@ -2403,6 +2483,20 @@ fn start_flow_socket_closes(index: usize) {
 }
 
 fn finish_flow_close(index: usize, outbound: bool, closed: bool) {
+    let status = if closed {
+        STATUS_SUCCESS
+    } else {
+        STATUS_REQUEST_NOT_ACCEPTED
+    };
+    debug_flow_event(
+        if outbound {
+            b"outbound socket close completed\0"
+        } else {
+            b"inbound socket close completed\0"
+        },
+        index,
+        status,
+    );
     let _lock = lock_flow_table();
     unsafe {
         let Some(slot) = flow_slot(index) else {
@@ -2497,6 +2591,9 @@ fn finish_forward(index: usize, status: NTSTATUS, length: usize) {
         }
     }
     drop(_lock);
+    if status != STATUS_SUCCESS {
+        debug_flow_event(b"forwarding failed\0", index, status);
+    }
     for (socket, pause) in resumes.into_iter().take(resume_count) {
         if !set_receive_event_callback(socket, unsafe { &mut *pause }, true) {
             cancel_receive_event_control(pause);
@@ -2535,10 +2632,18 @@ fn drain_active_flows() {
 
 fn handle_mapping_completion(completion: &abi::MappingCompletion) -> abi::Status {
     if !SESSION_ACTIVE.load(Ordering::Acquire) {
+        debug_status(
+            b"mapping completion without session\0",
+            STATUS_INVALID_DEVICE_STATE,
+        );
         return abi::Status::InvalidSession;
     }
     let nonce = load_nonce();
     if completion.header.session_nonce != nonce {
+        debug_status(
+            b"mapping completion nonce mismatch\0",
+            STATUS_INVALID_PARAMETER,
+        );
         return abi::Status::InvalidSession;
     }
     let (index, entry) = {
@@ -2555,11 +2660,20 @@ fn handle_mapping_completion(completion: &abi::MappingCompletion) -> abi::Status
             }
         }
         let Some(found) = found else {
+            debug_status(
+                b"mapping completion identity not found\0",
+                STATUS_INVALID_PARAMETER,
+            );
             return abi::Status::InvalidIdentity;
         };
         found
     };
     if entry.state != FlowState::AwaitingMapping {
+        debug_flow_event(
+            b"mapping completion for non-pending flow\0",
+            index,
+            STATUS_CANCELLED,
+        );
         return abi::Status::Cancelled;
     }
     if let Err(error) = completion.validate(
@@ -2568,6 +2682,11 @@ fn handle_mapping_completion(completion: &abi::MappingCompletion) -> abi::Status
         entry.generation,
         entry.key.synthetic,
     ) {
+        debug_flow_event(
+            b"mapping completion validation failed\0",
+            index,
+            STATUS_INVALID_PARAMETER,
+        );
         begin_flow_close_async_if_identity(index, entry.request_id, entry.generation);
         return error.status();
     }
@@ -2584,11 +2703,26 @@ fn handle_mapping_completion(completion: &abi::MappingCompletion) -> abi::Status
     {
         let _lock = lock_flow_table();
         if unsafe { !FLOW_TABLE.mark_completing(index, entry.request_id, entry.generation) } {
+            debug_flow_event(
+                b"mapping state transition failed\0",
+                index,
+                STATUS_CANCELLED,
+            );
             return abi::Status::Cancelled;
         }
     }
+    debug_flow_event(
+        b"mapping resolved; connecting outbound\0",
+        index,
+        STATUS_PENDING,
+    );
     let outbound = create_outbound_socket(&completion.original, index);
     let Some(outbound) = outbound else {
+        debug_flow_event(
+            b"outbound connection failed\0",
+            index,
+            STATUS_REQUEST_NOT_ACCEPTED,
+        );
         begin_flow_close_async_if_identity(index, entry.request_id, entry.generation);
         return abi::Status::ResourceUnavailable;
     };
@@ -2612,6 +2746,11 @@ fn handle_mapping_completion(completion: &abi::MappingCompletion) -> abi::Status
         }
     };
     if !installed {
+        debug_flow_event(
+            b"outbound connection became stale\0",
+            index,
+            STATUS_CANCELLED,
+        );
         let _ = close_socket_sync(outbound);
         return abi::Status::Cancelled;
     }
@@ -2620,13 +2759,24 @@ fn handle_mapping_completion(completion: &abi::MappingCompletion) -> abi::Status
             || !enable_socket_event_callbacks(outbound, WSK_EVENT_RECEIVE)
             || !enable_socket_event_callbacks(inbound, WSK_EVENT_RECEIVE)
         {
+            debug_flow_event(
+                b"TCP forwarding setup failed\0",
+                index,
+                STATUS_NOT_SUPPORTED,
+            );
             begin_flow_close_async(index);
             return abi::Status::ResourceUnavailable;
         }
     } else if !flush_pending_udp_packets(index) {
+        debug_flow_event(
+            b"UDP forwarding setup failed\0",
+            index,
+            STATUS_NOT_SUPPORTED,
+        );
         begin_flow_close_async(index);
         return abi::Status::ResourceUnavailable;
     }
+    debug_flow_event(b"flow mapped; forwarding enabled\0", index, STATUS_SUCCESS);
     abi::Status::Ok
 }
 
@@ -3018,23 +3168,43 @@ unsafe extern "C" fn wsk_accept_event(
     accept_socket_dispatch: *mut *const wsk::WSK_CLIENT_CONNECTION_DISPATCH,
 ) -> NTSTATUS {
     if accept_socket.is_null() || remote_address.is_null() {
+        debug_status(
+            b"TCP accept missing socket or peer\0",
+            STATUS_INVALID_PARAMETER,
+        );
         return STATUS_REQUEST_NOT_ACCEPTED;
     }
     let context = socket_context.cast::<ListenerContext>();
     if context.is_null() {
+        debug_status(
+            b"TCP accept missing listener context\0",
+            STATUS_INVALID_PARAMETER,
+        );
         return STATUS_REQUEST_NOT_ACCEPTED;
     }
     let local_address = if local_address.is_null() {
+        debug_status(
+            b"TCP accept missing local address\0",
+            STATUS_INVALID_PARAMETER,
+        );
         return STATUS_REQUEST_NOT_ACCEPTED;
     } else {
         local_address
     };
     let Some(synthetic) = tuple_from_addresses(IPPROTO_TCP as u8, local_address, remote_address)
     else {
+        debug_status(
+            b"TCP accept invalid address family\0",
+            STATUS_INVALID_PARAMETER,
+        );
         return STATUS_REQUEST_NOT_ACCEPTED;
     };
     let reservation = reserve_flow(accept_socket, synthetic, [0; 28], 0, null_mut());
     let FlowReservation::New(index) = reservation else {
+        debug_status(
+            b"TCP accept flow admission rejected\0",
+            STATUS_REQUEST_NOT_ACCEPTED,
+        );
         return STATUS_REQUEST_NOT_ACCEPTED;
     };
     if !accept_socket_context.is_null() {
@@ -3049,9 +3219,19 @@ unsafe extern "C" fn wsk_accept_event(
         }
     }
     if !enable_socket_event_callbacks(accept_socket, WSK_EVENT_DISCONNECT) {
+        debug_flow_event(
+            b"TCP accept disconnect callback setup failed\0",
+            index,
+            STATUS_NOT_SUPPORTED,
+        );
         reject_accept_flow(index);
         return STATUS_REQUEST_NOT_ACCEPTED;
     }
+    debug_flow_event(
+        b"TCP accept pending broker resolution\0",
+        index,
+        STATUS_PENDING,
+    );
     let _ = context;
     STATUS_SUCCESS
 }
@@ -3105,6 +3285,11 @@ unsafe extern "C" fn wsk_receive_from_event(
             if let Some(index) = index {
                 let packet = copy_forward_buffer(unsafe { &(*current).Buffer });
                 if packet.is_null() || !queue_or_forward_udp_packet(index, packet) {
+                    debug_flow_event(
+                        b"UDP receive forwarding failed\0",
+                        index,
+                        STATUS_REQUEST_NOT_ACCEPTED,
+                    );
                     if !packet.is_null() {
                         free_owned_buffer(packet);
                     }
@@ -3147,6 +3332,11 @@ unsafe extern "C" fn wsk_outbound_receive_from_event(
         }
     };
     if !mapped || outbound.is_null() || listener.is_null() {
+        debug_flow_event(
+            b"UDP outbound receive invalid flow state\0",
+            index,
+            STATUS_INVALID_DEVICE_STATE,
+        );
         begin_flow_close_async(index);
         return STATUS_SUCCESS;
     }
@@ -3175,6 +3365,11 @@ unsafe extern "C" fn wsk_outbound_receive_from_event(
         current = unsafe { (*current).Next };
     }
     if failed {
+        debug_flow_event(
+            b"UDP return forwarding failed\0",
+            index,
+            STATUS_REQUEST_NOT_ACCEPTED,
+        );
         begin_flow_close_async(index);
     } else {
         touch_flow(index);
@@ -3226,6 +3421,11 @@ unsafe extern "C" fn wsk_receive_event(
         return STATUS_SUCCESS;
     }
     if data_indication.is_null() {
+        debug_flow_event(
+            b"TCP receive indicated connection close\0",
+            index,
+            STATUS_SUCCESS,
+        );
         begin_flow_close_async(index);
         return STATUS_SUCCESS;
     }
@@ -3236,6 +3436,11 @@ unsafe extern "C" fn wsk_receive_event(
             .unwrap_or(false)
     };
     if !is_tcp {
+        debug_flow_event(
+            b"TCP receive delivered to non-TCP flow\0",
+            index,
+            STATUS_INVALID_PARAMETER,
+        );
         begin_flow_close_async(index);
         return STATUS_SUCCESS;
     }
@@ -3257,6 +3462,11 @@ unsafe extern "C" fn wsk_receive_event(
         }
     }
     if failed {
+        debug_flow_event(
+            b"TCP receive forwarding failed\0",
+            index,
+            STATUS_REQUEST_NOT_ACCEPTED,
+        );
         begin_flow_close_async(index);
     } else {
         touch_flow(index);
@@ -3270,6 +3480,7 @@ unsafe extern "C" fn wsk_disconnect_event(socket_context: PVOID, _flags: u32) ->
         let callback = unsafe { &*socket_context.cast::<FlowCallbackContext>() };
         let index = flow_slot_index(callback.slot);
         if index < FLOW_TABLE_CAPACITY {
+            debug_flow_event(b"WSK disconnect event\0", index, STATUS_SUCCESS);
             begin_flow_close_async(index);
         }
     }
