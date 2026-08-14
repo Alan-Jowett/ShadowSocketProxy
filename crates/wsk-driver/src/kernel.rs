@@ -3408,7 +3408,7 @@ unsafe extern "C" fn wsk_receive_event(
     socket_context: PVOID,
     _flags: u32,
     data_indication: wsk::PWSK_DATA_INDICATION,
-    bytes_indicated: u64,
+    _bytes_indicated: u64,
     bytes_accepted: *mut u64,
 ) -> NTSTATUS {
     let callback = if socket_context.is_null() {
@@ -3446,19 +3446,38 @@ unsafe extern "C" fn wsk_receive_event(
     }
     let mut current = data_indication;
     let mut failed = false;
+    let mut accepted = 0u64;
     while !current.is_null() {
-        let packet = copy_forward_buffer(unsafe { &(*current).Buffer });
+        let capacity = match stream_forward_capacity(index) {
+            Some(capacity) => capacity,
+            None => {
+                failed = true;
+                break;
+            }
+        };
+        if capacity == 0 {
+            break;
+        }
+        let buffer = unsafe { &(*current).Buffer };
+        let length = buffer.Length as usize;
+        let accepted_length = core::cmp::min(length, capacity);
+        let packet = copy_forward_buffer_length(buffer, accepted_length);
         if packet.is_null() || !queue_or_forward_stream_packet(index, callback.inbound, packet) {
             if !packet.is_null() {
                 free_owned_buffer(packet);
             }
             failed = true;
+            break;
+        }
+        accepted = accepted.saturating_add(accepted_length as u64);
+        if accepted_length < length {
+            break;
         }
         current = unsafe { (*current).Next };
     }
     if !bytes_accepted.is_null() {
         unsafe {
-            *bytes_accepted = bytes_indicated;
+            *bytes_accepted = accepted;
         }
     }
     if failed {
@@ -3516,8 +3535,14 @@ unsafe fn mdl_system_address(mdl: PMDL) -> (*mut u8, bool) {
 }
 
 fn copy_forward_buffer(source: &wsk::WSK_BUF) -> *mut OwnedForwardBuffer {
-    let length = source.Length as usize;
-    if length > u32::MAX as usize || (length != 0 && source.Mdl.is_null()) {
+    copy_forward_buffer_length(source, source.Length as usize)
+}
+
+fn copy_forward_buffer_length(source: &wsk::WSK_BUF, length: usize) -> *mut OwnedForwardBuffer {
+    if length > source.Length as usize
+        || length > u32::MAX as usize
+        || (length != 0 && source.Mdl.is_null())
+    {
         return null_mut();
     }
     let allocation = unsafe { allocate_nonpaged(length.max(1)) };
@@ -3795,6 +3820,16 @@ fn queue_or_forward_stream_packet(
     submit_stream_packet(index, destination, packet, true, unsafe {
         (*packet).buffer.Length as usize
     })
+}
+
+fn stream_forward_capacity(index: usize) -> Option<usize> {
+    let _lock = lock_flow_table();
+    let entry = unsafe { FLOW_TABLE.get(index) }?;
+    if entry.state != FlowState::Mapped || entry.key.synthetic.protocol as u32 != IPPROTO_TCP {
+        return None;
+    }
+    let slot = unsafe { &FLOW_SLOTS[index] };
+    Some(TCP_FORWARD_HIGH_WATERMARK.saturating_sub(slot.forward_pending_bytes))
 }
 
 fn flush_stream_packet_list(
