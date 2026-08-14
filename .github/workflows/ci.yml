@@ -169,8 +169,23 @@ jobs:
       - name: Install LLVM
         shell: pwsh
         run: |
-          winget install --id LLVM.LLVM --version 18.1.8 --exact `
-            --scope machine --accept-source-agreements --accept-package-agreements
+          $clang = 'C:\Program Files\LLVM\bin\clang.exe'
+          $installedVersion = if (Test-Path $clang) {
+            (& $clang --version | Select-Object -First 1)
+          } else {
+            ''
+          }
+          if ($installedVersion -notmatch '18\.1\.8') {
+            winget install --id LLVM.LLVM --version 18.1.8 --exact `
+              --scope machine --accept-source-agreements --accept-package-agreements
+            if ($LASTEXITCODE -ne 0) {
+              throw "LLVM 18.1.8 installation failed with exit code $LASTEXITCODE"
+            }
+          }
+          if (-not (Test-Path $clang) -or (& $clang --version | Select-Object -First 1) -notmatch '18\.1\.8') {
+            throw "LLVM 18.1.8 is not available at $clang"
+          }
+          'C:\Program Files\LLVM\bin' >> $env:GITHUB_PATH
 
       - name: Install OpenSSL
         shell: pwsh
