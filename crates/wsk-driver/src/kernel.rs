@@ -3980,12 +3980,13 @@ unsafe extern "C" fn forward_irp_completion(
     let information = unsafe { (*irp).IoStatus.Information as usize };
     let mut index = FLOW_TABLE_CAPACITY;
     let mut length = 0;
+    let mut submitted_length = 0;
     let mut datagram = false;
     if !context.is_null() {
         let forward = context.cast::<ForwardIrpContext>();
         index = flow_slot_index(unsafe { (*forward).slot });
         let packet = unsafe { (*forward).packet };
-        let submitted_length = unsafe { (*forward).submitted_length };
+        submitted_length = unsafe { (*forward).submitted_length };
         length = unsafe { (*forward).total_length };
         let destination = unsafe { (*forward).destination };
         datagram = unsafe { (*forward).datagram };
@@ -4028,7 +4029,7 @@ unsafe extern "C" fn forward_irp_completion(
                 status,
             );
         }
-        let completion_status = if status == STATUS_SUCCESS && information == length {
+        let completion_status = if status == STATUS_SUCCESS && information == submitted_length {
             STATUS_SUCCESS
         } else {
             STATUS_REQUEST_NOT_ACCEPTED
