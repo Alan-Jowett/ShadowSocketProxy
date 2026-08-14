@@ -1239,11 +1239,17 @@ where
     }
     let operation_status = operation(irp);
     if operation_status != STATUS_PENDING {
+        let status = unsafe { (*irp).IoStatus.__bindgen_anon_1.Status };
+        let information = unsafe { (*irp).IoStatus.Information as u64 };
         unsafe {
             IoFreeIrp(irp);
         }
         finish_wsk_operation();
-        return Err(operation_status);
+        return if operation_status == STATUS_SUCCESS {
+            Ok((status, information))
+        } else {
+            Err(operation_status)
+        };
     }
     let mut timeout = LARGE_INTEGER {
         QuadPart: -(WSK_OPERATION_TIMEOUT_MS * 10_000),
@@ -1605,6 +1611,15 @@ fn close_socket_async(socket: wsk::PWSK_SOCKET, context: &mut FlowCloseContext) 
     }
     let status = unsafe { close(socket, irp.cast()) };
     if status == STATUS_PENDING {
+        true
+    } else if status == STATUS_SUCCESS {
+        let close = &*context;
+        let index = flow_slot_index(close.slot);
+        finish_flow_close(index, close.outbound, true);
+        unsafe {
+            IoFreeIrp(irp);
+        }
+        finish_wsk_operation();
         true
     } else {
         unsafe {
@@ -3475,6 +3490,16 @@ fn submit_stream_packet(
     finish_forward_submission(index);
     if status == STATUS_PENDING {
         true
+    } else if status == STATUS_SUCCESS {
+        unsafe {
+            free_owned_buffer(packet);
+            (*context).packet = null_mut();
+            ExFreePool(context.cast());
+            IoFreeIrp(irp);
+        }
+        finish_wsk_operation();
+        finish_forward(index, STATUS_SUCCESS, length);
+        true
     } else {
         unsafe {
             (*context).packet = null_mut();
@@ -3528,6 +3553,16 @@ fn submit_datagram_packet(
     };
     finish_forward_submission(index);
     if status == STATUS_PENDING {
+        true
+    } else if status == STATUS_SUCCESS {
+        unsafe {
+            free_owned_buffer(packet);
+            (*context).packet = null_mut();
+            ExFreePool(context.cast());
+            IoFreeIrp(irp);
+        }
+        finish_wsk_operation();
+        finish_forward(index, STATUS_SUCCESS, length);
         true
     } else {
         unsafe {
