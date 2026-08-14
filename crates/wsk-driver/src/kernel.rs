@@ -70,6 +70,7 @@ const WSK_EVENT_ACCEPT: u32 = wsk::WSK_EVENT_ACCEPT;
 const WSK_EVENT_RECEIVE_FROM: u32 = wsk::WSK_EVENT_RECEIVE_FROM;
 const WSK_EVENT_RECEIVE: u32 = wsk::WSK_EVENT_RECEIVE;
 const WSK_EVENT_DISCONNECT: u32 = wsk::WSK_EVENT_DISCONNECT;
+const WSK_EVENT_DISABLE: u32 = wsk::WSK_EVENT_DISABLE;
 const WSK_SET_STATIC_EVENT_CALLBACKS: u32 = wsk::WSK_SET_STATIC_EVENT_CALLBACKS;
 const WSK_SET_OPTION: i32 = wsk::WSK_CONTROL_SOCKET_TYPE::WskSetOption;
 const SO_WSK_EVENT_CALLBACK: u32 = 0x4002;
@@ -88,6 +89,8 @@ const FORWARD_POOL_TAG: u32 = u32::from_ne_bytes(*b"FpsS");
 const UDP_PENDING_BYTES_LIMIT: usize = 64 * 1024;
 const TCP_PENDING_BYTES_LIMIT: usize = 1024 * 1024;
 const FORWARD_PENDING_BYTES_LIMIT: usize = 1024 * 1024;
+const TCP_FORWARD_HIGH_WATERMARK: usize = 512 * 1024;
+const TCP_FORWARD_LOW_WATERMARK: usize = 256 * 1024;
 const WSK_OPERATION_TIMEOUT_MS: i64 = 10_000;
 const CLOSE_RETRY_DELAY_100NS: u64 = 10_000_000;
 
@@ -359,6 +362,10 @@ struct FlowSocketSlot {
     forward_pending: u32,
     forward_pending_bytes: usize,
     forward_failed: bool,
+    inbound_receive_paused: bool,
+    outbound_receive_paused: bool,
+    inbound_pause_pending: bool,
+    outbound_pause_pending: bool,
     pending_udp_head: *mut OwnedForwardBuffer,
     pending_udp_tail: *mut OwnedForwardBuffer,
     pending_udp_bytes: usize,
@@ -370,6 +377,8 @@ struct FlowSocketSlot {
     pending_outbound_bytes: usize,
     inbound_context: FlowCallbackContext,
     outbound_context: FlowCallbackContext,
+    inbound_pause: ReceivePauseContext,
+    outbound_pause: ReceivePauseContext,
     inbound_close: FlowCloseContext,
     outbound_close: FlowCloseContext,
     inbound_close_pending: bool,
@@ -382,6 +391,16 @@ struct FlowSocketSlot {
 struct FlowCallbackContext {
     slot: *mut FlowSocketSlot,
     inbound: bool,
+}
+
+#[repr(C)]
+struct ReceivePauseContext {
+    slot: *mut FlowSocketSlot,
+    inbound: bool,
+    enabling: bool,
+    request_id: abi::RequestId,
+    generation: abi::Generation,
+    control: wsk::WSK_EVENT_CALLBACK_CONTROL,
 }
 
 #[repr(C)]
@@ -406,6 +425,10 @@ impl FlowSocketSlot {
             forward_pending: 0,
             forward_pending_bytes: 0,
             forward_failed: false,
+            inbound_receive_paused: false,
+            outbound_receive_paused: false,
+            inbound_pause_pending: false,
+            outbound_pause_pending: false,
             pending_udp_head: null_mut(),
             pending_udp_tail: null_mut(),
             pending_udp_bytes: 0,
@@ -422,6 +445,28 @@ impl FlowSocketSlot {
             outbound_context: FlowCallbackContext {
                 slot: null_mut(),
                 inbound: false,
+            },
+            inbound_pause: ReceivePauseContext {
+                slot: null_mut(),
+                inbound: true,
+                enabling: false,
+                request_id: abi::RequestId(0),
+                generation: abi::Generation(0),
+                control: wsk::WSK_EVENT_CALLBACK_CONTROL {
+                    NpiId: core::ptr::null(),
+                    EventMask: 0,
+                },
+            },
+            outbound_pause: ReceivePauseContext {
+                slot: null_mut(),
+                inbound: false,
+                enabling: false,
+                request_id: abi::RequestId(0),
+                generation: abi::Generation(0),
+                control: wsk::WSK_EVENT_CALLBACK_CONTROL {
+                    NpiId: core::ptr::null(),
+                    EventMask: 0,
+                },
             },
             inbound_close: FlowCloseContext {
                 slot: null_mut(),
@@ -1414,6 +1459,205 @@ fn enable_socket_event_callbacks(socket: wsk::PWSK_SOCKET, event_mask: u32) -> b
     status == STATUS_SUCCESS
 }
 
+unsafe extern "C" fn receive_pause_completion(
+    _device: PDEVICE_OBJECT,
+    irp: PIRP,
+    context: PVOID,
+) -> NTSTATUS {
+    let status = unsafe { (*irp).IoStatus.__bindgen_anon_1.Status };
+    let mut resume = None;
+    let mut close_flow = false;
+    let mut start_closes = false;
+    if !context.is_null() {
+        let pause = unsafe { &mut *context.cast::<ReceivePauseContext>() };
+        let index = flow_slot_index(pause.slot);
+        if index < FLOW_TABLE_CAPACITY {
+            let _lock = lock_flow_table();
+            unsafe {
+                if let Some(entry) = FLOW_TABLE.get(index) {
+                    if entry.request_id != pause.request_id || entry.generation != pause.generation
+                    {
+                        IoFreeIrp(irp);
+                        finish_wsk_operation();
+                        return STATUS_MORE_PROCESSING_REQUIRED;
+                    }
+                    let slot = &mut FLOW_SLOTS[index];
+                    let (paused, pending, socket) = if pause.inbound {
+                        (
+                            &mut slot.inbound_receive_paused,
+                            &mut slot.inbound_pause_pending,
+                            slot.socket,
+                        )
+                    } else {
+                        (
+                            &mut slot.outbound_receive_paused,
+                            &mut slot.outbound_pause_pending,
+                            slot.outbound,
+                        )
+                    };
+                    *pending = false;
+                    if pause.enabling {
+                        if status == STATUS_SUCCESS {
+                            *paused = false;
+                        } else if entry.state == FlowState::Mapped {
+                            slot.forward_failed = true;
+                            close_flow = true;
+                        }
+                    } else if status != STATUS_SUCCESS {
+                        *paused = false;
+                    } else if entry.state == FlowState::Mapped
+                        && slot.forward_pending_bytes <= TCP_FORWARD_LOW_WATERMARK
+                    {
+                        *pending = true;
+                        pause.enabling = true;
+                        resume = Some((socket, context.cast::<ReceivePauseContext>()));
+                    }
+                    if entry.state == FlowState::Closing
+                        && !slot.inbound_pause_pending
+                        && !slot.outbound_pause_pending
+                    {
+                        start_closes = true;
+                    }
+                }
+            }
+        }
+    }
+    unsafe {
+        IoFreeIrp(irp);
+    }
+    finish_wsk_operation();
+    if close_flow {
+        let pause = unsafe { &*context.cast::<ReceivePauseContext>() };
+        begin_flow_close_async(flow_slot_index(pause.slot));
+    } else if let Some((socket, pause)) = resume {
+        if !set_receive_event_callback(socket, unsafe { &mut *pause }, true) {
+            cancel_receive_event_control(pause);
+            begin_flow_close_async(flow_slot_index(unsafe { (*pause).slot }));
+        }
+    }
+    if start_closes {
+        let pause = unsafe { &*context.cast::<ReceivePauseContext>() };
+        start_flow_socket_closes(flow_slot_index(pause.slot));
+    }
+    STATUS_MORE_PROCESSING_REQUIRED
+}
+
+fn cancel_receive_event_control(context: *mut ReceivePauseContext) {
+    if context.is_null() {
+        return;
+    }
+    let pause = unsafe { &*context };
+    let index = flow_slot_index(pause.slot);
+    if index >= FLOW_TABLE_CAPACITY {
+        return;
+    }
+    let _lock = lock_flow_table();
+    unsafe {
+        let Some(entry) = FLOW_TABLE.get(index) else {
+            return;
+        };
+        if entry.request_id != pause.request_id || entry.generation != pause.generation {
+            return;
+        }
+        if pause.inbound {
+            FLOW_SLOTS[index].inbound_pause_pending = false;
+            if !pause.enabling {
+                FLOW_SLOTS[index].inbound_receive_paused = false;
+            }
+        } else {
+            FLOW_SLOTS[index].outbound_pause_pending = false;
+            if !pause.enabling {
+                FLOW_SLOTS[index].outbound_receive_paused = false;
+            }
+        }
+    }
+}
+
+fn set_receive_event_callback(
+    socket: wsk::PWSK_SOCKET,
+    context: &mut ReceivePauseContext,
+    enable: bool,
+) -> bool {
+    if socket.is_null() || !begin_wsk_operation(false) {
+        return false;
+    }
+    let dispatch = unsafe {
+        if (*socket).Dispatch.is_null() {
+            finish_wsk_operation();
+            return false;
+        }
+        &*((*socket).Dispatch as *const wsk::WSK_PROVIDER_BASIC_DISPATCH)
+    };
+    let Some(control_socket) = dispatch.WskControlSocket else {
+        finish_wsk_operation();
+        return false;
+    };
+    let irp = unsafe { IoAllocateIrp(1, 0) };
+    if irp.is_null() {
+        finish_wsk_operation();
+        return false;
+    }
+    let set_status = unsafe {
+        IoSetCompletionRoutineEx(
+            DEVICE_OBJECT,
+            irp,
+            Some(receive_pause_completion),
+            (context as *mut ReceivePauseContext).cast(),
+            1,
+            1,
+            1,
+        )
+    };
+    if set_status != STATUS_SUCCESS {
+        unsafe {
+            IoFreeIrp(irp);
+        }
+        finish_wsk_operation();
+        return false;
+    }
+    context.control = wsk::WSK_EVENT_CALLBACK_CONTROL {
+        NpiId: core::ptr::addr_of!(WSK_INTERFACE_ID),
+        EventMask: if enable {
+            WSK_EVENT_RECEIVE
+        } else {
+            WSK_EVENT_RECEIVE | WSK_EVENT_DISABLE
+        },
+    };
+    let status = unsafe {
+        control_socket(
+            socket,
+            WSK_SET_OPTION,
+            SO_WSK_EVENT_CALLBACK,
+            SOL_SOCKET,
+            size_of::<wsk::WSK_EVENT_CALLBACK_CONTROL>() as u64,
+            (&mut context.control as *mut wsk::WSK_EVENT_CALLBACK_CONTROL).cast(),
+            0,
+            null_mut(),
+            null_mut(),
+            irp.cast(),
+        )
+    };
+    if status == STATUS_PENDING {
+        return true;
+    }
+    if status != STATUS_SUCCESS {
+        debug_status(b"WskControlSocket receive callback\0", status);
+        unsafe {
+            IoFreeIrp(irp);
+        }
+        finish_wsk_operation();
+        return false;
+    }
+    unsafe {
+        receive_pause_completion(
+            null_mut(),
+            irp,
+            (context as *mut ReceivePauseContext).cast(),
+        );
+    }
+    true
+}
+
 fn create_wsk_socket(
     family: u16,
     socket_type: u16,
@@ -1908,6 +2152,8 @@ fn initialize_flow_slots() {
             let slot = &mut FLOW_SLOTS[index];
             slot.inbound_context.slot = flow_slot_ptr(index);
             slot.outbound_context.slot = flow_slot_ptr(index);
+            slot.inbound_pause.slot = flow_slot_ptr(index);
+            slot.outbound_pause.slot = flow_slot_ptr(index);
             slot.inbound_close.slot = flow_slot_ptr(index);
             slot.outbound_close.slot = flow_slot_ptr(index);
         }
@@ -1959,6 +2205,12 @@ fn reserve_flow(
                     slot.forward_pending = 0;
                     slot.forward_pending_bytes = 0;
                     slot.forward_failed = false;
+                    slot.inbound_receive_paused = false;
+                    slot.outbound_receive_paused = false;
+                    slot.inbound_pause_pending = false;
+                    slot.outbound_pause_pending = false;
+                    slot.inbound_pause.enabling = false;
+                    slot.outbound_pause.enabling = false;
                     slot.pending_udp_head = null_mut();
                     slot.pending_udp_tail = null_mut();
                     slot.pending_udp_bytes = 0;
@@ -2055,6 +2307,12 @@ fn reset_flow_slot(slot: &mut FlowSocketSlot) {
     slot.forward_pending = 0;
     slot.forward_pending_bytes = 0;
     slot.forward_failed = false;
+    slot.inbound_receive_paused = false;
+    slot.outbound_receive_paused = false;
+    slot.inbound_pause_pending = false;
+    slot.outbound_pause_pending = false;
+    slot.inbound_pause.enabling = false;
+    slot.outbound_pause.enabling = false;
     slot.pending_udp_head = null_mut();
     slot.pending_udp_tail = null_mut();
     slot.pending_udp_bytes = 0;
@@ -2141,7 +2399,11 @@ fn start_flow_socket_closes(index: usize) {
         }
         unsafe {
             let slot = &mut FLOW_SLOTS[index];
-            if slot.submit_in_progress != 0 || slot.close_retry_deadline > now_100ns() {
+            if slot.submit_in_progress != 0
+                || slot.inbound_pause_pending
+                || slot.outbound_pause_pending
+                || slot.close_retry_deadline > now_100ns()
+            {
                 return;
             }
             let socket = if !slot.socket.is_null() && !slot.inbound_close_pending {
@@ -2158,7 +2420,12 @@ fn start_flow_socket_closes(index: usize) {
             } else {
                 null_mut()
             };
-            if slot.socket.is_null() && slot.outbound.is_null() && slot.forward_pending == 0 {
+            if slot.socket.is_null()
+                && slot.outbound.is_null()
+                && slot.forward_pending == 0
+                && !slot.inbound_pause_pending
+                && !slot.outbound_pause_pending
+            {
                 FLOW_TABLE.release(index);
                 reset_flow_slot(slot);
             }
@@ -2204,7 +2471,12 @@ fn finish_flow_close(index: usize, outbound: bool, closed: bool) {
         if !closed {
             slot.close_retry_deadline = now_100ns().saturating_add(CLOSE_RETRY_DELAY_100NS);
         }
-        if slot.socket.is_null() && slot.outbound.is_null() && slot.forward_pending == 0 {
+        if slot.socket.is_null()
+            && slot.outbound.is_null()
+            && slot.forward_pending == 0
+            && !slot.inbound_pause_pending
+            && !slot.outbound_pause_pending
+        {
             FLOW_TABLE.release(index);
             reset_flow_slot(slot);
         }
@@ -2213,6 +2485,8 @@ fn finish_flow_close(index: usize, outbound: bool, closed: bool) {
 
 fn finish_forward(index: usize, status: NTSTATUS, length: usize) {
     let mut start_closes = false;
+    let mut resumes = [(null_mut(), null_mut()); 2];
+    let mut resume_count = 0;
     let _lock = lock_flow_table();
     unsafe {
         let Some(entry) = FLOW_TABLE.get(index) else {
@@ -2224,10 +2498,40 @@ fn finish_forward(index: usize, status: NTSTATUS, length: usize) {
         if status != STATUS_SUCCESS && entry.state == FlowState::Mapped {
             slot.forward_failed = true;
         }
+        if status == STATUS_SUCCESS
+            && entry.state == FlowState::Mapped
+            && slot.forward_pending_bytes <= TCP_FORWARD_LOW_WATERMARK
+        {
+            if slot.inbound_receive_paused && !slot.inbound_pause_pending && !slot.socket.is_null()
+            {
+                slot.inbound_pause_pending = true;
+                slot.inbound_pause.enabling = true;
+                slot.inbound_pause.request_id = entry.request_id;
+                slot.inbound_pause.generation = entry.generation;
+                resumes[resume_count] = (slot.socket, core::ptr::addr_of_mut!(slot.inbound_pause));
+                resume_count += 1;
+            }
+            if slot.outbound_receive_paused
+                && !slot.outbound_pause_pending
+                && !slot.outbound.is_null()
+            {
+                slot.outbound_pause_pending = true;
+                slot.outbound_pause.enabling = true;
+                slot.outbound_pause.request_id = entry.request_id;
+                slot.outbound_pause.generation = entry.generation;
+                resumes[resume_count] =
+                    (slot.outbound, core::ptr::addr_of_mut!(slot.outbound_pause));
+                resume_count += 1;
+            }
+        }
         if entry.state == FlowState::Closing {
             if slot.submit_in_progress == 0 {
                 start_closes = true;
-            } else if slot.socket.is_null() && slot.outbound.is_null() && slot.forward_pending == 0
+            } else if slot.socket.is_null()
+                && slot.outbound.is_null()
+                && slot.forward_pending == 0
+                && !slot.inbound_pause_pending
+                && !slot.outbound_pause_pending
             {
                 FLOW_TABLE.release(index);
                 reset_flow_slot(slot);
@@ -2235,6 +2539,13 @@ fn finish_forward(index: usize, status: NTSTATUS, length: usize) {
         }
     }
     drop(_lock);
+    for (socket, pause) in resumes.into_iter().take(resume_count) {
+        if !set_receive_event_callback(socket, unsafe { &mut *pause }, true) {
+            cancel_receive_event_control(pause);
+            begin_flow_close_async(index);
+            return;
+        }
+    }
     if start_closes {
         start_flow_socket_closes(index);
     }
@@ -3379,7 +3690,10 @@ fn begin_forward_submission(
     index: usize,
     destination: wsk::PWSK_SOCKET,
     length: usize,
-) -> Option<*mut FlowSocketSlot> {
+) -> Option<(
+    *mut FlowSocketSlot,
+    Option<(wsk::PWSK_SOCKET, *mut ReceivePauseContext)>,
+)> {
     let _lock = lock_flow_table();
     let entry = unsafe { FLOW_TABLE.get(index) }?;
     if entry.state != FlowState::Mapped || destination.is_null() {
@@ -3399,7 +3713,30 @@ fn begin_forward_submission(
         slot.submit_in_progress = slot.submit_in_progress.saturating_add(1);
         slot.forward_pending = slot.forward_pending.saturating_add(1);
         slot.forward_pending_bytes += length;
-        Some(flow_slot_ptr(index))
+        let pause = if entry.key.synthetic.protocol as u32 == IPPROTO_TCP
+            && slot.forward_pending_bytes >= TCP_FORWARD_HIGH_WATERMARK
+        {
+            if destination == slot.outbound && !slot.inbound_receive_paused {
+                slot.inbound_receive_paused = true;
+                slot.inbound_pause_pending = true;
+                slot.inbound_pause.enabling = false;
+                slot.inbound_pause.request_id = entry.request_id;
+                slot.inbound_pause.generation = entry.generation;
+                Some((slot.socket, core::ptr::addr_of_mut!(slot.inbound_pause)))
+            } else if destination == slot.socket && !slot.outbound_receive_paused {
+                slot.outbound_receive_paused = true;
+                slot.outbound_pause_pending = true;
+                slot.outbound_pause.enabling = false;
+                slot.outbound_pause.request_id = entry.request_id;
+                slot.outbound_pause.generation = entry.generation;
+                Some((slot.outbound, core::ptr::addr_of_mut!(slot.outbound_pause)))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        Some((flow_slot_ptr(index), pause))
     }
 }
 
@@ -3486,7 +3823,7 @@ fn prepare_forward_irp(
     total_length: usize,
 ) -> Option<(PIRP, *mut ForwardIrpContext)> {
     let length = unsafe { (*packet).buffer.Length as usize };
-    let slot = if account_submission {
+    let (slot, pause) = if account_submission {
         begin_forward_submission(index, destination, length)?
     } else {
         let _lock = lock_flow_table();
@@ -3499,8 +3836,13 @@ fn prepare_forward_irp(
         {
             return None;
         }
-        flow_slot_ptr(index)
+        (flow_slot_ptr(index), None)
     };
+    if let Some((socket, context)) = pause {
+        if !set_receive_event_callback(socket, unsafe { &mut *context }, false) {
+            cancel_receive_event_control(context);
+        }
+    }
     if !begin_wsk_operation(false) {
         if account_submission {
             finish_forward(index, STATUS_INVALID_DEVICE_STATE, length);
