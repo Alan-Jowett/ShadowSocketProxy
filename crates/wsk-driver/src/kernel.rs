@@ -374,6 +374,7 @@ struct FlowSocketSlot {
     outbound_close: FlowCloseContext,
     inbound_close_pending: bool,
     outbound_close_pending: bool,
+    mapping_wait_posted: bool,
     close_retry_deadline: u64,
 }
 
@@ -432,6 +433,7 @@ impl FlowSocketSlot {
             },
             inbound_close_pending: false,
             outbound_close_pending: false,
+            mapping_wait_posted: false,
             close_retry_deadline: 0,
         }
     }
@@ -824,27 +826,36 @@ fn dispatch_mapping_wait(
     if output_length < expected_output {
         return unsafe { complete_irp(irp, STATUS_BUFFER_TOO_SMALL, 0) };
     }
-    let pending_status = {
+    let immediate_flow = {
         let _lock = lock_session();
         if !SESSION_ACTIVE.load(Ordering::Acquire) || SESSION_TEARDOWN.load(Ordering::Acquire) {
-            Some(abi::Status::InvalidSession)
+            Err(abi::Status::InvalidSession)
         } else if let Err(error) = request
             .ok_or(abi::AbiError::InvalidAbi)
             .and_then(|request| request.validate(load_nonce()))
         {
-            Some(error.status())
+            Err(error.status())
+        } else if let Some(index) = take_awaiting_mapping_flow() {
+            Ok(Some(index))
         } else if !PENDING_MAPPING_IRP.load(Ordering::Acquire).is_null() {
-            Some(abi::Status::InvalidState)
+            Err(abi::Status::InvalidState)
         } else if !pend_mapping_irp(irp) {
-            Some(abi::Status::Cancelled)
+            Err(abi::Status::Cancelled)
         } else {
-            None
+            Ok(None)
         }
     };
-    if let Some(status) = pending_status {
-        return complete_mapping_wait_response(irp, buffer, request_header, status);
+    match immediate_flow {
+        Err(status) => complete_mapping_wait_response(irp, buffer, request_header, status),
+        Ok(Some(index)) => {
+            if publish_mapping_request(index, irp) {
+                STATUS_SUCCESS
+            } else {
+                complete_mapping_wait_response(irp, buffer, request_header, abi::Status::Cancelled)
+            }
+        }
+        Ok(None) => STATUS_PENDING,
     }
-    STATUS_PENDING
 }
 
 fn dispatch_mapping_completion(
@@ -1885,7 +1896,7 @@ enum FlowReservation {
 }
 
 enum ReservedFlow {
-    New(usize, PIRP),
+    New(usize, Option<PIRP>),
     Existing(usize),
     Full,
 }
@@ -1928,12 +1939,7 @@ fn reserve_flow(
         let deadline = now_100ns().saturating_add(MAPPING_TIMEOUT_100NS);
         match unsafe { FLOW_TABLE.reserve(key, request_id, generation, deadline) } {
             ReserveResult::New(index) => {
-                let Some(mapping_irp) = take_pending_mapping_irp() else {
-                    unsafe {
-                        FLOW_TABLE.release(index);
-                    }
-                    return FlowReservation::Full;
-                };
+                let mapping_irp = take_pending_mapping_irp();
                 unsafe {
                     let slot = &mut FLOW_SLOTS[index];
                     slot.socket = if synthetic.protocol as u32 == IPPROTO_UDP {
@@ -1964,6 +1970,7 @@ fn reserve_flow(
                     slot.pending_outbound_bytes = 0;
                     slot.inbound_close_pending = false;
                     slot.outbound_close_pending = false;
+                    slot.mapping_wait_posted = mapping_irp.is_some();
                     slot.close_retry_deadline = 0;
                 }
                 ReservedFlow::New(index, mapping_irp)
@@ -1974,16 +1981,33 @@ fn reserve_flow(
     };
     match reservation {
         ReservedFlow::New(index, mapping_irp) => {
-            if publish_mapping_request(index, mapping_irp) {
-                FlowReservation::New(index)
-            } else {
-                begin_flow_close_async(index);
-                FlowReservation::Full
+            if let Some(mapping_irp) = mapping_irp {
+                if !publish_mapping_request(index, mapping_irp) {
+                    begin_flow_close_async(index);
+                    return FlowReservation::Full;
+                }
             }
+            FlowReservation::New(index)
         }
         ReservedFlow::Existing(index) => FlowReservation::Existing(index),
         ReservedFlow::Full => FlowReservation::Full,
     }
+}
+
+fn take_awaiting_mapping_flow() -> Option<usize> {
+    let _lock = lock_flow_table();
+    for index in 0..FLOW_TABLE_CAPACITY {
+        if unsafe { FLOW_TABLE.get(index) }
+            .is_some_and(|entry| entry.state == FlowState::AwaitingMapping)
+            && unsafe { !FLOW_SLOTS[index].mapping_wait_posted }
+        {
+            unsafe {
+                FLOW_SLOTS[index].mapping_wait_posted = true;
+            }
+            return Some(index);
+        }
+    }
+    None
 }
 
 fn publish_mapping_request(index: usize, irp: PIRP) -> bool {
@@ -2042,6 +2066,7 @@ fn reset_flow_slot(slot: &mut FlowSocketSlot) {
     slot.pending_outbound_bytes = 0;
     slot.inbound_close_pending = false;
     slot.outbound_close_pending = false;
+    slot.mapping_wait_posted = false;
     slot.close_retry_deadline = 0;
 }
 
@@ -3421,11 +3446,14 @@ unsafe extern "C" fn forward_irp_completion(
                 IoFreeIrp(irp);
             }
             finish_wsk_operation();
-            if datagram {
+            let resent = if datagram {
                 submit_datagram_packet(index, destination, packet, remote_address, false, length)
             } else {
                 submit_stream_packet(index, destination, packet, false, length)
             };
+            if !resent {
+                free_owned_buffer(packet);
+            }
             return STATUS_MORE_PROCESSING_REQUIRED;
         }
         free_owned_buffer(packet);
@@ -3477,6 +3505,8 @@ fn prepare_forward_irp(
         if account_submission {
             finish_forward(index, STATUS_INVALID_DEVICE_STATE, length);
             finish_forward_submission(index);
+        } else {
+            finish_forward(index, STATUS_INVALID_DEVICE_STATE, total_length);
         }
         return None;
     }
@@ -3486,6 +3516,8 @@ fn prepare_forward_irp(
         if account_submission {
             finish_forward(index, STATUS_INSUFFICIENT_RESOURCES, length);
             finish_forward_submission(index);
+        } else {
+            finish_forward(index, STATUS_INSUFFICIENT_RESOURCES, total_length);
         }
         return None;
     }
@@ -3499,6 +3531,8 @@ fn prepare_forward_irp(
         if account_submission {
             finish_forward(index, STATUS_INSUFFICIENT_RESOURCES, length);
             finish_forward_submission(index);
+        } else {
+            finish_forward(index, STATUS_INSUFFICIENT_RESOURCES, total_length);
         }
         return None;
     }
@@ -3533,6 +3567,8 @@ fn prepare_forward_irp(
         if account_submission {
             finish_forward(index, status, length);
             finish_forward_submission(index);
+        } else {
+            finish_forward(index, status, total_length);
         }
         return None;
     }
@@ -3556,10 +3592,6 @@ fn submit_stream_packet(
         account_submission,
         total_length,
     ) else {
-        if !account_submission {
-            free_owned_buffer(packet);
-            finish_forward(index, STATUS_INSUFFICIENT_RESOURCES, total_length);
-        }
         return false;
     };
     let dispatch =
@@ -3640,10 +3672,6 @@ fn submit_datagram_packet(
         account_submission,
         total_length,
     ) else {
-        if !account_submission {
-            free_owned_buffer(packet);
-            finish_forward(index, STATUS_INSUFFICIENT_RESOURCES, total_length);
-        }
         return false;
     };
     let dispatch = unsafe { (*destination).Dispatch as *const wsk::WSK_PROVIDER_DATAGRAM_DISPATCH };

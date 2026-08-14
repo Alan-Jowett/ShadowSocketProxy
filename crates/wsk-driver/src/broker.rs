@@ -3,7 +3,7 @@
 //! User-mode broker-side IOCTL transport and session state machine.
 
 #[cfg(windows)]
-use std::sync::{atomic::AtomicPtr, Arc};
+use std::sync::{Arc, Mutex};
 use std::{
     fmt, io,
     sync::atomic::{AtomicU64, Ordering},
@@ -333,7 +333,7 @@ pub struct WindowsDevice {
     /// Open handle to the installed device.
     handle: Arc<std::fs::File>,
     /// Native handle for the thread currently issuing a synchronous IOCTL.
-    issuing_thread: Arc<AtomicPtr<std::ffi::c_void>>,
+    issuing_thread: Arc<Mutex<Option<usize>>>,
 }
 
 #[cfg(windows)]
@@ -347,18 +347,16 @@ impl WindowsDevice {
             .map_err(BrokerError::Transport)?;
         Ok(Self {
             handle: Arc::new(handle),
-            issuing_thread: Arc::new(AtomicPtr::new(std::ptr::null_mut())),
+            issuing_thread: Arc::new(Mutex::new(None)),
         })
     }
 
     /// Cancels pending device I/O so a synchronous mapping wait can shut down.
     pub fn cancel_pending_io(&self) {
-        let thread = self
-            .issuing_thread
-            .load(std::sync::atomic::Ordering::Acquire);
-        if !thread.is_null() {
+        let thread = *self.issuing_thread.lock().unwrap();
+        if let Some(thread) = thread {
             unsafe {
-                let _ = CancelSynchronousIo(thread);
+                let _ = CancelSynchronousIo(thread as *mut std::ffi::c_void);
             }
         }
     }
@@ -385,8 +383,7 @@ impl IoctlTransport for WindowsDevice {
                 return Err(BrokerError::Transport(io::Error::last_os_error()));
             }
         }
-        self.issuing_thread
-            .store(thread, std::sync::atomic::Ordering::Release);
+        *self.issuing_thread.lock().unwrap() = Some(thread as usize);
         let mut output = vec![0u8; output_size];
         let mut returned = 0u32;
         let ok = unsafe {
@@ -401,10 +398,11 @@ impl IoctlTransport for WindowsDevice {
                 std::ptr::null_mut(),
             )
         };
-        self.issuing_thread
-            .store(std::ptr::null_mut(), std::sync::atomic::Ordering::Release);
-        unsafe {
-            CloseHandle(thread);
+        let thread = self.issuing_thread.lock().unwrap().take();
+        if let Some(thread) = thread {
+            unsafe {
+                CloseHandle(thread as *mut std::ffi::c_void);
+            }
         }
         if ok == 0 {
             return Err(BrokerError::Transport(io::Error::last_os_error()));
