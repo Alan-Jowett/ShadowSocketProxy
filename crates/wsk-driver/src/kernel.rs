@@ -1309,21 +1309,8 @@ where
         }
         finish_wsk_operation();
         return Err(set_status);
-    }
+    };
     let operation_status = operation(irp);
-    if operation_status != STATUS_PENDING {
-        let status = unsafe { (*irp).IoStatus.__bindgen_anon_1.Status };
-        let information = unsafe { (*irp).IoStatus.Information as u64 };
-        unsafe {
-            IoFreeIrp(irp);
-        }
-        finish_wsk_operation();
-        return if operation_status == STATUS_SUCCESS {
-            Ok((status, information))
-        } else {
-            Err(operation_status)
-        };
-    }
     let mut timeout = LARGE_INTEGER {
         QuadPart: -(WSK_OPERATION_TIMEOUT_MS * 10_000),
     };
@@ -1341,7 +1328,9 @@ where
         let information = (*irp).IoStatus.Information as u64;
         IoFreeIrp(irp);
         finish_wsk_operation();
-        if wait_status == STATUS_TIMEOUT {
+        if operation_status != STATUS_SUCCESS && operation_status != STATUS_PENDING {
+            Err(operation_status)
+        } else if wait_status == STATUS_TIMEOUT {
             if status == STATUS_SUCCESS {
                 Ok((status, information))
             } else {
@@ -1637,23 +1626,8 @@ fn set_receive_event_callback(
             irp.cast(),
         )
     };
-    if status == STATUS_PENDING {
-        return true;
-    }
-    if status != STATUS_SUCCESS {
+    if status != STATUS_SUCCESS && status != STATUS_PENDING {
         debug_status(b"WskControlSocket receive callback\0", status);
-        unsafe {
-            IoFreeIrp(irp);
-        }
-        finish_wsk_operation();
-        return false;
-    }
-    unsafe {
-        receive_pause_completion(
-            null_mut(),
-            irp,
-            (context as *mut ReceivePauseContext).cast(),
-        );
     }
     true
 }
@@ -1884,26 +1858,10 @@ fn close_socket_async(socket: wsk::PWSK_SOCKET, context: &mut FlowCloseContext) 
         }
         finish_wsk_operation();
         return false;
-    }
-    let status = unsafe { close(socket, irp.cast()) };
-    if status == STATUS_PENDING {
-        true
-    } else if status == STATUS_SUCCESS {
-        let close = &*context;
-        let index = flow_slot_index(close.slot);
-        finish_flow_close(index, close.outbound, true);
-        unsafe {
-            IoFreeIrp(irp);
-        }
-        finish_wsk_operation();
-        true
-    } else {
-        unsafe {
-            IoFreeIrp(irp);
-        }
-        finish_wsk_operation();
-        false
-    }
+    };
+    // WSK completes this IRP for immediate and deferred close results.
+    let _ = unsafe { close(socket, irp.cast()) };
+    true
 }
 
 fn close_listener_slot(slot: *mut wsk::PWSK_SOCKET) -> bool {
@@ -3924,7 +3882,6 @@ fn submit_stream_packet(
     account_submission: bool,
     total_length: usize,
 ) -> bool {
-    let length = unsafe { (*packet).buffer.Length as usize };
     let Some((irp, context)) = prepare_forward_irp(
         index,
         destination,
@@ -3956,44 +3913,12 @@ fn submit_stream_packet(
         }
         return false;
     };
-    let status = unsafe { send(destination, &mut (*packet).buffer, 0, irp.cast()) };
+    // WSK completes this IRP for immediate and deferred send results.
+    let _ = unsafe { send(destination, &mut (*packet).buffer, 0, irp.cast()) };
     if account_submission {
         finish_forward_submission(index);
     }
-    if status == STATUS_PENDING {
-        true
-    } else if status == STATUS_SUCCESS {
-        let information = unsafe { (*irp).IoStatus.Information as usize };
-        if information > 0 && information < length {
-            unsafe {
-                (*packet).buffer.Offset += information as u32;
-                (*packet).buffer.Length = (length - information) as u64;
-                (*context).packet = null_mut();
-                ExFreePool(context.cast());
-                IoFreeIrp(irp);
-            }
-            finish_wsk_operation();
-            return submit_stream_packet(index, destination, packet, false, total_length);
-        }
-        unsafe {
-            free_owned_buffer(packet);
-            (*context).packet = null_mut();
-            ExFreePool(context.cast());
-            IoFreeIrp(irp);
-        }
-        finish_wsk_operation();
-        finish_forward(index, STATUS_SUCCESS, total_length);
-        true
-    } else {
-        unsafe {
-            (*context).packet = null_mut();
-            ExFreePool(context.cast());
-            IoFreeIrp(irp);
-        }
-        finish_wsk_operation();
-        finish_forward(index, status, total_length);
-        false
-    }
+    true
 }
 
 fn submit_datagram_packet(
@@ -4004,7 +3929,6 @@ fn submit_datagram_packet(
     account_submission: bool,
     total_length: usize,
 ) -> bool {
-    let length = unsafe { (*packet).buffer.Length as usize };
     let Some((irp, context)) = prepare_forward_irp(
         index,
         destination,
@@ -4035,7 +3959,8 @@ fn submit_datagram_packet(
         }
         return false;
     };
-    let status = unsafe {
+    // WSK completes this IRP for immediate and deferred send results.
+    let _ = unsafe {
         send_to(
             destination,
             &mut (*packet).buffer,
@@ -4049,47 +3974,7 @@ fn submit_datagram_packet(
     if account_submission {
         finish_forward_submission(index);
     }
-    if status == STATUS_PENDING {
-        true
-    } else if status == STATUS_SUCCESS {
-        let information = unsafe { (*irp).IoStatus.Information as usize };
-        if information > 0 && information < length {
-            unsafe {
-                (*packet).buffer.Offset += information as u32;
-                (*packet).buffer.Length = (length - information) as u64;
-                (*context).packet = null_mut();
-                ExFreePool(context.cast());
-                IoFreeIrp(irp);
-            }
-            finish_wsk_operation();
-            return submit_datagram_packet(
-                index,
-                destination,
-                packet,
-                remote_address,
-                false,
-                total_length,
-            );
-        }
-        unsafe {
-            free_owned_buffer(packet);
-            (*context).packet = null_mut();
-            ExFreePool(context.cast());
-            IoFreeIrp(irp);
-        }
-        finish_wsk_operation();
-        finish_forward(index, STATUS_SUCCESS, total_length);
-        true
-    } else {
-        unsafe {
-            (*context).packet = null_mut();
-            ExFreePool(context.cast());
-            IoFreeIrp(irp);
-        }
-        finish_wsk_operation();
-        finish_forward(index, status, total_length);
-        false
-    }
+    true
 }
 
 fn register_wsk() -> NTSTATUS {
