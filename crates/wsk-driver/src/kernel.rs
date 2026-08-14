@@ -29,7 +29,7 @@ use wdk_sys::{
         KeFlushQueuedDpcs, KeGetCurrentIrql, KeInitializeDpc, KeInitializeEvent,
         KeInitializeSpinLock, KeInitializeTimerEx, KeQueryInterruptTimePrecise, KeReleaseSpinLock,
         KeSetEvent, KeSetTimerEx, KeWaitForSingleObject, MmBuildMdlForNonPagedPool,
-        MmMapLockedPagesSpecifyCache,
+        MmMapLockedPagesSpecifyCache, MmUnmapLockedPages,
     },
     DRIVER_OBJECT, GUID, KDPC, KEVENT, KIRQL, KSPIN_LOCK, KTIMER, LARGE_INTEGER, NTSTATUS,
     PDEVICE_OBJECT, PDRIVER_CANCEL, PIRP, PMDL, POOL_FLAG_NON_PAGED, PUNICODE_STRING, PVOID,
@@ -2013,6 +2013,18 @@ fn begin_flow_close_async(index: usize) {
     begin_flow_close_async_if_identity(index, abi::RequestId(0), abi::Generation(0));
 }
 
+fn reject_accept_flow(index: usize) {
+    {
+        let _lock = lock_flow_table();
+        unsafe {
+            if FLOW_TABLE.get(index).is_some() {
+                FLOW_SLOTS[index].socket = null_mut();
+            }
+        }
+    }
+    begin_flow_close_async(index);
+}
+
 fn begin_flow_close_async_if_identity(
     index: usize,
     expected_request_id: abi::RequestId,
@@ -2707,7 +2719,7 @@ unsafe extern "C" fn wsk_accept_event(
         }
     }
     if !enable_socket_event_callbacks(accept_socket, WSK_EVENT_DISCONNECT) {
-        begin_flow_close_async(index);
+        reject_accept_flow(index);
         return STATUS_REQUEST_NOT_ACCEPTED;
     }
     let _ = context;
@@ -2934,25 +2946,28 @@ unsafe fn allocate_nonpaged(size: usize) -> PVOID {
     unsafe { ExAllocatePool2(POOL_FLAG_NON_PAGED, size.max(1) as u64, FORWARD_POOL_TAG) }
 }
 
-unsafe fn mdl_system_address(mdl: PMDL) -> *mut u8 {
+unsafe fn mdl_system_address(mdl: PMDL) -> (*mut u8, bool) {
     if mdl.is_null() {
-        return null_mut();
+        return (null_mut(), false);
     }
     let flags = unsafe { (*mdl).MdlFlags };
     if flags & (MDL_MAPPED_TO_SYSTEM_VA | MDL_SOURCE_IS_NONPAGED_POOL) != 0 {
-        return unsafe { (*mdl).MappedSystemVa.cast() };
+        return (unsafe { (*mdl).MappedSystemVa.cast() }, false);
     }
-    unsafe {
-        MmMapLockedPagesSpecifyCache(
-            mdl,
-            0,
-            1,
-            null_mut(),
-            0,
-            NORMAL_PAGE_PRIORITY | MDL_MAPPING_NO_EXECUTE,
-        )
-        .cast()
-    }
+    (
+        unsafe {
+            MmMapLockedPagesSpecifyCache(
+                mdl,
+                0,
+                1,
+                null_mut(),
+                0,
+                NORMAL_PAGE_PRIORITY | MDL_MAPPING_NO_EXECUTE,
+            )
+            .cast()
+        },
+        true,
+    )
 }
 
 fn copy_forward_buffer(source: &wsk::WSK_BUF) -> *mut OwnedForwardBuffer {
@@ -2991,7 +3006,7 @@ fn copy_forward_buffer(source: &wsk::WSK_BUF) -> *mut OwnedForwardBuffer {
             }
             return null_mut();
         }
-        let source_address = unsafe { mdl_system_address(source_mdl.cast()) };
+        let (source_address, mapped) = unsafe { mdl_system_address(source_mdl.cast()) };
         if source_address.is_null() {
             unsafe {
                 IoFreeMdl(mdl);
@@ -3007,6 +3022,9 @@ fn copy_forward_buffer(source: &wsk::WSK_BUF) -> *mut OwnedForwardBuffer {
                 allocation.cast::<u8>().add(copied),
                 amount,
             );
+            if mapped {
+                MmUnmapLockedPages(source_address.cast(), source_mdl.cast());
+            }
         }
         copied += amount;
         source_offset = 0;
