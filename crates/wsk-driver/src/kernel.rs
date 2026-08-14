@@ -337,7 +337,10 @@ struct OwnedForwardBuffer {
 struct ForwardIrpContext {
     slot: *mut FlowSocketSlot,
     packet: *mut OwnedForwardBuffer,
-    length: usize,
+    destination: wsk::PWSK_SOCKET,
+    datagram: bool,
+    submitted_length: usize,
+    total_length: usize,
     remote_address: [u8; 28],
 }
 
@@ -874,11 +877,7 @@ fn dispatch_mapping_completion(
     let response = abi::AbiHeader::response(
         abi::Opcode::CompleteRequest,
         status,
-        if SESSION_ACTIVE.load(Ordering::Acquire) {
-            load_nonce()
-        } else {
-            request_header.session_nonce
-        },
+        request_header.session_nonce,
         request_header.request_id,
         request_header.generation,
         expected_output,
@@ -1073,9 +1072,27 @@ fn clear_session() {
 }
 
 fn clear_session_if_owner(owner: *mut c_void) {
-    if SESSION_OWNER.load(Ordering::Acquire) == owner {
-        clear_session();
+    let pending = {
+        let _lock = lock_session();
+        if SESSION_OWNER.load(Ordering::Acquire) != owner
+            || SESSION_TEARDOWN.load(Ordering::Acquire)
+        {
+            return;
+        }
+        SESSION_TEARDOWN.store(true, Ordering::Release);
+        SESSION_ACTIVE.store(false, Ordering::Release);
+        SESSION_OWNER.store(null_mut(), Ordering::Release);
+        store_nonce(abi::SessionNonce::zero());
+        SESSION_REQUEST_ID.store(0, Ordering::Release);
+        SESSION_GENERATION.store(0, Ordering::Release);
+        take_pending_mapping_irp()
+    };
+    if let Some(irp) = pending {
+        complete_mapping_wait_irp(irp, abi::Status::Cancelled);
     }
+    drain_active_flows();
+    let _lock = lock_session();
+    SESSION_TEARDOWN.store(false, Ordering::Release);
 }
 
 fn generate_nonce() -> Option<abi::SessionNonce> {
@@ -1514,6 +1531,7 @@ fn setup_listener(
     family: u16,
     protocol: u32,
     context: &'static ListenerContext,
+    slot: *mut wsk::PWSK_SOCKET,
 ) -> Option<wsk::PWSK_SOCKET> {
     let (socket_type, flags, dispatch) = if protocol == IPPROTO_TCP {
         (
@@ -1538,8 +1556,11 @@ fn setup_listener(
         (context as *const ListenerContext).cast_mut().cast(),
         dispatch,
     )?;
+    unsafe {
+        *slot = socket;
+    }
     if !bind_socket(socket, family, protocol) {
-        let _ = close_socket_sync(socket);
+        let _ = close_listener_slot(slot);
         return None;
     }
     let event_mask = if protocol == IPPROTO_TCP {
@@ -1548,7 +1569,7 @@ fn setup_listener(
         WSK_EVENT_RECEIVE_FROM
     };
     if !enable_socket_event_callbacks(socket, event_mask) {
-        let _ = close_socket_sync(socket);
+        let _ = close_listener_slot(slot);
         return None;
     }
     Some(socket)
@@ -2847,7 +2868,11 @@ unsafe extern "C" fn wsk_outbound_receive_from_event(
             continue;
         }
         let packet = copy_forward_buffer(unsafe { &(*current).Buffer });
-        if packet.is_null() || !submit_datagram_packet(index, listener, packet, client) {
+        if packet.is_null()
+            || !submit_datagram_packet(index, listener, packet, client, true, unsafe {
+                (*packet).buffer.Length as usize
+            })
+        {
             if !packet.is_null() {
                 free_owned_buffer(packet);
             }
@@ -3167,7 +3192,9 @@ fn queue_or_forward_udp_packet(index: usize, packet: *mut OwnedForwardBuffer) ->
     let Some(remote) = remote else {
         return false;
     };
-    submit_datagram_packet(index, destination, packet, remote)
+    submit_datagram_packet(index, destination, packet, remote, true, unsafe {
+        (*packet).buffer.Length as usize
+    })
 }
 
 fn flush_pending_udp_packets(index: usize) -> bool {
@@ -3197,7 +3224,9 @@ fn flush_pending_udp_packets(index: usize) -> bool {
         unsafe {
             (*packet).next = null_mut();
         }
-        if !submit_datagram_packet(index, destination, packet, remote) {
+        if !submit_datagram_packet(index, destination, packet, remote, true, unsafe {
+            (*packet).buffer.Length as usize
+        }) {
             free_owned_buffer(packet);
             free_owned_buffer_list(next);
             return false;
@@ -3258,7 +3287,9 @@ fn queue_or_forward_stream_packet(
             }
         }
     };
-    submit_stream_packet(index, destination, packet)
+    submit_stream_packet(index, destination, packet, true, unsafe {
+        (*packet).buffer.Length as usize
+    })
 }
 
 fn flush_stream_packet_list(
@@ -3271,7 +3302,9 @@ fn flush_stream_packet_list(
         unsafe {
             (*packet).next = null_mut();
         }
-        if !submit_stream_packet(index, destination, packet) {
+        if !submit_stream_packet(index, destination, packet, true, unsafe {
+            (*packet).buffer.Length as usize
+        }) {
             free_owned_buffer(packet);
             free_owned_buffer_list(next);
             return false;
@@ -3375,7 +3408,26 @@ unsafe extern "C" fn forward_irp_completion(
         let forward = context.cast::<ForwardIrpContext>();
         index = flow_slot_index(unsafe { (*forward).slot });
         let packet = unsafe { (*forward).packet };
-        length = unsafe { (*forward).length };
+        let submitted_length = unsafe { (*forward).submitted_length };
+        length = unsafe { (*forward).total_length };
+        let destination = unsafe { (*forward).destination };
+        let datagram = unsafe { (*forward).datagram };
+        let remote_address = unsafe { (*forward).remote_address };
+        if status == STATUS_SUCCESS && information > 0 && information < submitted_length {
+            unsafe {
+                (*packet).buffer.Offset += information as u32;
+                (*packet).buffer.Length = (submitted_length - information) as u64;
+                ExFreePool(forward.cast());
+                IoFreeIrp(irp);
+            }
+            finish_wsk_operation();
+            if datagram {
+                submit_datagram_packet(index, destination, packet, remote_address, false, length)
+            } else {
+                submit_stream_packet(index, destination, packet, false, length)
+            };
+            return STATUS_MORE_PROCESSING_REQUIRED;
+        }
         free_owned_buffer(packet);
         unsafe {
             ExFreePool(forward.cast());
@@ -3401,19 +3453,40 @@ fn prepare_forward_irp(
     destination: wsk::PWSK_SOCKET,
     packet: *mut OwnedForwardBuffer,
     remote_address: [u8; 28],
+    datagram: bool,
+    account_submission: bool,
+    total_length: usize,
 ) -> Option<(PIRP, *mut ForwardIrpContext)> {
     let length = unsafe { (*packet).buffer.Length as usize };
-    let slot = begin_forward_submission(index, destination, length)?;
+    let slot = if account_submission {
+        begin_forward_submission(index, destination, length)?
+    } else {
+        let _lock = lock_flow_table();
+        let entry = unsafe { FLOW_TABLE.get(index) }?;
+        let slot = unsafe { &mut FLOW_SLOTS[index] };
+        if entry.state != FlowState::Mapped && entry.state != FlowState::Closing
+            || (destination != slot.socket
+                && destination != slot.outbound
+                && destination != slot.udp_listener)
+        {
+            return None;
+        }
+        flow_slot_ptr(index)
+    };
     if !begin_wsk_operation(false) {
-        finish_forward(index, STATUS_INVALID_DEVICE_STATE, length);
-        finish_forward_submission(index);
+        if account_submission {
+            finish_forward(index, STATUS_INVALID_DEVICE_STATE, length);
+            finish_forward_submission(index);
+        }
         return None;
     }
     let irp = unsafe { IoAllocateIrp(1, 0) };
     if irp.is_null() {
         finish_wsk_operation();
-        finish_forward(index, STATUS_INSUFFICIENT_RESOURCES, length);
-        finish_forward_submission(index);
+        if account_submission {
+            finish_forward(index, STATUS_INSUFFICIENT_RESOURCES, length);
+            finish_forward_submission(index);
+        }
         return None;
     }
     let context =
@@ -3423,15 +3496,20 @@ fn prepare_forward_irp(
             IoFreeIrp(irp);
         }
         finish_wsk_operation();
-        finish_forward(index, STATUS_INSUFFICIENT_RESOURCES, length);
-        finish_forward_submission(index);
+        if account_submission {
+            finish_forward(index, STATUS_INSUFFICIENT_RESOURCES, length);
+            finish_forward_submission(index);
+        }
         return None;
     }
     unsafe {
         context.write(ForwardIrpContext {
             slot,
             packet,
-            length,
+            destination,
+            datagram,
+            submitted_length: length,
+            total_length,
             remote_address,
         });
     }
@@ -3452,8 +3530,10 @@ fn prepare_forward_irp(
             IoFreeIrp(irp);
         }
         finish_wsk_operation();
-        finish_forward(index, status, length);
-        finish_forward_submission(index);
+        if account_submission {
+            finish_forward(index, status, length);
+            finish_forward_submission(index);
+        }
         return None;
     }
     Some((irp, context))
@@ -3463,9 +3543,23 @@ fn submit_stream_packet(
     index: usize,
     destination: wsk::PWSK_SOCKET,
     packet: *mut OwnedForwardBuffer,
+    account_submission: bool,
+    total_length: usize,
 ) -> bool {
     let length = unsafe { (*packet).buffer.Length as usize };
-    let Some((irp, context)) = prepare_forward_irp(index, destination, packet, [0; 28]) else {
+    let Some((irp, context)) = prepare_forward_irp(
+        index,
+        destination,
+        packet,
+        [0; 28],
+        false,
+        account_submission,
+        total_length,
+    ) else {
+        if !account_submission {
+            free_owned_buffer(packet);
+            finish_forward(index, STATUS_INSUFFICIENT_RESOURCES, total_length);
+        }
         return false;
     };
     let dispatch =
@@ -3482,15 +3576,31 @@ fn submit_stream_packet(
             IoFreeIrp(irp);
         }
         finish_wsk_operation();
-        finish_forward(index, STATUS_NOT_SUPPORTED, length);
-        finish_forward_submission(index);
+        finish_forward(index, STATUS_NOT_SUPPORTED, total_length);
+        if account_submission {
+            finish_forward_submission(index);
+        }
         return false;
     };
     let status = unsafe { send(destination, &mut (*packet).buffer, 0, irp.cast()) };
-    finish_forward_submission(index);
+    if account_submission {
+        finish_forward_submission(index);
+    }
     if status == STATUS_PENDING {
         true
     } else if status == STATUS_SUCCESS {
+        let information = unsafe { (*irp).IoStatus.Information as usize };
+        if information > 0 && information < length {
+            unsafe {
+                (*packet).buffer.Offset += information as u32;
+                (*packet).buffer.Length = (length - information) as u64;
+                (*context).packet = null_mut();
+                ExFreePool(context.cast());
+                IoFreeIrp(irp);
+            }
+            finish_wsk_operation();
+            return submit_stream_packet(index, destination, packet, false, total_length);
+        }
         unsafe {
             free_owned_buffer(packet);
             (*context).packet = null_mut();
@@ -3498,7 +3608,7 @@ fn submit_stream_packet(
             IoFreeIrp(irp);
         }
         finish_wsk_operation();
-        finish_forward(index, STATUS_SUCCESS, length);
+        finish_forward(index, STATUS_SUCCESS, total_length);
         true
     } else {
         unsafe {
@@ -3507,7 +3617,7 @@ fn submit_stream_packet(
             IoFreeIrp(irp);
         }
         finish_wsk_operation();
-        finish_forward(index, status, length);
+        finish_forward(index, status, total_length);
         false
     }
 }
@@ -3517,10 +3627,23 @@ fn submit_datagram_packet(
     destination: wsk::PWSK_SOCKET,
     packet: *mut OwnedForwardBuffer,
     remote_address: [u8; 28],
+    account_submission: bool,
+    total_length: usize,
 ) -> bool {
     let length = unsafe { (*packet).buffer.Length as usize };
-    let Some((irp, context)) = prepare_forward_irp(index, destination, packet, remote_address)
-    else {
+    let Some((irp, context)) = prepare_forward_irp(
+        index,
+        destination,
+        packet,
+        remote_address,
+        true,
+        account_submission,
+        total_length,
+    ) else {
+        if !account_submission {
+            free_owned_buffer(packet);
+            finish_forward(index, STATUS_INSUFFICIENT_RESOURCES, total_length);
+        }
         return false;
     };
     let dispatch = unsafe { (*destination).Dispatch as *const wsk::WSK_PROVIDER_DATAGRAM_DISPATCH };
@@ -3536,8 +3659,10 @@ fn submit_datagram_packet(
             IoFreeIrp(irp);
         }
         finish_wsk_operation();
-        finish_forward(index, STATUS_NOT_SUPPORTED, length);
-        finish_forward_submission(index);
+        finish_forward(index, STATUS_NOT_SUPPORTED, total_length);
+        if account_submission {
+            finish_forward_submission(index);
+        }
         return false;
     };
     let status = unsafe {
@@ -3551,10 +3676,31 @@ fn submit_datagram_packet(
             irp.cast(),
         )
     };
-    finish_forward_submission(index);
+    if account_submission {
+        finish_forward_submission(index);
+    }
     if status == STATUS_PENDING {
         true
     } else if status == STATUS_SUCCESS {
+        let information = unsafe { (*irp).IoStatus.Information as usize };
+        if information > 0 && information < length {
+            unsafe {
+                (*packet).buffer.Offset += information as u32;
+                (*packet).buffer.Length = (length - information) as u64;
+                (*context).packet = null_mut();
+                ExFreePool(context.cast());
+                IoFreeIrp(irp);
+            }
+            finish_wsk_operation();
+            return submit_datagram_packet(
+                index,
+                destination,
+                packet,
+                remote_address,
+                false,
+                total_length,
+            );
+        }
         unsafe {
             free_owned_buffer(packet);
             (*context).packet = null_mut();
@@ -3562,7 +3708,7 @@ fn submit_datagram_packet(
             IoFreeIrp(irp);
         }
         finish_wsk_operation();
-        finish_forward(index, STATUS_SUCCESS, length);
+        finish_forward(index, STATUS_SUCCESS, total_length);
         true
     } else {
         unsafe {
@@ -3571,7 +3717,7 @@ fn submit_datagram_packet(
             IoFreeIrp(irp);
         }
         finish_wsk_operation();
-        finish_forward(index, status, length);
+        finish_forward(index, status, total_length);
         false
     }
 }
@@ -3608,32 +3754,34 @@ fn register_wsk() -> NTSTATUS {
         debug_status(b"set_static_event_callbacks\0", status);
     }
 
-    let tcp_v4 = setup_listener(AF_INET, IPPROTO_TCP, &TCP_CONTEXT_V4);
-    let tcp_v6 = setup_listener(AF_INET6, IPPROTO_TCP, &TCP_CONTEXT_V6);
-    let udp_v4 = setup_listener(AF_INET, IPPROTO_UDP, &UDP_CONTEXT_V4);
-    let udp_v6 = setup_listener(AF_INET6, IPPROTO_UDP, &UDP_CONTEXT_V6);
+    let tcp_v4 = setup_listener(
+        AF_INET,
+        IPPROTO_TCP,
+        &TCP_CONTEXT_V4,
+        core::ptr::addr_of_mut!(TCP_LISTENER_V4),
+    );
+    let tcp_v6 = setup_listener(
+        AF_INET6,
+        IPPROTO_TCP,
+        &TCP_CONTEXT_V6,
+        core::ptr::addr_of_mut!(TCP_LISTENER_V6),
+    );
+    let udp_v4 = setup_listener(
+        AF_INET,
+        IPPROTO_UDP,
+        &UDP_CONTEXT_V4,
+        core::ptr::addr_of_mut!(UDP_LISTENER_V4),
+    );
+    let udp_v6 = setup_listener(
+        AF_INET6,
+        IPPROTO_UDP,
+        &UDP_CONTEXT_V6,
+        core::ptr::addr_of_mut!(UDP_LISTENER_V6),
+    );
     if tcp_v4.is_none() || tcp_v6.is_none() || udp_v4.is_none() || udp_v6.is_none() {
         debug_status(b"setup_listener\0", STATUS_NOT_SUPPORTED);
-        if let Some(socket) = tcp_v4 {
-            let _ = close_socket_sync(socket);
-        }
-        if let Some(socket) = tcp_v6 {
-            let _ = close_socket_sync(socket);
-        }
-        if let Some(socket) = udp_v4 {
-            let _ = close_socket_sync(socket);
-        }
-        if let Some(socket) = udp_v6 {
-            let _ = close_socket_sync(socket);
-        }
         unregister_wsk();
         return STATUS_NOT_SUPPORTED;
-    }
-    unsafe {
-        TCP_LISTENER_V4 = tcp_v4.unwrap_or(null_mut());
-        TCP_LISTENER_V6 = tcp_v6.unwrap_or(null_mut());
-        UDP_LISTENER_V4 = udp_v4.unwrap_or(null_mut());
-        UDP_LISTENER_V6 = udp_v6.unwrap_or(null_mut());
     }
     initialize_mapping_timer();
     STATUS_SUCCESS

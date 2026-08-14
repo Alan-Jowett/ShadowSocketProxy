@@ -3,7 +3,7 @@
 //! User-mode broker-side IOCTL transport and session state machine.
 
 #[cfg(windows)]
-use std::sync::Arc;
+use std::sync::{atomic::AtomicPtr, Arc};
 use std::{
     fmt, io,
     sync::atomic::{AtomicU64, Ordering},
@@ -332,6 +332,8 @@ impl<T: IoctlTransport> IoctlBroker<T> {
 pub struct WindowsDevice {
     /// Open handle to the installed device.
     handle: Arc<std::fs::File>,
+    /// Native handle for the thread currently issuing a synchronous IOCTL.
+    issuing_thread: Arc<AtomicPtr<std::ffi::c_void>>,
 }
 
 #[cfg(windows)]
@@ -345,15 +347,19 @@ impl WindowsDevice {
             .map_err(BrokerError::Transport)?;
         Ok(Self {
             handle: Arc::new(handle),
+            issuing_thread: Arc::new(AtomicPtr::new(std::ptr::null_mut())),
         })
     }
 
     /// Cancels pending device I/O so a synchronous mapping wait can shut down.
     pub fn cancel_pending_io(&self) {
-        use std::os::windows::io::AsRawHandle;
-
-        unsafe {
-            let _ = CancelIoEx(self.handle.as_raw_handle(), std::ptr::null_mut());
+        let thread = self
+            .issuing_thread
+            .load(std::sync::atomic::Ordering::Acquire);
+        if !thread.is_null() {
+            unsafe {
+                let _ = CancelSynchronousIo(thread);
+            }
         }
     }
 }
@@ -363,6 +369,24 @@ impl IoctlTransport for WindowsDevice {
     /// Sends a synchronous buffered `DeviceIoControl` request.
     fn ioctl(&self, code: u32, input: &[u8], output_size: usize) -> Result<Vec<u8>, BrokerError> {
         use std::os::windows::io::AsRawHandle;
+
+        let mut thread = std::ptr::null_mut();
+        unsafe {
+            if DuplicateHandle(
+                GetCurrentProcess(),
+                GetCurrentThread(),
+                GetCurrentProcess(),
+                &mut thread,
+                0,
+                0,
+                2,
+            ) == 0
+            {
+                return Err(BrokerError::Transport(io::Error::last_os_error()));
+            }
+        }
+        self.issuing_thread
+            .store(thread, std::sync::atomic::Ordering::Release);
         let mut output = vec![0u8; output_size];
         let mut returned = 0u32;
         let ok = unsafe {
@@ -377,6 +401,11 @@ impl IoctlTransport for WindowsDevice {
                 std::ptr::null_mut(),
             )
         };
+        self.issuing_thread
+            .store(std::ptr::null_mut(), std::sync::atomic::Ordering::Release);
+        unsafe {
+            CloseHandle(thread);
+        }
         if ok == 0 {
             return Err(BrokerError::Transport(io::Error::last_os_error()));
         }
@@ -401,7 +430,19 @@ extern "system" {
     ) -> i32;
 
     /// Cancels pending I/O issued for a device handle.
-    fn CancelIoEx(file: *mut std::ffi::c_void, overlapped: *mut std::ffi::c_void) -> i32;
+    fn GetCurrentProcess() -> *mut std::ffi::c_void;
+    fn GetCurrentThread() -> *mut std::ffi::c_void;
+    fn DuplicateHandle(
+        source_process: *mut std::ffi::c_void,
+        source: *mut std::ffi::c_void,
+        target_process: *mut std::ffi::c_void,
+        target: *mut *mut std::ffi::c_void,
+        desired_access: u32,
+        inherit_handle: i32,
+        options: u32,
+    ) -> i32;
+    fn CancelSynchronousIo(thread: *mut std::ffi::c_void) -> i32;
+    fn CloseHandle(handle: *mut std::ffi::c_void) -> i32;
 }
 
 /// Explicit non-Windows transport used to keep workspace checks portable.
