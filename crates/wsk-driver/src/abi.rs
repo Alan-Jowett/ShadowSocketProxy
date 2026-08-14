@@ -267,18 +267,31 @@ impl AbiHeader {
         request_id: RequestId,
         generation: Generation,
     ) -> Result<Status, AbiError> {
-        if self.version != ABI_VERSION || self.size as usize != expected_size {
-            return Err(AbiError::InvalidAbi);
-        }
-        if Opcode::from_raw(self.opcode) != Some(opcode) {
-            return Err(AbiError::InvalidOpcode);
-        }
+        self.validate_response_envelope(opcode, expected_size)?;
         let status = Status::from_raw(self.status).ok_or(AbiError::InvalidStatus(self.status))?;
         if self.session_nonce != expected_nonce {
             return Err(AbiError::InvalidSession);
         }
         self.validate_identity(request_id, generation)?;
         Ok(status)
+    }
+
+    /// Validates response fields that are independent of the device status.
+    pub fn validate_response_envelope(
+        &self,
+        opcode: Opcode,
+        expected_size: usize,
+    ) -> Result<(), AbiError> {
+        if self.version != ABI_VERSION || self.size as usize != expected_size {
+            return Err(AbiError::InvalidAbi);
+        }
+        if Opcode::from_raw(self.opcode) != Some(opcode) {
+            return Err(AbiError::InvalidOpcode);
+        }
+        if self.reserved != 0 {
+            return Err(AbiError::InvalidAbi);
+        }
+        Ok(())
     }
 
     /// Validates a new request identity against the previous operation.

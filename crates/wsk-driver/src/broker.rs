@@ -249,13 +249,29 @@ impl<T: IoctlTransport> IoctlBroker<T> {
             std::mem::size_of::<MappingRequest>(),
         )?;
         let mapping = from_bytes::<MappingRequest>(&response)?;
-        let status = mapping.header.validate_response(
-            Opcode::SubmitRequest,
-            std::mem::size_of::<MappingRequest>(),
-            nonce,
-            request.header.request_id,
-            request.header.generation,
-        )?;
+        mapping
+            .header
+            .validate_response_envelope(
+                Opcode::SubmitRequest,
+                std::mem::size_of::<MappingRequest>(),
+            )
+            .map_err(BrokerError::Abi)?;
+        if mapping.header.session_nonce != nonce {
+            return Err(BrokerError::Abi(AbiError::InvalidSession));
+        }
+        let status = Status::from_raw(mapping.header.status).ok_or(BrokerError::Abi(
+            AbiError::InvalidStatus(mapping.header.status),
+        ))?;
+        if status == Status::Ok {
+            if mapping.header.request_id.0 == 0 || mapping.header.generation.0 == 0 {
+                return Err(BrokerError::Abi(AbiError::InvalidIdentity));
+            }
+        } else {
+            mapping
+                .header
+                .validate_identity(request.header.request_id, request.header.generation)
+                .map_err(BrokerError::Abi)?;
+        }
         if status != Status::Ok {
             return Err(BrokerError::DeviceStatus(status));
         }
@@ -574,8 +590,8 @@ mod tests {
                         Opcode::SubmitRequest,
                         Status::Ok,
                         self.response_nonce,
-                        request.header.request_id,
-                        request.header.generation,
+                        RequestId(77),
+                        Generation(88),
                         std::mem::size_of::<MappingRequest>(),
                     ),
                     synthetic: MappingTuple {
