@@ -379,7 +379,7 @@ fn preflight(plan: &BuildPlan) -> Result<(), String> {
     }
     if plan.kernel_relay {
         require_command("cargo", "Rust/Cargo")?;
-        require_command("powershell.exe", "PowerShell")?;
+        powershell_executable()?;
         ensure_llvm()?;
         ensure_wdk_packages()?;
     }
@@ -407,7 +407,7 @@ fn preflight(plan: &BuildPlan) -> Result<(), String> {
             let url = format!(
                 "https://api.nuget.org/v3-flatcontainer/{package}/{WDK_VERSION}/{package}.{WDK_VERSION}.nupkg"
             );
-            let mut download = Command::new("powershell.exe");
+            let mut download = Command::new(powershell_executable()?);
             download.args([
                 "-NoProfile",
                 "-NonInteractive",
@@ -425,7 +425,25 @@ fn preflight(plan: &BuildPlan) -> Result<(), String> {
         }
         Ok(())
     }
+
     Ok(())
+}
+
+fn powershell_executable() -> Result<OsString, String> {
+    for candidate in ["powershell.exe", "pwsh"] {
+        let available = Command::new(candidate)
+            .arg("-NoProfile")
+            .arg("-Command")
+            .arg("$PSVersionTable.PSVersion.ToString()")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        if available {
+            return Ok(OsString::from(candidate));
+        }
+    }
+    Err("PowerShell prerequisite was not found; install powershell.exe or pwsh".to_owned())
 }
 
 fn require_command(command: &str, label: &str) -> Result<(), String> {
@@ -803,7 +821,7 @@ fn sign_driver(
         .map_err(|error| format!("create certificate directory: {error}"))?;
     let cert = cert_dir.join("shadow-socket-proxy-test.cer");
     let pfx = cert_dir.join("shadow-socket-proxy-test.pfx");
-    let mut make_cert = Command::new("powershell.exe");
+    let mut make_cert = Command::new(powershell_executable()?);
     make_cert.args([
         "-NoProfile",
         "-NonInteractive",
@@ -832,7 +850,7 @@ fn sign_driver(
     let mut verify = Command::new(&signtool);
     verify.args(["verify", "/pa", &driver.to_string_lossy()]);
     run_command(&mut verify, "verify kernel driver signature")?;
-    let mut thumbprint_command = Command::new("powershell.exe");
+    let mut thumbprint_command = Command::new(powershell_executable()?);
     thumbprint_command.args([
         "-NoProfile",
         "-NonInteractive",
