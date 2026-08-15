@@ -9,9 +9,11 @@ WORKSPACE_ROOT := $(abspath ../..)
 SOURCE := shadow-socket-proxy.bpf.c
 OUTPUT ?= shadow-socket-proxy.bpf.o
 RUNNER_OUTPUT ?= ssp-bpf-fixture-runner
+PROFILE ?= debug
 RUNNER_MANIFEST := fixture-runner/Cargo.toml
 RUNNER_SOURCES := $(wildcard fixture-runner/src/*.rs)
-RUNNER_ARTIFACT := $(WORKSPACE_ROOT)/target/debug/$(RUNNER_OUTPUT)
+RUNNER_ARTIFACT := $(WORKSPACE_ROOT)/target/$(PROFILE)/$(RUNNER_OUTPUT)
+CARGO_PROFILE_FLAG := $(if $(filter release,$(PROFILE)),--release,)
 
 .PHONY: all clean
 
@@ -22,7 +24,7 @@ $(OUTPUT): $(SOURCE)
 		-I$(KERNEL_UAPI) -c $< -o $@
 
 $(RUNNER_OUTPUT): $(RUNNER_MANIFEST) $(RUNNER_SOURCES) $(WORKSPACE_ROOT)/Cargo.lock
-	$(CARGO) build --locked --manifest-path $(RUNNER_MANIFEST) --bin $(RUNNER_OUTPUT)
+	$(CARGO) build --locked $(CARGO_PROFILE_FLAG) --manifest-path $(RUNNER_MANIFEST) --bin $(RUNNER_OUTPUT)
 	cp $(RUNNER_ARTIFACT) $@
 
 clean:

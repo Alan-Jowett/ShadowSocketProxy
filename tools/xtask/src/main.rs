@@ -294,10 +294,7 @@ fn build(
         )?;
     }
     if plan.tls == Some(TlsMode::Psk) {
-        versions.push(format!(
-            "openssl={}",
-            detected_version("openssl", &["version"])
-        ));
+        versions.push(format!("openssl={}", detected_openssl_version()));
     }
 
     let host_features = tls_feature(plan.tls);
@@ -611,7 +608,7 @@ fn run_wsl_build(repo: &Path, profile: &str, distro: &str, plan: &BuildPlan) -> 
         None => " --features linux-bpf",
     };
     let command_line = format!(
-        "cd '{wsl_repo}' && make -C crates/bpf all && cargo build --locked{profile_flag} --target x86_64-unknown-linux-gnu -p shadow-socket-proxy-control{tls}"
+        "cd '{wsl_repo}' && make -C crates/bpf PROFILE={profile} all && cargo build --locked{profile_flag} --target x86_64-unknown-linux-gnu -p shadow-socket-proxy-control{tls}"
     );
     let mut command = Command::new("wsl.exe");
     command.args(["-d", distro, "--", "bash", "-lc", &command_line]);
@@ -621,6 +618,27 @@ fn run_wsl_build(repo: &Path, profile: &str, distro: &str, plan: &BuildPlan) -> 
 fn detected_version(command: &str, args: &[&str]) -> String {
     Command::new(command)
         .args(args)
+        .output()
+        .ok()
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "unknown".to_owned())
+}
+
+fn detected_openssl_version() -> String {
+    let executable = env::var_os("OPENSSL_DIR")
+        .map(PathBuf::from)
+        .map(|root| {
+            root.join("bin").join(if cfg!(windows) {
+                "openssl.exe"
+            } else {
+                "openssl"
+            })
+        })
+        .filter(|path| path.exists())
+        .unwrap_or_else(|| PathBuf::from("openssl"));
+    Command::new(executable)
+        .arg("version")
         .output()
         .ok()
         .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
