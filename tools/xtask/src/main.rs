@@ -340,6 +340,9 @@ fn build(
             "--features",
             "wdk-native",
         ]);
+        for (key, value) in discover_msvc_environment()? {
+            command.env(key, value);
+        }
         for (key, value) in roots.environment {
             command.env(key, value);
         }
@@ -444,6 +447,95 @@ fn powershell_executable() -> Result<OsString, String> {
         }
     }
     Err("PowerShell prerequisite was not found; install powershell.exe or pwsh".to_owned())
+}
+
+fn discover_msvc_environment() -> Result<Vec<(String, String)>, String> {
+    let vcvars = locate_vcvars64()?;
+    let command_line = format!("call \"{}\" >nul && set", vcvars.display());
+    let output = Command::new("cmd.exe")
+        .args(["/d", "/s", "/c", &command_line])
+        .output()
+        .map_err(|error| format!("start Visual Studio environment: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "Visual Studio environment initialization failed with {}",
+            output.status
+        ));
+    }
+    let mut environment = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        if let Some((key, value)) = line.split_once('=') {
+            environment.push((key.to_owned(), value.to_owned()));
+        }
+    }
+    if !environment.iter().any(|(key, _)| key == "LINK") {
+        return Err(
+            "Visual Studio environment did not expose LINK; install the MSVC C++ toolset"
+                .to_owned(),
+        );
+    }
+    Ok(environment)
+}
+
+fn locate_vcvars64() -> Result<PathBuf, String> {
+    if let Ok(path) = env::var("SSP_VCVARS64_BAT") {
+        let path = PathBuf::from(path);
+        if path.exists() {
+            return Ok(path);
+        }
+    }
+    if let Ok(output) = Command::new("vswhere.exe")
+        .args([
+            "-latest",
+            "-products",
+            "*",
+            "-requires",
+            "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+            "-property",
+            "installationPath",
+        ])
+        .output()
+    {
+        if let Some(root) = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+        {
+            let path = PathBuf::from(root)
+                .join("VC")
+                .join("Auxiliary")
+                .join("Build")
+                .join("vcvars64.bat");
+            if path.exists() {
+                return Ok(path);
+            }
+        }
+    }
+    let roots = [
+        env::var_os("ProgramFiles(x86)").map(PathBuf::from),
+        env::var_os("ProgramFiles").map(PathBuf::from),
+    ];
+    for root in roots.into_iter().flatten() {
+        for year in ["2022", "2019"] {
+            for edition in ["BuildTools", "Community", "Professional", "Enterprise"] {
+                let path = root
+                    .join("Microsoft Visual Studio")
+                    .join(year)
+                    .join(edition)
+                    .join("VC")
+                    .join("Auxiliary")
+                    .join("Build")
+                    .join("vcvars64.bat");
+                if path.exists() {
+                    return Ok(path);
+                }
+            }
+        }
+    }
+    Err(
+        "MSVC environment not found; install the Visual Studio C++ toolset or set SSP_VCVARS64_BAT"
+            .to_owned(),
+    )
 }
 
 fn require_command(command: &str, label: &str) -> Result<(), String> {
