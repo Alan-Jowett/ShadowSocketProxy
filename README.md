@@ -126,6 +126,49 @@ deferred queue head, so the proxy processes one deferred attempt at a time;
 the configured native backlog neither sizes internal queues nor promises
 parallel conditional admission.
 
+## WSK kernel relay core
+
+The approved kernel-relay path now lives in `crates/kernel-relay`. It keeps
+the driver-owned flow state machine, complete `GetMapping` protobuf
+construction and validation, the versioned opaque tunnel framing for the first
+authenticated gRPC transport, the explicit host-agent/IOCTL transport
+boundary, host-independent TCP relay ownership/deadline bookkeeping, and a
+Windows-gated WSK/WDM driver runtime that now owns pending opaque requests,
+correlated completions, listener setup sequencing, outbound connect decisions,
+and TCP/UDP relay ownership in a host-independent crate with targeted tests:
+
+```text
+cargo check -p shadow-socket-proxy-kernel-relay
+cargo test -p shadow-socket-proxy-kernel-relay
+cargo check -p shadow-socket-proxy-kernel-relay --no-default-features
+```
+
+This crate does not change the existing Linux BPF/control behavior or the
+existing user-mode host-proxy data path; each binary still builds exactly one
+data-plane implementation.
+
+Native WDK linkage is feature-gated. By default, normal Cargo builds use typed
+Windows boundary shims so the host-independent core and tests compile on
+non-driver toolchains. A native build consumes pinned WDK/SDK NuGet packages
+and generates the narrow WSK bindings from
+`crates/kernel-relay/include\wsk_wrapper.h`:
+
+```powershell
+$env:SSP_WSK_NUGET_ROOT = "$env:USERPROFILE\.nuget\packages"
+$env:WDKContentRoot = "$env:USERPROFILE\.nuget\packages\microsoft.windows.wdk.x64\10.0.28000.2526\c"
+cargo check -p shadow-socket-proxy-kernel-relay `
+  --target x86_64-pc-windows-msvc --features wdk-native
+```
+
+`SSP_WSK_WDK_ROOT` and `SSP_WSK_SDK_ROOT` can override package discovery.
+`WDKContentRoot` must be set before Cargo starts because `wdk-sys` reads it
+while its dependency build script runs.
+The generated bindings are written to Cargo's `OUT_DIR`; they are not checked
+in. `NativeWskDataplane` owns provider-dispatch socket creation, callback
+registration, bounded IRP/MDL I/O, half-close, and close operations. Its
+payload-bearing methods require caller-owned buffers; the legacy length-only
+test seam fails explicitly instead of claiming native forwarding.
+
 ## Windows/WSL demo deployment
 
 This is a prototype, not a hardened production service. The following procedure

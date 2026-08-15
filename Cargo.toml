@@ -4,6 +4,7 @@
 [workspace]
 members = [
     "crates/bpf/fixture-runner",
+    "crates/kernel-relay",
     "crates/control-service",
     "crates/e2e-runner",
     "crates/host-proxy",

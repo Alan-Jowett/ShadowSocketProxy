@@ -1,0 +1,64 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 ShadowSocketProxy contributors
+
+[package]
+name = "shadow-socket-proxy-kernel-relay"
+version = "0.1.0"
+edition = "2021"
+description = "Host-independent WSK kernel-relay core and opaque gRPC tunnel for ShadowSocketProxy"
+license = "MIT"
+build = "build.rs"
+
+[package.metadata.wdk.driver-model]
+driver-type = "WDM"
+
+[lib]
+path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["opaque-user-tunnel"]
+opaque-user-tunnel = ["dep:async-trait", "dep:http", "dep:tokio", "dep:tonic"]
+wdk-native = [
+    "dep:wdk",
+    "dep:wdk-alloc",
+    "dep:wdk-panic",
+    "dep:wdk-sys",
+]
+
+[dependencies]
+prost = "0.13"
+thiserror = "1"
+
+[dependencies.async-trait]
+version = "0.1"
+optional = true
+
+[dependencies.http]
+version = "1"
+optional = true
+
+[dependencies.tokio]
+version = "1.40"
+features = ["rt", "sync", "time"]
+optional = true
+
+[dependencies.tonic]
+version = "0.12"
+features = ["transport"]
+optional = true
+
+[build-dependencies]
+bindgen = "0.71.1"
+protoc-bin-vendored = "3"
+tonic-build = "0.12"
+wdk-build = "0.5.1"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+wdk = { version = "0.4.1", optional = true }
+wdk-alloc = { version = "0.4.1", optional = true }
+wdk-panic = { version = "0.4.1", optional = true }
+wdk-sys = { version = "0.5.1", optional = true }
+
+[dev-dependencies]
+tokio = { version = "1.40", features = ["macros", "rt-multi-thread", "sync", "time", "test-util"] }
