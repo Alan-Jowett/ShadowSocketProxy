@@ -169,6 +169,33 @@ registration, bounded IRP/MDL I/O, half-close, and close operations. Its
 payload-bearing methods require caller-owned buffers; the legacy length-only
 test seam fails explicitly instead of claiming native forwarding.
 
+### Unified build orchestration
+
+From a fresh Windows machine with Rust/MSVC and WSL installed, use the
+workspace xtask to provision dependencies and build the selected artifacts:
+
+```powershell
+cargo xtask build --release --features wsl tls-psk
+cargo xtask build --release --features wsl tls-rustls
+cargo xtask build --release --features wsl tls-psk kernel-relay
+cargo xtask build --release --features wsl tls-rustls kernel-relay test-signing
+```
+
+The command restores the pinned WDK/SDK NuGet packages when the kernel relay
+is selected, installs LLVM/libclang or Windows OpenSSL through `winget` when
+needed, installs the required Ubuntu WSL packages, builds the BPF/control
+service and Windows host proxy, and optionally builds and signs the driver.
+`SSP_WSL_DISTRO` overrides the default `Ubuntu` distribution. Use
+`SSP_LLVM_PACKAGE_VERSION`, `SSP_OPENSSL_PACKAGE_VERSION`, or `SSP_SIGNTOOL`
+to override provisioning/tool discovery. Outputs and `manifest.json` are
+published under `target\ssp-build\<profile>\`.
+
+User-mode forwarding is the default when `kernel-relay` is omitted. TLS
+features are mutually exclusive, and `test-signing` requires `kernel-relay`.
+After provisioning, ordinary package-specific `cargo build` commands remain
+available; native WDK builds still require the WDK environment variables
+documented above.
+
 ## Windows/WSL demo deployment
 
 This is a prototype, not a hardened production service. The following procedure

@@ -193,6 +193,112 @@ containing correlation, generation, protocol, prior state, next state or
 rejection, reason, and execution level. The initial sink is `DbgPrintEx`; the
 sink is replaceable and its failure MUST NOT affect correctness.
 
+### CHG-WKR-011 - Unified build orchestration
+
+- **Before:** Building WSL, host, driver, and signing artifacts requires
+  separate environment-specific commands.
+- **After:** A Cargo-native `xtask` provisions prerequisites, validates feature
+  combinations, builds all selected components, signs when explicitly
+  requested, and publishes a deterministic artifact manifest.
+- **Traceability:** `USER-REQUEST: simple and intuitive building process from a
+  fresh machine`.
+
+### REQ-WKR-013 - Cargo-native build entry point
+
+The workspace MUST provide `cargo xtask build`. The command MUST be exposed by
+an `xtask` workspace package and a checked-in Cargo alias
+`xtask = "run --package shadow-socket-proxy-xtask --"`; it MUST NOT depend on a
+globally installed executable. The command MUST accept Cargo-compatible
+`--release` and space-separated `--features` arguments.
+
+### REQ-WKR-014 - Supported feature contract
+
+The public build features MUST be `wsl`, `tls-psk`, `tls-rustls`,
+`kernel-relay`, and `test-signing`. `tls-psk` and `tls-rustls` are mutually
+exclusive. `kernel-relay` and user-mode forwarding are mutually exclusive;
+user-mode forwarding is selected when `kernel-relay` is absent.
+`test-signing` is valid only with `kernel-relay`. Invalid combinations MUST
+fail before provisioning or building.
+
+The orchestrator MUST map these public features to the existing package
+features: `tls-psk`/`tls-rustls` on the host proxy and Linux control service,
+`linux-bpf` on the control service for WSL builds, and `wdk-native` on the
+kernel-relay crate.
+
+### REQ-WKR-015 - Deterministic Windows provisioning
+
+When required, the orchestrator MUST idempotently restore pinned NuGet
+packages `microsoft.windows.wdk.x64`,
+`microsoft.windows.wdk.arm64`, and `microsoft.windows.sdk.cpp`, all at
+`10.0.28000.2526`, into the configured NuGet global package root. It MUST
+discover or install LLVM/libclang major version 18 or newer and a PSK-capable
+OpenSSL development package when `tls-psk` is selected. The default Windows
+package identifiers are `LLVM.LLVM` and `ShiningLight.OpenSSL.Dev`; package
+installation MUST use exact IDs and accept agreements non-interactively.
+The orchestrator MUST accept `SSP_LLVM_PACKAGE_VERSION` and
+`SSP_OPENSSL_PACKAGE_VERSION` overrides; when unset, it MUST record the exact
+resolved package versions in the manifest. Missing `winget` MUST produce an
+actionable prerequisite error.
+
+For native driver builds, the orchestrator MUST set `SSP_WSK_NUGET_ROOT`,
+`SSP_WSK_WDK_ROOT`, `SSP_WSK_SDK_ROOT`, and `WDKContentRoot` in the same
+process that invokes Cargo. For PSK builds it MUST set
+`OPENSSL_DIR`, `OPENSSL_INCLUDE_DIR`, and `OPENSSL_LIB_DIR` after validating
+the headers, libraries, and `openssl.exe`.
+
+### REQ-WKR-016 - Deterministic WSL provisioning and builds
+
+For `wsl` builds, the default distribution MUST be `Ubuntu`, overridable by
+`SSP_WSL_DISTRO`. The orchestrator MUST verify `wsl.exe`, the distribution,
+and WSL 2 availability before mutation. It MUST install missing packages as
+root using the exact package set
+`build-essential clang llvm linux-libc-dev libssl-dev pkg-config make
+iproute2 python3 ca-certificates`, then build the BPF artifact and Linux
+control service inside WSL using the repository checkout and locked
+dependencies. Package-install or build failures MUST identify the failed phase
+and MUST NOT publish a successful manifest.
+
+### REQ-WKR-017 - Component and artifact selection
+
+The orchestrator MUST build the Linux BPF/control artifacts when `wsl` is
+selected, the Windows host proxy for every build, and the native kernel driver
+only when `kernel-relay` is selected. User-mode builds MUST NOT build or
+publish a driver. All outputs MUST be copied to
+`target\ssp-build\<profile>\` under deterministic component names.
+
+Publication MUST use a temporary staging directory followed by an atomic
+manifest replacement. The manifest MUST list profile, selected features,
+target triples, absolute artifact paths, SHA-256 hashes, signing state, and
+whether a reboot is required. Stale artifacts MUST NOT appear in a new
+manifest.
+
+### REQ-WKR-018 - Signing and test-signing safety
+
+Without `test-signing`, the driver MUST remain unsigned and the manifest MUST
+state `unsigned`. With `test-signing`, the orchestrator MUST locate
+`signtool.exe` from the restored WDK/SDK contents or an explicitly configured
+path, create or reuse a local test certificate outside the repository, sign,
+verify the signature, and report the certificate thumbprint. Enabling Windows
+test-signing mode MUST require an explicit elevated action; the tool MUST report
+`reboot_required` when the setting changed and MUST NOT claim the driver is
+loadable until reboot.
+
+### REQ-WKR-019 - Fresh-machine diagnostics
+
+The orchestrator MUST perform non-mutating prerequisite checks before each
+mutation phase and emit phase-specific, actionable diagnostics. It MUST fail
+closed when Rust/MSVC, WSL, NuGet, LLVM/libclang, OpenSSL, signing tools, or
+required privileges are unavailable. It MUST preserve existing user changes
+and MUST NOT commit secrets, certificates, or generated bindings.
+
+### REQ-WKR-020 - Post-bootstrap plain Cargo builds
+
+After successful provisioning, the orchestrator MUST invoke the same ordinary
+Cargo package builds that a developer can run directly. The README MUST
+document `cargo xtask build` as the fresh-machine/provisioning entry point and
+plain `cargo build` as a post-bootstrap command, including the required
+environment variables for native WDK and PSK builds.
+
 ## Non-goals
 
 - Changing Linux BPF rewrite behavior or the existing `GetMapping` schema.

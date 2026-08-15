@@ -55,6 +55,22 @@ fail explicitly and never count as successful forwarding.
 | TC-WKR-039 | REQ-WKR-011/012 | DISPATCH telemetry | No allocation/blocking/pageable operation |
 | TC-WKR-040 | REQ-WKR-012 | PASSIVE telemetry queue unavailable | State remains correct; loss is observable |
 | TC-WKR-041 | REQ-WKR-009 | Bounded shutdown drain | No published work remains after unload |
+| TC-WKR-042 | REQ-WKR-013 | Invoke `cargo xtask build --release` on a clean checkout | Workspace alias resolves the xtask package without a global executable |
+| TC-WKR-043 | REQ-WKR-013/020 | Run xtask after provisioning, then run the equivalent plain Cargo package command | Both paths produce the same selected component artifacts |
+| TC-WKR-044 | REQ-WKR-014 | Select each valid feature combination | Normalized plan contains exactly one TLS mode and one data path |
+| TC-WKR-045 | REQ-WKR-014 | Select conflicting/unknown features | Command fails before provisioning, mutation, or artifact publication |
+| TC-WKR-046 | REQ-WKR-015 | Restore absent pinned WDK/SDK packages | Exact versions are installed or restored idempotently and environment paths validate |
+| TC-WKR-047 | REQ-WKR-015 | Detect LLVM/libclang below major 18 | Exact `LLVM.LLVM` installation is attempted or an actionable `winget` error is returned |
+| TC-WKR-048 | REQ-WKR-015 | Build PSK with absent OpenSSL | Exact `ShiningLight.OpenSSL.Dev` installation is attempted and all OpenSSL paths validate |
+| TC-WKR-049 | REQ-WKR-015/020 | Native WDK and PSK child Cargo builds | Dependency build scripts receive the required WDK/SDK and OpenSSL environment |
+| TC-WKR-050 | REQ-WKR-016/019 | Missing WSL distro or package | Preflight or root package phase fails with distro/package-specific diagnostics |
+| TC-WKR-051 | REQ-WKR-016 | Build BPF/control service in Ubuntu WSL | Locked Linux artifacts are produced through the shared repository mount |
+| TC-WKR-052 | REQ-WKR-017 | Build user-mode feature set | Host/Linux artifacts publish and no driver artifact is listed |
+| TC-WKR-053 | REQ-WKR-017 | Build kernel-relay feature set | Host and signed/unsigned driver artifacts publish with deterministic names |
+| TC-WKR-054 | REQ-WKR-018 | Run kernel build without `test-signing` | Driver is unsigned and manifest records `unsigned` |
+| TC-WKR-055 | REQ-WKR-018 | Run kernel build with `test-signing` | Certificate/signature verify; elevation and reboot state are reported accurately |
+| TC-WKR-056 | REQ-WKR-019 | Remove a prerequisite or required privilege | Correct phase fails, no success manifest is published, and no unrelated files change |
+| TC-WKR-057 | REQ-WKR-015/018 | Override or discover package/signing-tool versions and paths | Manifest records resolved versions, tool paths, and certificate thumbprint without repository writes |
 
 ## Properties
 
@@ -85,3 +101,21 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 Windows WDK/signing and live Windows/WSL commands are documented by the
 implementation and are environment-gated.
+
+## Build-orchestration validation commands
+
+```text
+cargo xtask build --release --features wsl tls-psk
+cargo xtask build --release --features wsl tls-rustls
+cargo xtask build --release --features wsl tls-psk kernel-relay
+cargo xtask build --release --features wsl tls-rustls kernel-relay test-signing
+```
+
+The xtask parser accepts repeated feature tokens after `--features`; quoted
+feature lists are also accepted. This syntax is intentionally handled by the
+workspace xtask rather than Cargo's package feature parser.
+
+The test-signing cases MUST run in an elevated Windows session when enabling
+test-signing configuration. A changed boot configuration is a successful
+configuration result only when the manifest reports `reboot_required`; it is
+not a successful live-driver-load result before reboot.

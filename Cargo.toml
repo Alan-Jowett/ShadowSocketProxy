@@ -9,5 +9,6 @@ members = [
     "crates/e2e-runner",
     "crates/host-proxy",
     "crates/tls-rustls",
+    "tools/xtask",
 ]
 resolver = "2"

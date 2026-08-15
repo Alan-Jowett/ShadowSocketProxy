@@ -134,6 +134,77 @@ generation. Agent reconnect does not replay requests. The driver decides
 retry/fail/cancel, rejects duplicate/stale/wrong-epoch responses, and sees
 backpressure without partial enqueue or truncation.
 
+### D-WKR-016 - Cargo xtask boundary
+
+The workspace contains `tools/xtask` as package
+`shadow-socket-proxy-xtask`. `.cargo/config.toml` defines the alias
+`xtask = "run --package shadow-socket-proxy-xtask --"`. The xtask parses
+`build`, `--release`, and space-separated feature values before any
+provisioning. It executes child processes with explicit environments rather
+than relying on persistent shell state.
+
+### D-WKR-017 - Feature normalization
+
+The xtask normalizes public features into a typed build plan:
+
+| Public feature | Host proxy | Linux control service | Kernel relay |
+|---|---|---|---|
+| `tls-psk` | `tls-psk` | `tls-psk` | — |
+| `tls-rustls` | `tls-rustls` | `tls-rustls` | — |
+| `wsl` | — | `linux-bpf` | — |
+| `kernel-relay` | — | — | `wdk-native` |
+
+User-mode forwarding is the host-proxy default. The plan rejects conflicting
+TLS modes, `test-signing` without `kernel-relay`, and unknown features before
+side effects.
+
+### D-WKR-018 - Provisioning providers
+
+Windows provisioning uses NuGet package restore for the pinned WDK/SDK
+packages and `winget` exact package IDs `LLVM.LLVM` and
+`ShiningLight.OpenSSL.Dev` when detection fails. WSL provisioning invokes
+`wsl.exe -d <distro> -u root -- apt-get ...` for the pinned package set.
+Detection is idempotent and records discovered paths in the build plan.
+Optional `SSP_LLVM_PACKAGE_VERSION` and `SSP_OPENSSL_PACKAGE_VERSION` values
+pin winget resolution; otherwise the resolved versions are recorded in the
+manifest. Unavailable package managers produce phase-specific errors rather
+than falling back silently.
+
+### D-WKR-019 - Environment handoff
+
+The xtask computes and validates WDK/SDK, LLVM/libclang, and OpenSSL roots,
+then passes them directly to every Cargo child process. Native WDK children
+receive `SSP_WSK_NUGET_ROOT`, `SSP_WSK_WDK_ROOT`, `SSP_WSK_SDK_ROOT`, and
+`WDKContentRoot`. PSK children receive `OPENSSL_DIR`,
+`OPENSSL_INCLUDE_DIR`, and `OPENSSL_LIB_DIR`. This avoids the dependency
+build-script ordering limitation of the parent crate's `build.rs`.
+
+### D-WKR-020 - WSL artifact bridge
+
+WSL builds run from the repository mounted at `/mnt/<drive>/...` and publish
+Linux artifacts into a staging directory represented by the Windows
+`target\ssp-build\<profile>\` path. The bridge copies BPF ELF, control-service,
+and fixture-runner outputs through the shared mount, verifies existence and
+hashes, and rejects stale files not produced in the current staging run.
+
+### D-WKR-021 - Atomic artifact manifest
+
+Each run creates `target\ssp-build\<profile>\.staging-<run-id>\`, writes
+artifacts and `manifest.json` there, fsyncs where supported, and replaces the
+published manifest only after all selected components and validations succeed.
+The manifest records feature plan, target triples, artifact paths, SHA-256,
+driver signing state, certificate thumbprint when applicable, and
+`reboot_required`.
+
+### D-WKR-022 - Signing state machine
+
+Signing is a distinct final phase. Unsigned mode only records the unsigned
+driver. Test-signing mode creates/reuses a local certificate outside the
+repository, signs with the discovered WDK `signtool`, verifies the embedded
+signature, and optionally requests elevated test-signing configuration.
+Configuration changes are reported as reboot-pending; no loadability claim is
+made before reboot.
+
 ## Invariants
 
 | ID | Invariant |
@@ -165,3 +236,11 @@ backpressure without partial enqueue or truncation.
 | REQ-WKR-010 | D-WKR-001/D-WKR-013 | TC-WKR-026-028 |
 | REQ-WKR-011 | D-WKR-011 | TC-WKR-020/021 |
 | REQ-WKR-012 | D-WKR-012 | TC-WKR-022/023/039/040 |
+| REQ-WKR-013 | D-WKR-016 | TC-WKR-042/043 |
+| REQ-WKR-014 | D-WKR-017 | TC-WKR-044/045 |
+| REQ-WKR-015 | D-WKR-018/D-WKR-019 | TC-WKR-046-049/057 |
+| REQ-WKR-016 | D-WKR-018/D-WKR-020 | TC-WKR-050/051 |
+| REQ-WKR-017 | D-WKR-017/D-WKR-020/D-WKR-021 | TC-WKR-052/053 |
+| REQ-WKR-018 | D-WKR-022 | TC-WKR-054/055/057 |
+| REQ-WKR-019 | D-WKR-016/D-WKR-018/D-WKR-019 | TC-WKR-046/050/056 |
+| REQ-WKR-020 | D-WKR-019 | TC-WKR-043/049 |

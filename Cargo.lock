@@ -1671,6 +1671,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "shadow-socket-proxy-xtask"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "sharded-slab"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
