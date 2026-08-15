@@ -163,7 +163,9 @@ side effects.
 Windows provisioning uses NuGet package restore for the pinned WDK/SDK
 packages and `winget` exact package IDs `LLVM.LLVM` and
 `ShiningLight.OpenSSL.Dev` when detection fails. WSL provisioning invokes
-`wsl.exe -d <distro> -u root -- apt-get ...` for the pinned package set.
+`wsl.exe -d <distro> -u root -- apt-get ...` for the pinned package set,
+including `cargo` and `rustc`; it verifies `cargo --version` before running
+the Linux builds.
 Detection is idempotent and records discovered paths in the build plan.
 Optional `SSP_LLVM_PACKAGE_VERSION` and `SSP_OPENSSL_PACKAGE_VERSION` values
 pin winget resolution; otherwise the resolved versions are recorded in the

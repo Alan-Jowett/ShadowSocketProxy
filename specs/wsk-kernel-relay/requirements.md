@@ -252,8 +252,8 @@ For `wsl` builds, the default distribution MUST be `Ubuntu`, overridable by
 `SSP_WSL_DISTRO`. The orchestrator MUST verify `wsl.exe`, the distribution,
 and WSL 2 availability before mutation. It MUST install missing packages as
 root using the exact package set
-`build-essential clang llvm linux-libc-dev libssl-dev pkg-config make
-iproute2 python3 ca-certificates`, then build the BPF artifact and Linux
+`build-essential cargo clang llvm linux-libc-dev libssl-dev pkg-config make
+rustc iproute2 python3 ca-certificates`, then verify Cargo is available and build the BPF artifact and Linux
 control service inside WSL using the repository checkout and locked
 dependencies. Package-install or build failures MUST identify the failed phase
 and MUST NOT publish a successful manifest.

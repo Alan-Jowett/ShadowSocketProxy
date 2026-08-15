@@ -568,17 +568,30 @@ fn run_wsl_build(repo: &Path, profile: &str, distro: &str, plan: &BuildPlan) -> 
         "install",
         "-y",
         "build-essential",
+        "cargo",
         "clang",
         "llvm",
         "linux-libc-dev",
         "libssl-dev",
         "pkg-config",
         "make",
+        "rustc",
         "iproute2",
         "python3",
         "ca-certificates",
     ]);
     run_command(&mut install, "WSL package installation")?;
+
+    let mut cargo_check = Command::new("wsl.exe");
+    cargo_check.args([
+        "-d",
+        distro,
+        "--",
+        "bash",
+        "-lc",
+        "command -v cargo && cargo --version",
+    ]);
+    run_command(&mut cargo_check, "WSL Cargo verification")?;
 
     let repo_string = repo.to_string_lossy().replace('\\', "/");
     let drive = repo_string

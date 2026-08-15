@@ -63,7 +63,7 @@ fail explicitly and never count as successful forwarding.
 | TC-WKR-047 | REQ-WKR-015 | Detect LLVM/libclang below major 18 | Exact `LLVM.LLVM` installation is attempted or an actionable `winget` error is returned |
 | TC-WKR-048 | REQ-WKR-015 | Build PSK with absent OpenSSL | Exact `ShiningLight.OpenSSL.Dev` installation is attempted and all OpenSSL paths validate |
 | TC-WKR-049 | REQ-WKR-015/020 | Native WDK and PSK child Cargo builds | Dependency build scripts receive the required WDK/SDK and OpenSSL environment |
-| TC-WKR-050 | REQ-WKR-016/019 | Missing WSL distro or package | Preflight or root package phase fails with distro/package-specific diagnostics |
+| TC-WKR-050 | REQ-WKR-016/019 | Missing WSL distro, Cargo, or package | Preflight or root package phase fails with distro/package-specific diagnostics |
 | TC-WKR-051 | REQ-WKR-016 | Build BPF/control service in Ubuntu WSL | Locked Linux artifacts are produced through the shared repository mount |
 | TC-WKR-052 | REQ-WKR-017 | Build user-mode feature set | Host/Linux artifacts publish and no driver artifact is listed |
 | TC-WKR-053 | REQ-WKR-017 | Build kernel-relay feature set | Host and signed/unsigned driver artifacts publish with deterministic names |

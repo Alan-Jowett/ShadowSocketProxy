@@ -183,7 +183,7 @@ cargo xtask build --release --features wsl tls-rustls kernel-relay test-signing
 
 The command restores the pinned WDK/SDK NuGet packages when the kernel relay
 is selected, installs LLVM/libclang or Windows OpenSSL through `winget` when
-needed, installs the required Ubuntu WSL packages, builds the BPF/control
+needed, installs the required Ubuntu WSL packages including Cargo/Rust, builds the BPF/control
 service and Windows host proxy, and optionally builds and signs the driver.
 `SSP_WSL_DISTRO` overrides the default `Ubuntu` distribution. Use
 `SSP_LLVM_PACKAGE_VERSION`, `SSP_OPENSSL_PACKAGE_VERSION`, or `SSP_SIGNTOOL`
