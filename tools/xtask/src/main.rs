@@ -23,7 +23,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 
 const WDK_VERSION: &str = "10.0.28000.2526";
-const LLVM_MIN_MAJOR: u32 = 18;
+const LLVM_VERSION: &str = "18.1.8";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BuildPlan {
@@ -580,6 +580,8 @@ fn require_command(command: &str, label: &str) -> Result<(), String> {
 }
 
 fn ensure_llvm() -> Result<(), String> {
+    let required_version =
+        env::var("SSP_LLVM_PACKAGE_VERSION").unwrap_or_else(|_| LLVM_VERSION.to_owned());
     let candidates = [
         PathBuf::from("clang"),
         PathBuf::from(r"C:\Program Files\LLVM\bin\clang.exe"),
@@ -590,28 +592,52 @@ fn ensure_llvm() -> Result<(), String> {
             .output()
             .ok()
             .and_then(|output| String::from_utf8(output.stdout).ok())
-            .and_then(|text| {
-                text.split_whitespace().find_map(|word| {
-                    word.split_once('.')
-                        .and_then(|(major, _)| major.parse::<u32>().ok())
-                })
-            });
-        if version.is_some_and(|major| major >= LLVM_MIN_MAJOR) {
+            .and_then(|text| parse_clang_version(&text));
+        if version.as_deref() == Some(required_version.as_str()) {
             if env::var_os("LIBCLANG_PATH").is_none() {
                 let candidate = PathBuf::from(r"C:\Program Files\LLVM\bin");
                 if candidate.join("libclang.dll").exists() {
-                    env::set_var("LIBCLANG_PATH", candidate);
+                    env::set_var("LIBCLANG_PATH", &candidate);
                 }
             }
             return Ok(());
         }
     }
-    install_winget("LLVM.LLVM", env::var("SSP_LLVM_PACKAGE_VERSION").ok())?;
+    install_winget("LLVM.LLVM", Some(required_version.clone()))?;
     let candidate = PathBuf::from(r"C:\Program Files\LLVM\bin");
     if candidate.join("libclang.dll").exists() {
-        env::set_var("LIBCLANG_PATH", candidate);
+        env::set_var("LIBCLANG_PATH", &candidate);
+    }
+    let installed = Command::new(&candidate.join("clang.exe"))
+        .arg("--version")
+        .output()
+        .ok()
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .and_then(|text| parse_clang_version(&text));
+    if installed.as_deref() != Some(required_version.as_str()) {
+        return Err(format!(
+            "LLVM {required_version} is required for WDK binding generation, but installed version was {}",
+            installed.as_deref().unwrap_or("unknown")
+        ));
     }
     Ok(())
+}
+
+fn parse_clang_version(output: &str) -> Option<String> {
+    output.split_whitespace().find_map(|word| {
+        let mut components = word.split('.');
+        let major = components.next()?;
+        let minor = components.next()?;
+        let patch = components.next()?;
+        if components.next().is_some()
+            || major.parse::<u32>().is_err()
+            || minor.parse::<u32>().is_err()
+            || patch.parse::<u32>().is_err()
+        {
+            return None;
+        }
+        Some(format!("{major}.{minor}.{patch}"))
+    })
 }
 
 fn ensure_openssl() -> Result<(), String> {
@@ -687,6 +713,7 @@ fn install_winget(id: &str, version: Option<String>) -> Result<(), String> {
     ]);
     if let Some(version) = version {
         command.args(["--version", &version]);
+        command.arg("--force");
     }
     run_command(&mut command, &format!("install {id}"))
 }
@@ -1159,5 +1186,14 @@ mod tests {
                 .iter()
                 .any(|(name, _)| name.eq_ignore_ascii_case(key))
         }));
+    }
+
+    #[test]
+    fn parses_clang_version() {
+        assert_eq!(
+            parse_clang_version("clang version 18.1.8 (https://github.com/llvm/llvm-project.git)"),
+            Some("18.1.8".to_owned())
+        );
+        assert_eq!(parse_clang_version("clang version unknown"), None);
     }
 }
