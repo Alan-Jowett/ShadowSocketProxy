@@ -3,284 +3,172 @@
 
 # ShadowSocketProxy
 
-ShadowSocketProxy demonstrates a WSL networking model where outbound TCP/UDP flows are intercepted inside the Linux side and transparently proxied through a host‑side process. The container believes it is connecting normally; the host actually owns the external socket.
+ShadowSocketProxy redirects selected TCP and UDP traffic from Linux/WSL
+through a Windows data plane. The Linux control service owns the TC/BPF
+redirection maps; the Windows side resolves each synthetic flow and forwards
+traffic to its original destination.
 
-## Overview
+Two data planes are available:
 
-Outbound packets are rewritten to target a host‑visible proxy socket. The proxy establishes the real external connection, forwards data bidirectionally, and preserves flow semantics. Inbound packets are rewritten back to the container’s original tuple so applications see a normal connection.
+- **User mode** (default): the Windows host proxy owns forwarding.
+- **Kernel mode** (`kernel-relay`): the WSK driver owns forwarding. This path
+  is experimental and requires a disposable, kernel-debuggable Windows VM.
 
+TLS is required for the control channel. Choose exactly one:
 
+- **TLS-PSK** (`tls-psk`): OpenSSL PSK transport.
+- **rustls** (`tls-rustls`): mutual TLS with certificate pinning.
 
+## Quick start
 
+Run all commands from the repository root in PowerShell.
 
-## Components
+| Goal | Command |
+| --- | --- |
+| User mode + TLS-PSK | `cargo xtask build --release --features wsl tls-psk` |
+| User mode + rustls | `cargo xtask build --release --features wsl tls-rustls` |
+| Kernel mode + TLS-PSK | `cargo xtask build --release --features wsl tls-psk kernel-relay test-signing` |
+| Kernel mode + rustls | `cargo xtask build --release --features wsl tls-rustls kernel-relay test-signing` |
 
-- **TC‑attached BPF program** — Intercepts inbound/outbound packets, rewrites L3/L4 tuples, and maintains a per‑flow redirection map in a BPF hash.
-- **Container gRPC control service** — Loads the BPF program, exposes the redirection map to the host, and provides minimal control/inspection hooks.
-- **Host shadow proxy** — Listens for redirected flows, performs the real outbound connect(), and bridges traffic between the container and the external endpoint.
-
-
-
-
-
-## Why this exists
-
-WSL’s NAT model breaks VPNs, packet inspection, and tools that rely on owning the real socket. ShadowSocketProxy gives the host full visibility and control over outbound flows while keeping the container unmodified.
-
-## How it works (short version)
-
-1. Container app calls `connect()`.
-2. BPF rewrites the destination to the host proxy.
-3. Host proxy receives the synthetic connection, looks up the original tuple via gRPC.
-4. Host proxy establishes the real external connection.
-5. Proxy shuttles bytes between both sides until teardown.
-
-## Status
-
-Prototype. Global TCP/UDP packet rewriting, flow mapping, and proxy bridging
-are implemented. Kernel attachment and packet-path verification remain
-Linux-environment gated.
-
-## Container control service
-
-The Linux-targeted Rust control service is in `crates/control-service`, with
-the shared protobuf contract in `crates/proto` and the Linux TC BPF artifact
-source in `crates/bpf`:
+The first build provisions missing dependencies, builds the selected Linux
+and Windows components, and publishes them under:
 
 ```text
-cargo build --target x86_64-unknown-linux-gnu -p shadow-socket-proxy-control --features tls-psk
-cargo test --workspace --no-default-features
+target\ssp-build\release\
 ```
 
-It provides the versioned mapping ABI, replaceable BPF/TC backend,
-protobuf/gRPC service, configuration snapshots, and bounded log pull.
-Host-proxy owns the maintenance worker, expiry policy, retries, flow deletion,
-and local UDP association behavior; for maintenance, control-service exposes
-only typed flow-operation adapters.
-On Linux, the production backend uses Aya for ELF loading, versioned
-map/program discovery, TC ingress/egress links, transactional rollback, and
-map operations. Runnable control-service builds must select exactly one
-transport feature; neither is the default:
+The build is deterministic for the selected feature set. `tls-psk` and
+`tls-rustls` are mutually exclusive. `test-signing` is valid only with
+`kernel-relay`.
 
-```text
-cargo build --locked -p shadow-socket-proxy-control --features tls-psk
-cargo build --locked -p shadow-socket-proxy-control --features tls-rustls
+## Prerequisites
+
+### Windows
+
+Install or enable:
+
+- Windows 10/11 x64.
+- Git.
+- Rust/Cargo with the `x86_64-pc-windows-msvc` target.
+- Visual Studio C++ build tools, including the MSVC x64 toolset and Windows
+  SDK.
+- PowerShell and `winget`.
+- WSL 2 with an Ubuntu distribution.
+
+The orchestrator automatically restores the pinned WDK/SDK NuGet packages,
+installs the required WSL packages, and provisions Windows LLVM/OpenSSL when
+needed.
+
+For kernel builds, the orchestrator uses LLVM **18.1.8** for WDK binding
+generation. A different installed LLVM version is not a compatible substitute.
+
+### Optional environment overrides
+
+Use these only when automatic discovery does not match the machine:
+
+```powershell
+$env:SSP_WSL_DISTRO = 'Ubuntu'
+$env:SSP_VCVARS64_BAT = 'C:\Path\To\vcvars64.bat'
+$env:SSP_LLVM_PACKAGE_VERSION = '18.1.8'
+$env:SSP_OPENSSL_PACKAGE_VERSION = '4.0.1'
+$env:SSP_SIGNTOOL = 'C:\Path\To\signtool.exe'
 ```
 
-Feature-neutral library and test compilation remains supported, but each
-runnable TLS-selected binary built without either feature exits nonzero with an
-explicit `tls-psk`/`tls-rustls` feature-selection diagnostic.
-
-`tls-psk` preserves the OpenSSL TLS 1.2 PSK and h2 ALPN behavior. `tls-rustls`
-uses TCP gRPC over h2 with TLS 1.2/1.3, mutual self-signed PEM certificates,
-and a normalized SHA-256 pin of the peer leaf certificate's exact DER bytes.
-Rustls validates the pinned leaf's signature, validity, and key usage without
-requiring a hostname. Missing, malformed, or ambiguous startup settings fail;
-there is no plaintext or cross-mode fallback. Rustls builds do not require
-OpenSSL.
-
-Rustls runtime settings are startup-only and may be supplied by either CLI
-flags or their environment variables (not both):
-
-```text
---tls-cert-file <PEM>             SSP_TLS_CERT_FILE
---tls-key-file <PEM>              SSP_TLS_KEY_FILE
---tls-peer-cert-sha256 <HEX>      SSP_TLS_PEER_CERT_SHA256
-```
-
-The pin parser is case-insensitive and normalizes an optional `0x` prefix,
-whitespace, `:` separators, and `-` separators.
-
-## Windows host shadow proxy
-
-The Windows host proxy is in `crates/host-proxy`. It listens for redirected
-TCP and UDP flows, resolves each observed synthetic tuple through the
-authenticated `GetMapping` RPC, connects TCP flows to the original destination,
-and forwards UDP datagrams with response relaying. It also owns the maintenance
-worker and lifecycle policy for stale flows.
-
-Build the default workspace target with:
-
-```text
-cargo build -p shadow-socket-proxy-host
-```
-
-Windows deployments can choose either transport; neither feature is enabled by
-default:
-
-```text
-cargo build -p shadow-socket-proxy-host --features tls-psk
-cargo build -p shadow-socket-proxy-host --features tls-rustls
-```
-
-The PSK build requires a PSK-capable OpenSSL installation and accepts
-`--psk-secret`, `SSP_TLS_PSK_SECRET`, or `--psk-secret-file`. The rustls build
-uses the certificate flags above and does not require OpenSSL. The proxy
-requires a nonzero
-`--udp-idle-timeout-secs` and never falls back to direct forwarding when a
-mapping lookup fails. The listen address must be a specific local IPv4 or IPv6
-address, not a wildcard address, so UDP lookups preserve the actual local
-destination tuple. `--listen-backlog` defaults to 1024 and is passed to native
-`listen` on Windows. Winsock calls a conditional-accept callback only for the
-deferred queue head, so the proxy processes one deferred attempt at a time;
-the configured native backlog neither sizes internal queues nor promises
-parallel conditional admission.
-
-## WSK kernel relay core
-
-The approved kernel-relay path now lives in `crates/kernel-relay`. It keeps
-the driver-owned flow state machine, complete `GetMapping` protobuf
-construction and validation, the versioned opaque tunnel framing for the first
-authenticated gRPC transport, the explicit host-agent/IOCTL transport
-boundary, host-independent TCP relay ownership/deadline bookkeeping, and a
-Windows-gated WSK/WDM driver runtime that now owns pending opaque requests,
-correlated completions, listener setup sequencing, outbound connect decisions,
-and TCP/UDP relay ownership in a host-independent crate with targeted tests:
-
-```text
-cargo check -p shadow-socket-proxy-kernel-relay
-cargo test -p shadow-socket-proxy-kernel-relay
-cargo check -p shadow-socket-proxy-kernel-relay --no-default-features
-```
-
-This crate does not change the existing Linux BPF/control behavior or the
-existing user-mode host-proxy data path; each binary still builds exactly one
-data-plane implementation.
-
-Native WDK linkage is feature-gated. By default, normal Cargo builds use typed
-Windows boundary shims so the host-independent core and tests compile on
-non-driver toolchains. A native build consumes pinned WDK/SDK NuGet packages
-and generates the narrow WSK bindings from
-`crates/kernel-relay/include\wsk_wrapper.h`:
+The WDK/SDK package roots can also be supplied explicitly:
 
 ```powershell
 $env:SSP_WSK_NUGET_ROOT = "$env:USERPROFILE\.nuget\packages"
-$env:WDKContentRoot = "$env:USERPROFILE\.nuget\packages\microsoft.windows.wdk.x64\10.0.28000.2526\c"
-cargo check -p shadow-socket-proxy-kernel-relay `
-  --target x86_64-pc-windows-msvc --features wdk-native
+$env:SSP_WSK_WDK_ROOT = "$env:USERPROFILE\.nuget\packages\microsoft.windows.wdk.x64\10.0.28000.2526\c"
+$env:SSP_WSK_SDK_ROOT = "$env:USERPROFILE\.nuget\packages\microsoft.windows.sdk.cpp\10.0.28000.2526\c"
 ```
 
-`SSP_WSK_WDK_ROOT` and `SSP_WSK_SDK_ROOT` can override package discovery.
-`WDKContentRoot` must be set before Cargo starts because `wdk-sys` reads it
-while its dependency build script runs.
-The generated bindings are written to Cargo's `OUT_DIR`; they are not checked
-in. `NativeWskDataplane` owns provider-dispatch socket creation, callback
-registration, bounded IRP/MDL I/O, half-close, and close operations. Its
-payload-bearing methods require caller-owned buffers; the legacy length-only
-test seam fails explicitly instead of claiming native forwarding.
+## Unified build
 
-### Unified build orchestration
+The supported entry point is the workspace Cargo alias:
 
-From a fresh Windows machine with Rust/MSVC and WSL installed, use the
-workspace xtask to provision dependencies and build the selected artifacts:
+```powershell
+cargo xtask build --release --features <features>
+```
+
+Use `--release` for deployable artifacts. Omit it for a faster debug build.
+The orchestrator:
+
+1. Validates the feature combination.
+2. Provisions WSL, LLVM, OpenSSL, WDK, and SDK dependencies as needed.
+3. Builds the BPF object and Linux control service when `wsl` is selected.
+4. Builds the Windows host proxy for every build.
+5. Builds the native WSK driver only when `kernel-relay` is selected.
+6. Signs and verifies the driver when `test-signing` is selected.
+7. Publishes artifacts and an atomic `manifest.json`.
+
+### Build matrix
+
+```powershell
+# User-mode forwarding, TLS-PSK
+cargo xtask build --release --features wsl tls-psk
+
+# User-mode forwarding, rustls
+cargo xtask build --release --features wsl tls-rustls
+
+# Kernel forwarding, TLS-PSK, test certificate
+cargo xtask build --release --features wsl tls-psk kernel-relay test-signing
+
+# Kernel forwarding, rustls, test certificate
+cargo xtask build --release --features wsl tls-rustls kernel-relay test-signing
+```
+
+### Published artifacts
+
+User-mode builds publish:
+
+```text
+shadow-socket-proxy.bpf.o
+ssp-bpf-fixture-runner
+shadow-socket-proxy-control
+shadow-socket-proxy-host.exe
+manifest.json
+```
+
+Kernel-mode builds publish those artifacts plus:
+
+```text
+shadow_socket_proxy_kernel_relay.dll
+```
+
+The manifest records selected features, target triples, hashes, resolved
+toolchain versions, signing state, and the test certificate thumbprint when
+applicable.
+
+## User-mode deployment on Windows + WSL
+
+The following is a disposable demo deployment. It redirects eligible new
+IPv4 TCP and UDP flows from the selected WSL interface. Do not use it as a
+production service configuration.
+
+### 1. Build
+
+Choose one:
 
 ```powershell
 cargo xtask build --release --features wsl tls-psk
 cargo xtask build --release --features wsl tls-rustls
-cargo xtask build --release --features wsl tls-psk kernel-relay
-cargo xtask build --release --features wsl tls-rustls kernel-relay test-signing
 ```
 
-The command restores the pinned WDK/SDK NuGet packages when the kernel relay
-is selected, installs LLVM/libclang or Windows OpenSSL through `winget` when
-needed, installs the required Ubuntu WSL packages including Cargo/Rust, builds the BPF/control
-service and Windows host proxy, and optionally builds and signs the driver.
-`SSP_WSL_DISTRO` overrides the default `Ubuntu` distribution. Use
-`SSP_LLVM_PACKAGE_VERSION`, `SSP_OPENSSL_PACKAGE_VERSION`, or `SSP_SIGNTOOL`
-to override provisioning/tool discovery. Outputs and `manifest.json` are
-published under `target\ssp-build\<profile>\`.
-
-User-mode forwarding is the default when `kernel-relay` is omitted. TLS
-features are mutually exclusive, and `test-signing` requires `kernel-relay`.
-After provisioning, ordinary package-specific `cargo build` commands remain
-available; native WDK builds still require the WDK environment variables
-documented above.
-
-## Windows/WSL demo deployment
-
-This is a prototype, not a hardened production service. The following procedure
-runs the same control service, BPF program, and Windows host proxy that a demo
-uses. It redirects all eligible new IPv4 TCP and UDP flows from the selected
-WSL interface through the Windows proxy. The proxy creates the actual outbound
-connections, so only use a disposable WSL distribution or a quiet demo
-environment.
-
-The host needs Windows, WSL 2, a WSL distribution with BPF/TC support, and
-Rust 1.96.1 available in both Windows and WSL. The PSK example additionally
-requires a PSK-capable OpenSSL installation. The examples use an Ubuntu
-distribution named `Ubuntu`, a repository at `C:\dev\ShadowSocketProxy`, and
-the default WSL interface
-`eth0`.
-
-### Build the components
-
-Install the Linux build and runtime prerequisites as WSL root, then build as
-the normal WSL user:
+Set the artifact directory:
 
 ```powershell
-wsl -d Ubuntu -u root -- sh -c `
-  'apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y `
-   build-essential clang llvm linux-libc-dev libssl-dev pkg-config make `
-   iproute2 python3 ca-certificates'
-
-wsl -d Ubuntu -- bash -lc `
-  'cd /mnt/c/dev/ShadowSocketProxy &&
-   make -C crates/bpf clean all &&
-   cargo build --locked --release -p shadow-socket-proxy-control --features tls-psk'
-```
-
-For the PSK mode, install the Windows OpenSSL development package and build the
-host components:
-
-```powershell
-winget install --id ShiningLight.OpenSSL.Dev --version 4.0.1 --exact `
-  --scope machine --accept-source-agreements --accept-package-agreements
-
-$openssl = Get-ChildItem 'C:\Program Files' -Directory -Filter 'OpenSSL*' |
-  ForEach-Object { Join-Path $_.FullName 'bin\openssl.exe' } |
-  Where-Object { Test-Path $_ } |
-  Select-Object -First 1
-$opensslRoot = Split-Path (Split-Path $openssl -Parent) -Parent
-$env:OPENSSL_DIR = $opensslRoot
-$env:OPENSSL_LIB_DIR = Join-Path $opensslRoot 'lib\VC\x64\MD'
-
-cargo build --locked --release -p shadow-socket-proxy-host --features tls-psk
-```
-
-For rustls mode, no OpenSSL installation is needed:
-
-```powershell
-cargo build --locked --release -p shadow-socket-proxy-host --features tls-rustls
-```
-
-Generate one self-signed certificate/key pair for each endpoint and pass each
-process its own pair plus the SHA-256 pin of the peer certificate DER. A
-rustls listener has one configured peer-leaf pin, so every client connecting
-to that listener must use the same pinned client certificate; the E2E driver
-therefore shares one client pair between the host proxy and runner. The same
-three `--tls-*` options can be supplied through `SSP_TLS_*` variables;
-supplying a value through both forms is rejected.
-
-### Start the demo with TLS-PSK
-
-Open three PowerShell terminals in the repository. First, calculate the WSL
-gateway address and create one PSK shared by the control service and proxy:
-
-```powershell
+$out = (Resolve-Path .\target\ssp-build\release).Path
 $gateway = (wsl -d Ubuntu -- ip route show default).Split()[2]
+```
+
+### 2. Start the control service
+
+For TLS-PSK, create a temporary 32-byte secret:
+
+```powershell
 $identity = 'ssp-demo'
 $secret = [Convert]::ToHexString((1..32 | ForEach-Object { Get-Random -Maximum 256 }))
 $secret | Set-Content -NoNewline .\ssp-demo.psk
-```
-
-In the first terminal, load the shared credentials and start the control
-service as WSL root. WSL traffic leaves through physical egress, so
-`SSP_TC_HOOK_LAYOUT=wsl` is required here. Do not set that variable for a
-native Linux deployment, which uses the default ingress/egress layout.
-
-```powershell
-$identity = 'ssp-demo'
-$secret = (Get-Content -Raw .\ssp-demo.psk).Trim()
 
 wsl -d Ubuntu -u root -- env `
   RUST_LOG=info `
@@ -288,86 +176,11 @@ wsl -d Ubuntu -u root -- env `
   SSP_TC_HOOK_LAYOUT=wsl `
   SSP_TLS_PSK_IDENTITY=$identity `
   SSP_TLS_PSK_SECRET=$secret `
-  /mnt/c/dev/ShadowSocketProxy/target/release/shadow-socket-proxy-control
+  /mnt/c/dev/ShadowSocketProxy/target/ssp-build/release/shadow-socket-proxy-control
 ```
 
-In the second terminal, rediscover the gateway, identity, and OpenSSL path
-before starting the Windows proxy. The `127.0.0.1` control endpoint uses WSL
-localhost forwarding, while the proxy listens on the WSL gateway address that
-BPF will use as its synthetic destination. The proxy authenticates to the
-control service, attaches the supplied BPF ELF to the interface, and sets its
-own listener as the global target before it accepts traffic.
-
-```powershell
-$gateway = (wsl -d Ubuntu -- ip route show default).Split()[2]
-$identity = 'ssp-demo'
-$openssl = Get-ChildItem 'C:\Program Files' -Directory -Filter 'OpenSSL*' |
-  ForEach-Object { Join-Path $_.FullName 'bin\openssl.exe' } |
-  Where-Object { Test-Path $_ } |
-  Select-Object -First 1
-$opensslRoot = Split-Path (Split-Path $openssl -Parent) -Parent
-$env:PATH = "$opensslRoot\bin;$env:PATH"
-$env:RUST_LOG = 'info'
-
-.\target\release\shadow-socket-proxy-host.exe `
-  --listen "${gateway}:15000" `
-  --control-endpoint https://127.0.0.1:50051 `
-  --psk-identity $identity `
-  --psk-secret-file .\ssp-demo.psk `
-  --bpf-elf /mnt/c/dev/ShadowSocketProxy/crates/bpf/shadow-socket-proxy.bpf.o `
-  --interface eth0
-```
-
-The proxy prints `connected to control service` followed by `attached BPF
-program and configured proxy target`. The control-service terminal prints
-`BPF program attached`; `wsl -d Ubuntu -u root -- bpftool prog list` also shows
-the loaded programs. Each accepted TCP connection and newly created UDP
-association then prints an unconditional forwarding record with its client,
-proxy, and original destination.
-
-In the third terminal, optionally start a local marker server and demonstrate
-the redirected WSL-to-Windows path:
-
-```powershell
-$gateway = (wsl -d Ubuntu -- ip route show default).Split()[2]
-$marker = 'ssp-demo-marker'
-$markerProcess = Start-Process pwsh -PassThru -ArgumentList @(
-  '-NoProfile', '-File', '.\scripts\tcp-marker-server.ps1',
-  '-BindAddress', $gateway, '-Port', '18080', '-Marker', $marker
-)
-
-wsl -d Ubuntu -- python3 -c `
-  "import socket; s = socket.create_connection(('$gateway', 18080), 10); s.sendall(b'demo\n'); print(s.recv(1024).decode().strip()); s.close()"
-```
-
-After the marker validation succeeds, WSL applications can make normal
-outbound connections; their eligible IPv4 TCP and UDP flows are redirected
-through the Windows proxy. For example:
-
-```powershell
-wsl -d Ubuntu -- python3 -c `
-  "import socket; s = socket.create_connection(('1.1.1.1', 443), 10); print(s.getpeername()); s.close()"
-```
-
-### Start the demo with rustls certificate pinning
-
-Build the control service and Windows binaries with the rustls feature:
-
-```powershell
-wsl -d Ubuntu -- bash -lc `
-  'cd /mnt/c/dev/ShadowSocketProxy &&
-   cargo build --locked --release -p shadow-socket-proxy-control --features tls-rustls'
-cargo build --locked --release -p shadow-socket-proxy-host --features tls-rustls
-cargo build --locked --release -p shadow-socket-proxy-e2e-runner --features tls-rustls
-```
-
-Use one self-signed PEM certificate/key pair for the control service and one
-shared client PEM certificate/key pair for the host proxy and runner. Compute
-the SHA-256 pins from each certificate's exact DER bytes. The control service
-must be configured with the client certificate pin; the Windows clients must
-be configured with the control certificate pin.
-
-In the first PowerShell terminal, start the rustls control service:
+For rustls, provide a control certificate, private key, and SHA-256 pin of
+the client certificate's DER bytes:
 
 ```powershell
 $clientPin = '<sha256-of-client-certificate-der>'
@@ -379,125 +192,206 @@ wsl -d Ubuntu -u root -- env `
   SSP_TLS_CERT_FILE=/mnt/c/dev/ShadowSocketProxy/certs/control-cert.pem `
   SSP_TLS_KEY_FILE=/mnt/c/dev/ShadowSocketProxy/certs/control-key.pem `
   SSP_TLS_PEER_CERT_SHA256=$clientPin `
-  /mnt/c/dev/ShadowSocketProxy/target/release/shadow-socket-proxy-control
+  /mnt/c/dev/ShadowSocketProxy/target/ssp-build/release/shadow-socket-proxy-control
 ```
 
-In the second PowerShell terminal, start the rustls Windows host proxy:
+Do not set `SSP_TC_HOOK_LAYOUT=wsl` for a native Linux deployment. It is
+required here because WSL traffic leaves through the physical egress path.
+
+### 3. Start the Windows host proxy
+
+For TLS-PSK:
 
 ```powershell
-$gateway = (wsl -d Ubuntu -- ip route show default).Split()[2]
+.\target\ssp-build\release\shadow-socket-proxy-host.exe `
+  --listen "${gateway}:15000" `
+  --control-endpoint https://127.0.0.1:50051 `
+  --psk-identity $identity `
+  --psk-secret-file .\ssp-demo.psk `
+  --bpf-elf /mnt/c/dev/ShadowSocketProxy/target/ssp-build/release/shadow-socket-proxy.bpf.o `
+  --interface eth0
+```
+
+For rustls:
+
+```powershell
 $controlPin = '<sha256-of-control-certificate-der>'
 
-.\target\release\shadow-socket-proxy-host.exe `
+.\target\ssp-build\release\shadow-socket-proxy-host.exe `
   --listen "${gateway}:15000" `
   --control-endpoint https://127.0.0.1:50051 `
   --tls-cert-file .\certs\client-cert.pem `
   --tls-key-file .\certs\client-key.pem `
   --tls-peer-cert-sha256 $controlPin `
-  --bpf-elf /mnt/c/dev/ShadowSocketProxy/crates/bpf/shadow-socket-proxy.bpf.o `
+  --bpf-elf /mnt/c/dev/ShadowSocketProxy/target/ssp-build/release/shadow-socket-proxy.bpf.o `
   --interface eth0
 ```
 
-Do not provide PSK flags or `SSP_TLS_PSK_*` variables in rustls mode. The
-host proxy and E2E runner must use the same client certificate because the
-control service accepts one configured peer certificate pin.
+The proxy attaches the BPF program, configures its listener as the synthetic
+destination, and then accepts redirected traffic. A successful startup
+reports both control-service connectivity and BPF attachment.
 
-### Stop the demo
+### 4. Stop the demo
 
-Press `Ctrl+C` in the proxy terminal; it detaches the BPF links it attached.
-Then stop the control service and marker process, and remove the temporary PSK
-file:
-
-```powershell
-Stop-Process -Id $markerProcess.Id
-Remove-Item .\ssp-demo.psk
-```
-
-## Documentation
-
-The generated site combines private-item Rustdoc with Doxygen for the
-canonical BPF source. From a clean checkout with Rust 1.96.1 and Doxygen:
-
-```text
-python scripts/check-rustdoc.py
-```
-
-PowerShell:
+Press `Ctrl+C` in the host proxy and control-service terminals. Then remove
+temporary credentials:
 
 ```powershell
-$env:RUSTDOCFLAGS = "-D warnings"
-cargo doc --locked --workspace --no-deps --document-private-items
+Remove-Item .\ssp-demo.psk -ErrorAction SilentlyContinue
 ```
 
-POSIX shell:
+## Kernel-mode build and VM deployment
 
-```sh
-RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --no-deps --document-private-items
-```
+Kernel mode is **experimental**. The build currently produces and signs the
+native WSK driver artifact; it does not provide a turnkey installer or
+production service configuration.
 
-Then, on either platform:
-
-```text
-python -c "import shutil; shutil.rmtree('docs/.generated', ignore_errors=True); shutil.rmtree('site', ignore_errors=True)"
-doxygen docs/Doxyfile
-python scripts/assemble-docs.py --site-dir site
-```
-
-The disposable `site/` directory contains `index.html`, `rustdoc/`, and
-`bpf/`; it is not committed to the source branch.
-
-## Windows/WSL end-to-end validation
-
-The checked-in Windows/WSL driver defaults to the deployed BPF, control service,
-and host proxy with an ephemeral TLS-PSK. That default requires Windows, an
-installed WSL distribution, and the Windows OpenSSL/Rust prerequisites:
+### 1. Build for a disposable VM
 
 ```powershell
-cargo build --locked --release -p shadow-socket-proxy-e2e-runner --features tls-psk
-.\scripts\run-windows-wsl-e2e.ps1 `
-  -Transport psk `
-  -BpfArtifact .\artifacts\bpf\shadow-socket-proxy.bpf.o `
-  -ControlArtifact .\artifacts\control\shadow-socket-proxy-control `
-  -HostArtifact .\artifacts\host
+cargo xtask build --release --features wsl tls-psk kernel-relay test-signing
 ```
 
-For rustls-only end-to-end validation, build all three artifacts with rustls:
+The test certificate is stored outside the repository under the current
+user's local application data. `test-signing` signs the driver; it does not
+silently enable Windows test-signing mode or reboot the machine.
+
+Before loading the driver:
+
+- Take a VM snapshot.
+- Enable Windows test-signing mode explicitly in the VM.
+- Enable kernel debugging and crash dumps.
+- Configure WinDbg on the target.
+- Use Driver Verifier for pool, I/O, deadlock, and unload checks.
+
+Do not load the kernel artifact on a production or primary workstation.
+
+### 2. Validate the artifact
+
+Inspect the published manifest:
 
 ```powershell
+Get-Content .\target\ssp-build\release\manifest.json
+```
+
+Confirm that:
+
+- `features` includes `kernel-relay`.
+- `signing` is `test-signed`.
+- The driver hash matches the published artifact.
+- The recorded LLVM version is `18.1.8`.
+
+The driver exposes the secured device interface
+`\\.\ShadowSocketProxyKernelRelay` for the host-agent/IOCTL transport. A
+compatible user-mode mapping agent is still required for the opaque control
+requests; building the driver alone does not start a complete kernel-mode
+forwarding service.
+
+### 3. Runtime validation order
+
+On the VM, validate in this order:
+
+1. Driver load and unload with no traffic.
+2. Malformed and unauthorized IOCTLs.
+3. One TCP flow in each direction.
+4. TCP half-close and repeated aborts.
+5. UDP and QUIC-as-UDP associations.
+6. Missing mappings and control-agent disconnects.
+7. Concurrent flows, cancellation, unload, and late callbacks.
+8. Resource exhaustion and low-memory behavior.
+
+Stop immediately and collect a kernel dump if Driver Verifier reports a
+failure. Successful compilation and signature verification do not establish
+that the driver is safe for production use.
+
+## Direct Cargo commands
+
+After provisioning, package-level commands remain available:
+
+```powershell
+# Host proxy
+cargo build --locked --release -p shadow-socket-proxy-host --features tls-psk
+cargo build --locked --release -p shadow-socket-proxy-host --features tls-rustls
+
+# Linux control service
 wsl -d Ubuntu -- bash -lc `
   'cd /mnt/c/dev/ShadowSocketProxy &&
-   cargo build --locked --release -p shadow-socket-proxy-control --features tls-rustls'
-cargo build --locked --release -p shadow-socket-proxy-host --features tls-rustls
-cargo build --locked --release -p shadow-socket-proxy-e2e-runner --features tls-rustls
+   cargo build --locked --release -p shadow-socket-proxy-control --features tls-psk'
+
+# Kernel relay host-independent tests
+cargo test -p shadow-socket-proxy-kernel-relay
 ```
 
-Provide a PEM certificate/key pair for the control service and one shared PEM
-client pair for the host proxy and runner. Set the control-service pin to the
-client certificate's DER SHA-256 and the client pin to the control certificate's
-DER SHA-256, then select the rustls branch of the driver:
+Native WDK builds require the pinned WDK/SDK roots and an MSVC developer
+environment. Prefer `cargo xtask build` because it supplies those variables
+in the same process that invokes Cargo.
+
+## Validation
+
+Run the focused tests after code changes:
 
 ```powershell
-.\scripts\run-windows-wsl-e2e.ps1 `
-  -Transport rustls `
-  -BpfArtifact .\crates\bpf\shadow-socket-proxy.bpf.o `
-  -ControlArtifact .\target\release\shadow-socket-proxy-control `
-  -HostArtifact .\target\release `
-  -TlsControlCertificateFile .\certs\control-cert.pem `
-  -TlsControlKeyFile .\certs\control-key.pem `
-  -TlsControlPeerCertSha256 <shared-client-certificate-pin> `
-  -TlsClientCertificateFile .\certs\client-cert.pem `
-  -TlsClientKeyFile .\certs\client-key.pem `
-  -TlsClientPeerCertSha256 <control-certificate-pin>
+cargo fmt --all -- --check
+cargo test -p shadow-socket-proxy-xtask
+cargo test -p shadow-socket-proxy-kernel-relay
 ```
 
-The driver passes the control identity through `SSP_TLS_*` variables and the
-Windows identities through CLI flags. The rustls branch does not install or use
-OpenSSL; no PSK or hostname fallback is attempted.
+The BPF fixture runner is Linux-only:
 
-The command fails when WSL, BPF/TC, authentication, process, marker,
-mapping, counter, or cleanup prerequisites are unavailable; it never falls
-back to direct forwarding.
+```sh
+make -C crates/bpf clean all
+./crates/bpf/ssp-bpf-fixture-runner \
+  ./crates/bpf/shadow-socket-proxy.bpf.o \
+  --fixture target-miss \
+  --fixture flow-create \
+  --fixture forward-rewrite \
+  --fixture reverse-rewrite \
+  --fixture control-bypass \
+  --fixture fin-ack-teardown \
+  --fixture rst
+```
 
-Local runs retain the selected WSL distribution and its existing TC setup.
-CI passes `-TerminateDistribution` because it uses a disposable hosted
-distribution.
+Live WSK, Driver Verifier, low-memory, unload, and end-to-end Linux/Windows
+tests require the appropriate disposable target environment. They are not
+replaced by host-independent unit tests.
+
+## Troubleshooting
+
+### Visual Studio environment not found
+
+Install the Visual Studio C++ workload, or point directly to the developer
+environment script:
+
+```powershell
+$env:SSP_VCVARS64_BAT = 'C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat'
+```
+
+### LLVM version or WDK layout errors
+
+The native binding build requires LLVM 18.1.8:
+
+```powershell
+$env:SSP_LLVM_PACKAGE_VERSION = '18.1.8'
+cargo xtask build --release --features wsl tls-psk kernel-relay test-signing
+```
+
+### OpenSSL errors in TLS-PSK mode
+
+Use rustls to avoid Windows OpenSSL provisioning:
+
+```powershell
+cargo xtask build --release --features wsl tls-rustls
+```
+
+Or set `OPENSSL_DIR`, `OPENSSL_INCLUDE_DIR`, and `OPENSSL_LIB_DIR` to a valid
+PSK-capable OpenSSL development installation.
+
+### Signature verification errors
+
+Use the same Windows user for certificate creation, signing, and verification.
+Pull the latest branch so the build imports the test certificate into the
+current user's `Root` and `TrustedPublisher` stores before verification.
+
+## License
+
+ShadowSocketProxy is licensed under the MIT License. See `LICENSE`.
