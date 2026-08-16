@@ -580,25 +580,31 @@ fn require_command(command: &str, label: &str) -> Result<(), String> {
 }
 
 fn ensure_llvm() -> Result<(), String> {
-    let version = Command::new("clang")
-        .arg("--version")
-        .output()
-        .ok()
-        .and_then(|output| String::from_utf8(output.stdout).ok())
-        .and_then(|text| {
-            text.split_whitespace().find_map(|word| {
-                word.split_once('.')
-                    .and_then(|(major, _)| major.parse::<u32>().ok())
-            })
-        });
-    if version.is_some_and(|major| major >= LLVM_MIN_MAJOR) {
-        if env::var_os("LIBCLANG_PATH").is_none() {
-            let candidate = PathBuf::from(r"C:\Program Files\LLVM\bin");
-            if candidate.join("libclang.dll").exists() {
-                env::set_var("LIBCLANG_PATH", candidate);
+    let candidates = [
+        PathBuf::from("clang"),
+        PathBuf::from(r"C:\Program Files\LLVM\bin\clang.exe"),
+    ];
+    for candidate in candidates {
+        let version = Command::new(&candidate)
+            .arg("--version")
+            .output()
+            .ok()
+            .and_then(|output| String::from_utf8(output.stdout).ok())
+            .and_then(|text| {
+                text.split_whitespace().find_map(|word| {
+                    word.split_once('.')
+                        .and_then(|(major, _)| major.parse::<u32>().ok())
+                })
+            });
+        if version.is_some_and(|major| major >= LLVM_MIN_MAJOR) {
+            if env::var_os("LIBCLANG_PATH").is_none() {
+                let candidate = PathBuf::from(r"C:\Program Files\LLVM\bin");
+                if candidate.join("libclang.dll").exists() {
+                    env::set_var("LIBCLANG_PATH", candidate);
+                }
             }
+            return Ok(());
         }
-        return Ok(());
     }
     install_winget("LLVM.LLVM", env::var("SSP_LLVM_PACKAGE_VERSION").ok())?;
     let candidate = PathBuf::from(r"C:\Program Files\LLVM\bin");
