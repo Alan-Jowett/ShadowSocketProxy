@@ -987,6 +987,18 @@ fn sign_driver(
     if !cert.exists() || !pfx.exists() {
         run_command(&mut make_cert, "create test certificate")?;
     }
+    let mut trust_cert = Command::new(powershell_executable()?);
+    trust_cert.args([
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        &format!(
+            "Import-Certificate -FilePath '{}' -CertStoreLocation Cert:\\CurrentUser\\Root | Out-Null; Import-Certificate -FilePath '{}' -CertStoreLocation Cert:\\CurrentUser\\TrustedPublisher | Out-Null",
+            cert.display(),
+            cert.display()
+        ),
+    ]);
+    run_command(&mut trust_cert, "trust test certificate")?;
     let mut sign = Command::new(&signtool);
     sign.args([
         "sign",
