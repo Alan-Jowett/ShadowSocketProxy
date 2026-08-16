@@ -477,13 +477,21 @@ fn discover_msvc_environment() -> Result<Vec<(String, String)>, String> {
             environment.push((key.to_owned(), value.to_owned()));
         }
     }
-    let has_toolchain = ["PATH", "INCLUDE", "LIB"]
-        .iter()
-        .all(|key| environment.iter().any(|(name, _)| name == key));
+    let has_toolchain = ["PATH", "INCLUDE", "LIB"].iter().all(|key| {
+        environment
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case(key))
+    });
     if !has_toolchain {
+        let keys = environment
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
         return Err(
-            "Visual Studio environment did not expose PATH, INCLUDE, and LIB; install the MSVC C++ toolset"
-                .to_owned(),
+            format!(
+                "Visual Studio environment did not expose PATH, INCLUDE, and LIB; observed environment keys: {keys}; install the MSVC C++ toolset"
+            ),
         );
     }
     Ok(environment)
@@ -1131,5 +1139,19 @@ mod tests {
     fn rejects_unknown_features() {
         let error = parse(&["build", "--features", "wat"]).unwrap_err();
         assert!(error.contains("unknown feature"));
+    }
+
+    #[test]
+    fn accepts_case_insensitive_msvc_environment_keys() {
+        let environment = [
+            ("Path".to_owned(), "path".to_owned()),
+            ("Include".to_owned(), "include".to_owned()),
+            ("Lib".to_owned(), "lib".to_owned()),
+        ];
+        assert!(["PATH", "INCLUDE", "LIB"].iter().all(|key| {
+            environment
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case(key))
+        }));
     }
 }
