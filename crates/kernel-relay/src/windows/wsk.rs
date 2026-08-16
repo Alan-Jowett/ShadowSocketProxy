@@ -3,8 +3,8 @@
 //! WSK registration, listener setup, callback ownership, and relay-operation
 //! seams.
 
-use core::mem::MaybeUninit;
-use std::net::SocketAddr;
+use alloc::format;
+use core::{mem::MaybeUninit, net::SocketAddr};
 
 use crate::{
     error::KernelRelayError,
@@ -310,14 +310,14 @@ const SOL_SOCKET: u32 = 0xffff;
 const NATIVE_IRP_TIMEOUT_100NS: i64 = -5 * 10_000_000;
 
 #[cfg(ssp_wdk_native)]
+use core::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+#[cfg(ssp_wdk_native)]
 use core::{
     ffi::c_void,
     mem,
     ptr::{self, null_mut},
     slice,
 };
-#[cfg(ssp_wdk_native)]
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 #[cfg(ssp_wdk_native)]
 use wdk_sys::{
     ntddk::{
@@ -1401,7 +1401,7 @@ unsafe fn socket_addr_from_ptr(address: crate::wsk_bindings::PSOCKADDR) -> Optio
             let address = &*(address.cast::<crate::wsk_bindings::SOCKADDR_IN6>());
             let bytes = address.sin6_addr.u.Byte;
             let scope_id = address.__bindgen_anon_1.sin6_scope_id;
-            Some(SocketAddr::V6(std::net::SocketAddrV6::new(
+            Some(SocketAddr::V6(core::net::SocketAddrV6::new(
                 Ipv6Addr::from(bytes),
                 u16::from_be(address.sin6_port),
                 address.sin6_flowinfo,

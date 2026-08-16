@@ -2,7 +2,8 @@
 // Copyright (c) 2026 ShadowSocketProxy contributors
 //! Canonical tuple and mapping types owned by the kernel-relay path.
 
-use std::net::SocketAddr;
+use alloc::format;
+use core::net::SocketAddr;
 
 use crate::error::KernelRelayError;
 

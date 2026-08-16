@@ -705,6 +705,7 @@ checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 dependencies = [
  "equivalent",
  "foldhash",
+ "rustc-std-workspace-alloc",
 ]
 
 [[package]]
@@ -1404,6 +1405,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6b1e7f9a428571be2dc5bc0505c13fb6bf936822b894ec87abf8a08a4e51742d"
 
 [[package]]
+name = "rustc-std-workspace-alloc"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f9d441c3b2ebf55cebf796bfdc265d67fa09db17b7bb6bd4be75c509e1e8fec3"
+
+[[package]]
 name = "rusticata-macros"
 version = "4.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1642,10 +1649,10 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "bindgen",
+ "hashbrown 0.17.1",
  "http",
  "prost",
  "protoc-bin-vendored",
- "thiserror 1.0.69",
  "tokio",
  "tonic",
  "tonic-build",

@@ -2,7 +2,8 @@
 // Copyright (c) 2026 ShadowSocketProxy contributors
 //! Driver-owned `GetMapping` protobuf construction and validation.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use alloc::{format, string::ToString, vec::Vec};
+use core::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use prost::Message;
 

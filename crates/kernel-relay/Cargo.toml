@@ -27,8 +27,8 @@ wdk-native = [
 ]
 
 [dependencies]
-prost = "0.13"
-thiserror = "1"
+prost = { version = "0.13", default-features = false, features = ["derive"] }
+hashbrown = { version = "0.17", default-features = false, features = ["alloc", "default-hasher"] }
 
 [dependencies.async-trait]
 version = "0.1"

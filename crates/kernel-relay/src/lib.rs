@@ -8,6 +8,17 @@
 //! skeletons in one place without changing the existing Linux control service
 //! or user-mode host proxy data path.
 
+#![cfg_attr(ssp_wdk_native, no_std)]
+
+extern crate alloc;
+#[cfg(ssp_wdk_native)]
+extern crate wdk_panic;
+#[cfg(ssp_wdk_native)]
+use wdk_alloc::WdkAllocator;
+#[cfg(ssp_wdk_native)]
+#[global_allocator]
+static GLOBAL_ALLOCATOR: WdkAllocator = WdkAllocator;
+
 #[cfg(feature = "opaque-user-tunnel")]
 pub mod agent;
 pub mod codec;
@@ -41,9 +52,11 @@ pub use state::{
     CompletionDisposition, FlowAdmission, FlowController, FlowIdentity, FlowMode, FlowState,
     MappingReady, ResourceLimits,
 };
+#[cfg(not(ssp_wdk_native))]
+pub use telemetry::RecordingTelemetry;
 pub use telemetry::{
-    ExecutionLevel, FailingTelemetry, NoopTelemetry, RecordingTelemetry, TelemetrySink,
-    TransitionEvent, TransitionOutcome,
+    ExecutionLevel, FailingTelemetry, NoopTelemetry, TelemetrySink, TransitionEvent,
+    TransitionOutcome,
 };
 pub use tuple::{FlowProtocol, SocketTuple, ValidatedMapping};
 

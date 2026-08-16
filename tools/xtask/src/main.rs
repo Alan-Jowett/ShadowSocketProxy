@@ -5,6 +5,8 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 #[cfg(windows)]
 use std::os::windows::ffi::OsStrExt;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::{
     collections::BTreeSet,
     env,
@@ -337,6 +339,7 @@ fn build(
         command.args([
             "--target",
             "x86_64-pc-windows-msvc",
+            "--no-default-features",
             "--features",
             "wdk-native",
         ]);
@@ -452,14 +455,20 @@ fn powershell_executable() -> Result<OsString, String> {
 fn discover_msvc_environment() -> Result<Vec<(String, String)>, String> {
     let vcvars = locate_vcvars64()?;
     let command_line = format!("call \"{}\" >nul && set", vcvars.display());
-    let output = Command::new("cmd.exe")
-        .args(["/d", "/s", "/c", &command_line])
+    let mut command = Command::new("cmd.exe");
+    command.args(["/d", "/c"]);
+    #[cfg(windows)]
+    command.raw_arg(&command_line);
+    #[cfg(not(windows))]
+    command.arg(&command_line);
+    let output = command
         .output()
         .map_err(|error| format!("start Visual Studio environment: {error}"))?;
     if !output.status.success() {
         return Err(format!(
-            "Visual Studio environment initialization failed with {}",
-            output.status
+            "Visual Studio environment initialization failed with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
     let mut environment = Vec::new();
@@ -468,9 +477,12 @@ fn discover_msvc_environment() -> Result<Vec<(String, String)>, String> {
             environment.push((key.to_owned(), value.to_owned()));
         }
     }
-    if !environment.iter().any(|(key, _)| key == "LINK") {
+    let has_toolchain = ["PATH", "INCLUDE", "LIB"]
+        .iter()
+        .all(|key| environment.iter().any(|(name, _)| name == key));
+    if !has_toolchain {
         return Err(
-            "Visual Studio environment did not expose LINK; install the MSVC C++ toolset"
+            "Visual Studio environment did not expose PATH, INCLUDE, and LIB; install the MSVC C++ toolset"
                 .to_owned(),
         );
     }
@@ -484,30 +496,37 @@ fn locate_vcvars64() -> Result<PathBuf, String> {
             return Ok(path);
         }
     }
-    if let Ok(output) = Command::new("vswhere.exe")
-        .args([
-            "-latest",
-            "-products",
-            "*",
-            "-requires",
-            "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
-            "-property",
-            "installationPath",
-        ])
-        .output()
-    {
-        if let Some(root) = String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .map(str::trim)
-            .find(|line| !line.is_empty())
+    let vswhere_candidates = [
+        PathBuf::from("vswhere.exe"),
+        PathBuf::from(r"C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe"),
+        PathBuf::from(r"C:\Program Files\Microsoft Visual Studio\Installer\vswhere.exe"),
+    ];
+    for vswhere in vswhere_candidates {
+        if let Ok(output) = Command::new(&vswhere)
+            .args([
+                "-latest",
+                "-products",
+                "*",
+                "-requires",
+                "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+                "-property",
+                "installationPath",
+            ])
+            .output()
         {
-            let path = PathBuf::from(root)
-                .join("VC")
-                .join("Auxiliary")
-                .join("Build")
-                .join("vcvars64.bat");
-            if path.exists() {
-                return Ok(path);
+            if let Some(root) = String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty())
+            {
+                let path = PathBuf::from(root)
+                    .join("VC")
+                    .join("Auxiliary")
+                    .join("Build")
+                    .join("vcvars64.bat");
+                if path.exists() {
+                    return Ok(path);
+                }
             }
         }
     }
@@ -516,7 +535,7 @@ fn locate_vcvars64() -> Result<PathBuf, String> {
         env::var_os("ProgramFiles").map(PathBuf::from),
     ];
     for root in roots.into_iter().flatten() {
-        for year in ["2022", "2019"] {
+        for year in ["18", "2022", "2019"] {
             for edition in ["BuildTools", "Community", "Professional", "Enterprise"] {
                 let path = root
                     .join("Microsoft Visual Studio")

@@ -6,6 +6,7 @@
 #[cfg(feature = "opaque-user-tunnel")]
 use crate::device::TunnelResponse;
 use crate::error::KernelRelayError;
+use alloc::format;
 
 /// Driver dequeue request IOCTL.
 pub const IOCTL_SSP_DEQUEUE_REQUEST: u32 = ctl_code(0x12, 0x800, 0, 0);

@@ -2,6 +2,8 @@
 // Copyright (c) 2026 ShadowSocketProxy contributors
 //! Versioned opaque tunnel framing shared between the driver and host agent.
 
+use alloc::vec::Vec;
+
 use crate::error::KernelRelayError;
 
 /// Current version of the driver/agent tunnel ABI.

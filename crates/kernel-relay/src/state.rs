@@ -2,7 +2,8 @@
 // Copyright (c) 2026 ShadowSocketProxy contributors
 //! Driver-owned flow lifecycle and opaque tunnel correlation.
 
-use std::collections::HashMap;
+use alloc::{format, vec::Vec};
+use hashbrown::HashMap;
 
 use crate::{
     codec::{decode_get_mapping_response, encode_get_mapping_request, MAX_PROTO_MESSAGE_LEN},

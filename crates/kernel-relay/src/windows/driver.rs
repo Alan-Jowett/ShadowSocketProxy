@@ -3,11 +3,9 @@
 //! DriverEntry, runtime ownership, device dispatch, ACL, and unload seams for
 //! the kernel relay.
 
-use core::{mem, ptr, slice};
-use std::{
-    collections::{HashMap, VecDeque},
-    net::SocketAddr,
-};
+use alloc::{collections::VecDeque, format, vec::Vec};
+use core::{mem, net::SocketAddr, ptr, slice};
+use hashbrown::HashMap;
 
 use crate::{
     device::{TunnelRequest, TunnelResponse},

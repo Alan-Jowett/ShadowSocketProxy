@@ -2,6 +2,9 @@
 // Copyright (c) 2026 ShadowSocketProxy contributors
 //! Replaceable state-transition telemetry for the kernel relay.
 
+#[cfg(not(ssp_wdk_native))]
+use alloc::vec::Vec;
+#[cfg(not(ssp_wdk_native))]
 use std::sync::Mutex;
 
 #[cfg(ssp_wsk_windows)]
@@ -63,12 +66,14 @@ impl TelemetrySink for NoopTelemetry {
     }
 }
 
+#[cfg(not(ssp_wdk_native))]
 #[derive(Debug, Default)]
 /// Test sink that records all emitted events.
 pub struct RecordingTelemetry {
     events: Mutex<Vec<TransitionEvent>>,
 }
 
+#[cfg(not(ssp_wdk_native))]
 impl RecordingTelemetry {
     /// Returns a snapshot of the captured transition events.
     pub fn events(&self) -> Vec<TransitionEvent> {
@@ -76,6 +81,7 @@ impl RecordingTelemetry {
     }
 }
 
+#[cfg(not(ssp_wdk_native))]
 impl TelemetrySink for RecordingTelemetry {
     fn emit(&self, event: &TransitionEvent) -> Result<(), KernelRelayError> {
         self.events
