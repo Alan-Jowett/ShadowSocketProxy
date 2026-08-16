@@ -308,6 +308,13 @@ const SO_WSK_EVENT_CALLBACK: u32 = 0x4002;
 const SOL_SOCKET: u32 = 0xffff;
 #[cfg(ssp_wdk_native)]
 const NATIVE_IRP_TIMEOUT_100NS: i64 = -5 * 10_000_000;
+#[cfg(ssp_wdk_native)]
+static WSK_INTERFACE_ID: crate::wsk_bindings::NPIID = crate::wsk_bindings::NPIID {
+    Data1: 0x6e23_af44,
+    Data2: 0x6a96,
+    Data3: 0x4286,
+    Data4: [0x90, 0x5d, 0xa6, 0x9e, 0x4b, 0xe8, 0xe0, 0x51],
+};
 
 #[cfg(ssp_wdk_native)]
 use core::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -676,7 +683,7 @@ impl<'a> NativeWskDataplane<'a> {
             )
         })?;
         let mut callbacks = crate::wsk_bindings::WSK_EVENT_CALLBACK_CONTROL {
-            NpiId: ptr::addr_of!(crate::wsk_bindings::NPI_WSK_INTERFACE_ID),
+            NpiId: ptr::addr_of!(WSK_INTERFACE_ID),
             EventMask: event_mask,
         };
         let (status, _) = sync_wsk_call(record.device, |irp| unsafe {
@@ -710,7 +717,7 @@ impl<'a> NativeWskDataplane<'a> {
             )
         })?;
         let mut callbacks = crate::wsk_bindings::WSK_EVENT_CALLBACK_CONTROL {
-            NpiId: ptr::addr_of!(crate::wsk_bindings::NPI_WSK_INTERFACE_ID),
+            NpiId: ptr::addr_of!(WSK_INTERFACE_ID),
             EventMask: crate::wsk_bindings::WSK_EVENT_ACCEPT
                 | crate::wsk_bindings::WSK_EVENT_RECEIVE_FROM,
         };

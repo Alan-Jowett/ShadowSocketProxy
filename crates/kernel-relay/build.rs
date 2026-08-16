@@ -108,9 +108,23 @@ fn configure_wdk_bindings() {
         bindings
             .write_to_file(&output)
             .unwrap_or_else(|error| panic!("could not write {}: {error}", output.display()));
+        let ntddk_include = include_directory(&wdk_root, "ntddk.h");
+        let include_version = ntddk_include
+            .parent()
+            .and_then(std::path::Path::parent)
+            .unwrap_or_else(|| panic!("could not determine WDK include root"));
+        cc::Build::new()
+            .file("include\\wdm_shim.c")
+            .include(&ntddk_include)
+            .include(include_version.join("shared"))
+            .include(include_version.join("um"))
+            .define("_AMD64_", None)
+            .define("_WIN64", None)
+            .compile("ssp_wdm_shim");
         wdk_build::configure_wdk_binary_build()
             .unwrap_or_else(|error| panic!("wdk-build linker configuration failed: {error}"));
         println!("cargo:rustc-link-lib=netio");
+        println!("cargo:rustc-link-lib=wdmsec");
     }
 }
 

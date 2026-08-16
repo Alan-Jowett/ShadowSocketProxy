@@ -1649,6 +1649,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "bindgen",
+ "cc",
  "hashbrown 0.17.1",
  "http",
  "prost",

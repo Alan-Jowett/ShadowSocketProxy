@@ -50,6 +50,7 @@ optional = true
 
 [build-dependencies]
 bindgen = "0.71.1"
+cc = "1"
 protoc-bin-vendored = "3"
 tonic-build = "0.12"
 wdk-build = "0.5.1"

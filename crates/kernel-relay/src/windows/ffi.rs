@@ -225,6 +225,7 @@ extern "system" {
     pub fn KeAcquireSpinLockRaiseToDpc(lock: *mut KSpinLock) -> KIrql;
     pub fn KeReleaseSpinLock(lock: *mut KSpinLock, old_irql: KIrql);
     pub fn RtlInitUnicodeString(destination: *mut UnicodeString, source: *const u16);
+    #[link_name = "WdmlibIoCreateDeviceSecure"]
     pub fn IoCreateDeviceSecure(
         driver_object: *mut DriverObject,
         device_extension_size: u32,
@@ -243,7 +244,7 @@ extern "system" {
     pub fn IoDeleteSymbolicLink(symbolic_link_name: *const UnicodeString) -> NtStatus;
     pub fn IoDeleteDevice(device_object: *mut DeviceObject);
     pub fn IoCompleteRequest(irp: *mut Irp, priority_boost: i8);
-    pub fn IoGetCurrentIrpStackLocation(irp: *mut Irp) -> *mut IoStackLocation;
+    pub fn SspGetCurrentIrpStackLocation(irp: *mut Irp) -> *mut IoStackLocation;
 }
 
 #[cfg(ssp_wdk_native)]
@@ -252,6 +253,11 @@ pub unsafe fn WskRegister(
     registration: *mut WskRegistration,
 ) -> NtStatus {
     crate::wsk_bindings::WskRegister(client_npi, registration)
+}
+
+#[cfg(ssp_wdk_native)]
+pub unsafe fn IoGetCurrentIrpStackLocation(irp: *mut Irp) -> *mut IoStackLocation {
+    SspGetCurrentIrpStackLocation(irp)
 }
 
 #[cfg(ssp_wdk_native)]
