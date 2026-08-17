@@ -240,33 +240,66 @@ temporary credentials:
 Remove-Item .\ssp-demo.psk -ErrorAction SilentlyContinue
 ```
 
-## Kernel-mode build and VM deployment
+## Kernel-mode setup and VM deployment
 
-Kernel mode is **experimental**. The build currently produces and signs the
-native WSK driver artifact; it does not provide a turnkey installer or
-production service configuration.
+Kernel mode is **experimental** and is not a turnkey deployment yet. The
+repository contains the WSK driver, its bounded flow state machine, and the
+versioned IOCTL ABI, but it does not currently ship:
 
-### 1. Build for a disposable VM
+- An INF or signed production driver package.
+- A service-install/start command integrated into `cargo xtask`.
+- The user-mode mapping agent that dequeues opaque requests from the driver,
+  sends them to the Linux control service, and completes the responses.
+
+Therefore, a complete working kernel-mode forwarding deployment is not
+available yet. Use the user-mode deployment above for an end-to-end system.
+The steps below are the supported preparation and validation workflow for the
+kernel driver on a disposable VM.
+
+### 1. Prepare the VM
+
+Use a Windows VM snapshot with:
+
+- Visual Studio C++ tools and WDK prerequisites.
+- WSL 2 and the target Ubuntu distribution.
+- WinDbg or another kernel debugger connected before driver testing.
+- Kernel crash dumps enabled.
+
+Open an elevated PowerShell and enable test mode and kernel debugging:
+
+```powershell
+bcdedit /set testsigning on
+bcdedit /set debug on
+Restart-Computer
+```
+
+Do not run these commands on a production or primary workstation. Test mode
+and kernel debugging are intentional VM-only settings.
+
+After reboot, confirm the settings:
+
+```powershell
+bcdedit /enum {current} | Select-String 'testsigning|debug'
+```
+
+### 2. Build and sign the driver
+
+From the repository root:
 
 ```powershell
 cargo xtask build --release --features wsl tls-psk kernel-relay test-signing
 ```
 
+Use `tls-rustls` instead of `tls-psk` when the control channel should use
+certificate-pinned mutual TLS:
+
+```powershell
+cargo xtask build --release --features wsl tls-rustls kernel-relay test-signing
+```
+
 The test certificate is stored outside the repository under the current
-user's local application data. `test-signing` signs the driver; it does not
-silently enable Windows test-signing mode or reboot the machine.
-
-Before loading the driver:
-
-- Take a VM snapshot.
-- Enable Windows test-signing mode explicitly in the VM.
-- Enable kernel debugging and crash dumps.
-- Configure WinDbg on the target.
-- Use Driver Verifier for pool, I/O, deadlock, and unload checks.
-
-Do not load the kernel artifact on a production or primary workstation.
-
-### 2. Validate the artifact
+user's local application data. `test-signing` signs and verifies the driver;
+it does not enable Windows test mode or reboot the machine.
 
 Inspect the published manifest:
 
@@ -281,18 +314,74 @@ Confirm that:
 - The driver hash matches the published artifact.
 - The recorded LLVM version is `18.1.8`.
 
-The driver exposes the secured device interface
-`\\.\ShadowSocketProxyKernelRelay` for the host-agent/IOCTL transport. A
-compatible user-mode mapping agent is still required for the opaque control
-requests; building the driver alone does not start a complete kernel-mode
-forwarding service.
+The driver artifact is:
 
-### 3. Runtime validation order
+```text
+target\ssp-build\release\shadow_socket_proxy_kernel_relay.dll
+```
 
-On the VM, validate in this order:
+### 3. Driver loading boundary
+
+The driver creates the secured device interface:
+
+```text
+\\.\ShadowSocketProxyKernelRelay
+```
+
+and accepts the versioned opaque tunnel IOCTLs defined in
+`crates/kernel-relay/src/ioctl.rs`. The current repository does not provide an
+INF, service registration helper, or supported loader command for this
+artifact. Do not assume that copying the DLL or starting the user-mode host
+proxy loads or activates the kernel data plane.
+
+For current development, load the artifact only with the WDK/VM driver-loader
+procedure used by your target test environment, then verify that the device
+interface appears before sending any IOCTLs. A future production-ready kernel
+deployment needs a driver package, service registration, and an agent
+installation step.
+
+### 4. Required user-mode agent
+
+Kernel forwarding still needs a small privileged user-mode agent. Its job is
+to:
+
+1. Open `\\.\ShadowSocketProxyKernelRelay`.
+2. Dequeue mapping requests from the driver.
+3. Forward the opaque TLS/gRPC request to the Linux control service.
+4. Complete the matching response or cancellation IOCTL.
+5. Continue operating when one flow, mapping, or transport request fails.
+
+The existing `shadow-socket-proxy-host.exe` is the **user-mode data plane**; it
+is not the kernel relay agent and must not be run as a substitute for the
+IOCTL tunnel. Until that agent is provided, the kernel build is limited to
+driver loading, IOCTL, WSK, and lifecycle validation rather than complete
+forwarding.
+
+### 5. Enable Driver Verifier
+
+After the driver is loadable in the VM, configure targeted verification from
+an elevated PowerShell:
+
+```powershell
+verifier /reset
+verifier /standard /driver shadow_socket_proxy_kernel_relay.dll
+Restart-Computer
+```
+
+Use WinDbg and crash dumps to investigate any verifier failure. Reset
+verification after a test run:
+
+```powershell
+verifier /reset
+Restart-Computer
+```
+
+### 6. Runtime validation order
+
+Once the loader and agent are available, validate in this order:
 
 1. Driver load and unload with no traffic.
-2. Malformed and unauthorized IOCTLs.
+2. Device open/close and malformed or unauthorized IOCTLs.
 3. One TCP flow in each direction.
 4. TCP half-close and repeated aborts.
 5. UDP and QUIC-as-UDP associations.
