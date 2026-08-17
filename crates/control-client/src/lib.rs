@@ -10,10 +10,11 @@ mod psk {
     use hyper_util::rt::TokioIo;
     use openssl::{
         error::ErrorStack,
-        ssl::{Ssl, SslContext, SslContextBuilder, SslMethod, SslStream, SslVersion},
+        ssl::{Ssl, SslContext, SslContextBuilder, SslMethod, SslVersion},
     };
     use std::{pin::Pin, sync::Arc, time::Duration};
     use tokio::{net::TcpStream, time};
+    use tokio_openssl::SslStream;
     use tonic::transport::{Channel, Endpoint};
     use tower::service_fn;
 
