@@ -117,8 +117,23 @@ pub struct FileObject {
 
 #[repr(C)]
 pub struct DeviceObject {
-    pub device_extension: *mut c_void,
+    pub type_: i16,
+    pub size: u16,
+    pub reference_count: i32,
+    pub driver_object: *mut DriverObject,
+    pub next_device: *mut DeviceObject,
+    pub attached_device: *mut DeviceObject,
+    pub current_irp: *mut Irp,
+    pub timer: *mut c_void,
     pub flags: u32,
+    pub characteristics: u32,
+    pub vpb: *mut c_void,
+    pub device_extension: *mut c_void,
+    pub device_type: u32,
+    pub stack_size: u8,
+    pub _padding: [u8; 3],
+    pub _queue: [u8; 24],
+    pub alignment_requirement: u32,
 }
 
 pub type DriverDispatch = unsafe extern "system" fn(*mut DeviceObject, *mut Irp) -> NtStatus;
