@@ -51,6 +51,7 @@ fn configure_wdk_bindings() {
             println!("cargo:rerun-if-env-changed={variable}");
         }
         println!("cargo:rerun-if-changed=include\\wsk_wrapper.h");
+        println!("cargo:rerun-if-changed=include\\wdm_shim.c");
 
         let arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
         let wdk_package = match arch.as_str() {

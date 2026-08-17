@@ -1590,39 +1590,37 @@ unsafe fn complete_irp(
     status: ffi::NtStatus,
     information: usize,
 ) -> ffi::NtStatus {
-    (*irp).io_status.status = status;
-    (*irp).io_status.information = information;
-    ffi::IoCompleteRequest(irp, ffi::IO_NO_INCREMENT);
+    ffi::SspSetIoStatusAndComplete(irp, status, information);
     status
 }
 
 unsafe fn system_buffer<'a>(irp: *mut ffi::Irp, length: u32) -> &'a [u8] {
-    if length == 0 || (*irp).system_buffer.is_null() {
+    let buffer = ffi::SspGetSystemBuffer(irp);
+    if length == 0 || buffer.is_null() {
         &[]
     } else {
-        slice::from_raw_parts((*irp).system_buffer.cast::<u8>(), length as usize)
+        slice::from_raw_parts(buffer.cast::<u8>(), length as usize)
     }
 }
 
 unsafe fn system_buffer_mut<'a>(irp: *mut ffi::Irp, length: u32) -> &'a mut [u8] {
-    if length == 0 || (*irp).system_buffer.is_null() {
+    let buffer = ffi::SspGetSystemBuffer(irp);
+    if length == 0 || buffer.is_null() {
         &mut []
     } else {
-        slice::from_raw_parts_mut((*irp).system_buffer.cast::<u8>(), length as usize)
+        slice::from_raw_parts_mut(buffer.cast::<u8>(), length as usize)
     }
 }
 
 unsafe fn current_io_control(irp: *mut ffi::Irp) -> Result<(u32, u32, u32), ffi::NtStatus> {
-    let stack = ffi::IoGetCurrentIrpStackLocation(irp);
-    if stack.is_null() {
-        return Err(ffi::STATUS_INVALID_PARAMETER);
+    let mut code = 0;
+    let mut input_length = 0;
+    let mut output_length = 0;
+    let status = ffi::SspGetDeviceIoControl(irp, &mut code, &mut input_length, &mut output_length);
+    if !ffi::nt_success(status) {
+        return Err(status);
     }
-    let control = (*stack).parameters.device_io_control;
-    Ok((
-        control.io_control_code,
-        control.input_buffer_length,
-        control.output_buffer_length,
-    ))
+    Ok((code, input_length, output_length))
 }
 
 /// Exported kernel entry point.

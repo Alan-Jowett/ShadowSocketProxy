@@ -70,44 +70,12 @@ pub struct IoStatusBlock {
 #[repr(C)]
 #[derive(Debug)]
 pub struct Irp {
-    pub system_buffer: *mut c_void,
-    pub io_status: IoStatusBlock,
+    _private: [u8; 0],
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-pub struct DeviceIoControlStack {
-    pub output_buffer_length: u32,
-    pub input_buffer_length: u32,
-    pub io_control_code: u32,
-    pub type3_input_buffer: *mut c_void,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub union IoStackParameters {
-    pub device_io_control: DeviceIoControlStack,
-    pub reserved: [u8; 32],
-}
-
-impl Default for IoStackParameters {
-    fn default() -> Self {
-        Self { reserved: [0; 32] }
-    }
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
 pub struct IoStackLocation {
-    pub major_function: u8,
-    pub minor_function: u8,
-    pub flags: u8,
-    pub control: u8,
-    pub parameters: IoStackParameters,
-    pub device_object: *mut DeviceObject,
-    pub file_object: *mut FileObject,
-    pub completion_routine: *mut c_void,
-    pub context: *mut c_void,
+    _private: [u8; 0],
 }
 
 #[repr(C)]
@@ -260,6 +228,14 @@ extern "system" {
     pub fn IoDeleteDevice(device_object: *mut DeviceObject);
     pub fn IoCompleteRequest(irp: *mut Irp, priority_boost: i8);
     pub fn SspGetCurrentIrpStackLocation(irp: *mut Irp) -> *mut IoStackLocation;
+    pub fn SspGetSystemBuffer(irp: *mut Irp) -> *mut c_void;
+    pub fn SspSetIoStatusAndComplete(irp: *mut Irp, status: NtStatus, information: usize);
+    pub fn SspGetDeviceIoControl(
+        irp: *mut Irp,
+        code: *mut u32,
+        input_length: *mut u32,
+        output_length: *mut u32,
+    ) -> NtStatus;
 }
 
 #[cfg(ssp_wdk_native)]
@@ -360,6 +336,21 @@ pub unsafe fn IoCompleteRequest(_irp: *mut Irp, _priority_boost: i8) {}
 #[cfg(not(ssp_wdk_native))]
 pub unsafe fn IoGetCurrentIrpStackLocation(_irp: *mut Irp) -> *mut IoStackLocation {
     core::ptr::null_mut()
+}
+#[cfg(not(ssp_wdk_native))]
+pub unsafe fn SspGetSystemBuffer(_irp: *mut Irp) -> *mut c_void {
+    core::ptr::null_mut()
+}
+#[cfg(not(ssp_wdk_native))]
+pub unsafe fn SspSetIoStatusAndComplete(_irp: *mut Irp, _status: NtStatus, _information: usize) {}
+#[cfg(not(ssp_wdk_native))]
+pub unsafe fn SspGetDeviceIoControl(
+    _irp: *mut Irp,
+    _code: *mut u32,
+    _input_length: *mut u32,
+    _output_length: *mut u32,
+) -> NtStatus {
+    STATUS_INVALID_PARAMETER
 }
 #[cfg(not(ssp_wdk_native))]
 pub unsafe fn WskRegister(
