@@ -1,0 +1,34 @@
+# SPDX-License-Identifier: MIT
+
+[package]
+name = "shadow-socket-proxy-kernel-agent"
+version = "0.1.0"
+edition = "2021"
+description = "Windows user-mode opaque mapping agent for the WSK kernel relay"
+license = "MIT"
+
+[[bin]]
+name = "shadow-socket-proxy-kernel-agent"
+path = "src/main.rs"
+
+[features]
+default = []
+tls-psk = ["shadow-socket-proxy-control-client/tls-psk"]
+tls-rustls = ["shadow-socket-proxy-control-client/tls-rustls"]
+
+[dependencies]
+async-trait = "0.1"
+clap = { version = "4.5", features = ["derive", "env"] }
+shadow-socket-proxy-control-client = { path = "../control-client", default-features = false }
+shadow-socket-proxy-kernel-relay = { path = "../kernel-relay", default-features = true }
+tokio = { version = "1.40", features = ["macros", "rt-multi-thread", "sync", "time", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+zeroize = "1"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+] }

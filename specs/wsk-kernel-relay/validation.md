@@ -80,6 +80,10 @@ fail explicitly and never count as successful forwarding.
 - Every owned resource has exactly one release path.
 - No DISPATCH path waits, pages, blocks, or performs an unbounded operation.
 - One failure cannot terminate unrelated flows.
+- The kernel agent never becomes a payload forwarding data plane.
+- Agent request ownership, completion, cancellation, and reconnect bounds are
+  finite and observable.
+- Driver-supplied transport epochs are never rewritten by the agent.
 
 ## Failure semantics
 
@@ -119,3 +123,37 @@ The test-signing cases MUST run in an elevated Windows session when enabling
 test-signing configuration. A changed boot configuration is a successful
 configuration result only when the manifest reports `reboot_required`; it is
 not a successful live-driver-load result before reboot.
+
+## Kernel mapping agent validation
+
+| ID | Requirement | Scenario | Expected result |
+|---|---|---|---|
+| TC-WKR-058 | REQ-WKR-021 | Build without `kernel-relay` | No kernel-agent artifact is built or published |
+| TC-WKR-059 | REQ-WKR-021 | Build with `kernel-relay` | Dedicated agent artifact is published separately from host proxy |
+| TC-WKR-060 | REQ-WKR-021 | Inspect agent process surface | No payload listener or user-mode forwarding data plane exists |
+| TC-WKR-061 | REQ-WKR-022 | Build agent with TLS-PSK | Exactly the PSK control client is selected |
+| TC-WKR-062 | REQ-WKR-022 | Build agent with rustls | Exactly the rustls client is selected |
+| TC-WKR-063 | REQ-WKR-022/031 | Inject credentials into logs/errors/manifests | Credential values and private-key material never appear |
+| TC-WKR-064 | REQ-WKR-023 | Open protected device and dequeue request | Authorized handle succeeds and opaque bytes are preserved exactly |
+| TC-WKR-065 | REQ-WKR-023/029 | Poll an empty nonblocking dequeue | Backoff starts at 10 ms, caps at 250 ms, and does not busy-spin |
+| TC-WKR-066 | REQ-WKR-023 | Complete malformed or wrong-sized response | IOCTL fails explicitly; no request or agent-wide state is corrupted |
+| TC-WKR-067 | REQ-WKR-024 | Fail one mapping request | Only its worker/request fails; other workers continue |
+| TC-WKR-068 | REQ-WKR-024/028 | Drop control channel during concurrent work | Uncompletable requests fail individually and the agent reconnects |
+| TC-WKR-069 | REQ-WKR-024/026 | Cancel a worker during control exchange | Cancellation reaches the owning worker and completion is attempted once |
+| TC-WKR-070 | REQ-WKR-025 | Forward opaque TCP mapping bytes | Bytes round-trip without semantic interpretation |
+| TC-WKR-071 | REQ-WKR-025 | Forward opaque UDP mapping bytes | Bytes round-trip without TCP-state assumptions |
+| TC-WKR-072 | REQ-WKR-025 | Forward opaque QUIC-as-UDP bytes | Bytes round-trip as ordinary UDP payload |
+| TC-WKR-073 | REQ-WKR-026/029 | Exceed maximum outstanding requests | New request is rejected or remains in the bounded driver queue; no unbounded growth |
+| TC-WKR-074 | REQ-WKR-026 | Shut down with active workers | Admission stops, workers cancel/complete, handles close, and shutdown returns |
+| TC-WKR-075 | REQ-WKR-026 | Inject allocation or worker-start failure | Only the owning request fails; no panic, leak, or process termination |
+| TC-WKR-076 | REQ-WKR-027/031 | Omit external loader variables | Live test is gated as unavailable with actionable diagnostics |
+| TC-WKR-077 | REQ-WKR-027/031 | Loader returns nonzero or before device readiness | Agent is not started as a successful test; cleanup runs |
+| TC-WKR-078 | REQ-WKR-028 | Run loaded driver, agent, control service, and live TCP/UDP probes | Forwarding succeeds and artifacts/logs identify all selected components |
+| TC-WKR-079 | REQ-WKR-028 | Fail one live flow while another is active | Unrelated TCP/UDP forwarding continues |
+| TC-WKR-080 | REQ-WKR-029 | Run long empty-device interval | Poll delay remains bounded and shutdown remains responsive |
+| TC-WKR-081 | REQ-WKR-029/026 | Saturate workers with bounded requests | Concurrency remains at the configured maximum and no queue grows unbounded |
+| TC-WKR-082 | REQ-WKR-030 | Reconnect control channel repeatedly | Proposed epochs increase strictly and status transitions are reported |
+| TC-WKR-083 | REQ-WKR-030 | Return stale or altered epoch completion | Driver rejects it; agent does not mutate or replay the request |
+| TC-WKR-084 | REQ-WKR-031 | Use unreadable/insecure credential file | Startup fails with a redacted diagnostic |
+| TC-WKR-085 | REQ-WKR-031 | Inspect process privileges and credential cleanup | Only required device/control privileges are used and credential buffers are released |
+| TC-WKR-086 | REQ-WKR-028 | Run live QUIC traffic as UDP through the loaded driver and agent | QUIC datagrams forward as UDP and unrelated TCP/UDP flows remain live |

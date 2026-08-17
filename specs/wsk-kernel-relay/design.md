@@ -158,6 +158,81 @@ User-mode forwarding is the host-proxy default. The plan rejects conflicting
 TLS modes, `test-signing` without `kernel-relay`, and unknown features before
 side effects.
 
+### D-WKR-023 - Dedicated kernel mapping agent
+
+Kernel-relay mode publishes a separate `shadow-socket-proxy-kernel-agent.exe`.
+The executable owns only the device-to-control transport lifecycle. It never
+owns redirected payload listeners, user-mode forwarding sockets, or semantic
+mapping state. The host proxy and agent are separate binaries and data planes.
+
+### D-WKR-024 - Data-plane-neutral control client
+
+The TLS-PSK and rustls mapping clients are exposed through a shared,
+data-plane-neutral control-client module or workspace package. It contains
+only authenticated control-channel configuration, connection, unary opaque
+request/response exchange, and credential validation. Host-proxy forwarding
+modules are not dependencies of the kernel agent.
+
+### D-WKR-025 - Agent feature matrix
+
+The agent has no default feature and exactly one of `tls-psk` or `tls-rustls`.
+The xtask mapping is:
+
+| Public plan | Host proxy | Kernel agent | Driver |
+|---|---|---|---|
+| `tls-psk kernel-relay` | not published as data plane | `tls-psk` | `wdk-native` |
+| `tls-rustls kernel-relay` | not published as data plane | `tls-rustls` | `wdk-native` |
+
+The agent's selected feature is forwarded explicitly to Cargo. Invalid or
+ambiguous agent feature sets fail before provisioning and publication.
+
+### D-WKR-026 - Agent device-channel adapter
+
+The Windows adapter opens `\\.\ShadowSocketProxyKernelRelay` with the required
+ACL-compatible access, issues the canonical dequeue/complete/cancel/status
+IOCTLs, validates exact byte counts, and converts Win32 failures into owned
+request failures. Dequeue is nonblocking; no unbounded overlapped wait is
+assumed.
+
+### D-WKR-027 - Request workers and ownership
+
+The executable maintains a fixed-size worker set or semaphore-bounded worker
+pool. Each worker owns one request record from dequeue through response
+completion or cancellation. Cancellation is recorded before worker release;
+completion is attempted exactly once and late completion errors are isolated.
+
+### D-WKR-028 - Reconnect lifecycle
+
+The lifecycle is `Starting -> DeviceReady -> Connecting -> Serving ->
+Reconnecting -> Draining -> Stopped`. Control loss moves only the agent to
+`Reconnecting`; requests that cannot be completed fail individually. Existing
+driver flows decide their own continuation from transport status. Reconnect
+uses bounded exponential backoff and no request replay.
+
+### D-WKR-029 - Nonblocking poll and bounded concurrency
+
+The pump polls empty dequeues after 10 ms, increasing to a 250 ms cap, while
+checking shutdown and transport state. It never busy-spins. The maximum
+outstanding request count, queue capacity, worker count, request/response
+size, and reconnect-attempt delay are startup configuration values with
+validated safety bounds.
+
+### D-WKR-030 - Epoch transition protocol
+
+The driver remains authoritative for accepted epochs. On reconnect the agent
+increments its proposed epoch, reports connecting/ready/lost state, and
+copies the epoch from each dequeued request into its completion. The driver
+accepts or rejects the epoch; the agent does not override that decision.
+
+### D-WKR-031 - External VM loader interface
+
+Live validation invokes an externally supplied loader through
+`SSP_KERNEL_DRIVER_LOADER`. The loader receives the resolved driver path in
+`SSP_KERNEL_DRIVER_PATH` and MUST return zero only after the device is ready.
+The harness starts the agent using `SSP_KERNEL_AGENT` and passes
+`SSP_KERNEL_CONTROL_ENDPOINT`; absent variables or nonzero loader status gate
+the test as unavailable rather than successful.
+
 ### D-WKR-018 - Provisioning providers
 
 Windows provisioning uses NuGet package restore for the pinned WDK/SDK
@@ -221,6 +296,10 @@ made before reboot.
 | INV-WKR-008 | Lock acquisition follows the documented hierarchy and IRQL rules. |
 | INV-WKR-009 | Every state transition emits replaceable telemetry. |
 | INV-WKR-010 | Shutdown frees no context before callback/completion quiescence. |
+| INV-WKR-011 | The kernel agent never owns payload forwarding or semantic mapping state. |
+| INV-WKR-012 | A request has at most one worker owner and one completion attempt. |
+| INV-WKR-013 | Driver-supplied epochs are echoed unchanged; stale epochs cannot be accepted by the agent. |
+| INV-WKR-014 | Agent resource, worker, queue, and reconnect bounds are finite and startup-validated. |
 
 ## Impact map
 
@@ -246,3 +325,14 @@ made before reboot.
 | REQ-WKR-018 | D-WKR-022 | TC-WKR-054/055/057 |
 | REQ-WKR-019 | D-WKR-016/D-WKR-018/D-WKR-019 | TC-WKR-046/050/056 |
 | REQ-WKR-020 | D-WKR-019 | TC-WKR-043/049 |
+| REQ-WKR-021 | D-WKR-023/D-WKR-025 | TC-WKR-058/059/060 |
+| REQ-WKR-022 | D-WKR-024/D-WKR-025 | TC-WKR-061/062/063 |
+| REQ-WKR-023 | D-WKR-026/D-WKR-029 | TC-WKR-064/065/066 |
+| REQ-WKR-024 | D-WKR-027/D-WKR-028 | TC-WKR-067/068/069 |
+| REQ-WKR-025 | D-WKR-024 | TC-WKR-070/071/072 |
+| REQ-WKR-026 | D-WKR-027/D-WKR-029 | TC-WKR-073/074/075 |
+| REQ-WKR-027 | D-WKR-031 | TC-WKR-076/077 |
+| REQ-WKR-028 | D-WKR-023/D-WKR-028/D-WKR-031 | TC-WKR-078/079/086 |
+| REQ-WKR-029 | D-WKR-026/D-WKR-029 | TC-WKR-080/081 |
+| REQ-WKR-030 | D-WKR-028/D-WKR-030 | TC-WKR-082/083 |
+| REQ-WKR-031 | D-WKR-024/D-WKR-031 | TC-WKR-084/085 |

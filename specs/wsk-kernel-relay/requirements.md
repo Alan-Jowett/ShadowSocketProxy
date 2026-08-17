@@ -102,6 +102,25 @@ assumptions are not requirements for this clean implementation.
 - **Traceability:** User clarification: `All state transitions should expose
   telemetry`.
 
+### CHG-WKR-012 - Dedicated kernel mapping agent
+
+- **Before:** Kernel-relay builds have no concrete user-mode process for the
+  opaque device tunnel.
+- **After:** Add a separate kernel mapping agent with PSK/rustls transports,
+  bounded IOCTL polling, reconnect, and failure isolation. It is published
+  only for kernel-relay builds and is not a payload forwarding data plane.
+- **Traceability:** `USER-REQUEST: separate Windows kernel mapping agent`.
+
+### CHG-WKR-013 - Agent execution and live-test boundary
+
+- **Before:** Agent concurrency, epoch ownership, credentials, and VM startup
+  are underspecified.
+- **After:** Define shared control-client ownership, exact feature mapping,
+  bounded workers, driver-authoritative epochs, redacted credentials, and an
+  explicit external loader contract for disposable-VM validation.
+- **Traceability:** `USER-REQUEST: both TLS modes ... host tests plus
+  disposable-VM live TCP/UDP integration`.
+
 ## Stable Requirements
 
 ### REQ-WKR-001 - Exclusive data-plane mode
@@ -231,7 +250,7 @@ When required, the orchestrator MUST idempotently restore pinned NuGet
 packages `microsoft.windows.wdk.x64`,
 `microsoft.windows.wdk.arm64`, and `microsoft.windows.sdk.cpp`, all at
 `10.0.28000.2526`, into the configured NuGet global package root. It MUST
-discover or install LLVM/libclang major version 18 or newer and a PSK-capable
+discover or install LLVM/libclang version `18.1.8` exactly and a PSK-capable
 OpenSSL development package when `tls-psk` is selected. The default Windows
 package identifiers are `LLVM.LLVM` and `ShiningLight.OpenSSL.Dev`; package
 installation MUST use exact IDs and accept agreements non-interactively.
@@ -308,3 +327,84 @@ environment variables for native WDK and PSK builds.
 - QUIC-specific parsing/state.
 - Application-level flow-count caps; bounded safety buffers are not flow caps.
 - ARM64 live validation in the first implementation.
+
+### REQ-WKR-021 - Dedicated kernel mapping agent
+
+Kernel-relay builds MUST publish a separate
+`shadow-socket-proxy-kernel-agent.exe`. The agent MUST be a mapping/control
+transport process only; it MUST NOT listen for redirected payloads or
+implement user-mode TCP/UDP forwarding. Builds without `kernel-relay` MUST
+NOT publish or require the agent.
+
+### REQ-WKR-022 - Agent TLS transport modes
+
+The agent MUST support the existing TLS-PSK and rustls mutual-certificate
+control contracts. Exactly one agent TLS feature MUST be selected. The agent
+MUST use a data-plane-neutral shared control-client surface; it MUST NOT
+depend on host-proxy forwarding modules. Credentials and private-key material
+MUST never appear in logs, telemetry, manifests, or error text.
+
+### REQ-WKR-023 - Opaque IOCTL request pump
+
+The agent MUST open the ACL-protected
+`\\.\ShadowSocketProxyKernelRelay` device, dequeue opaque request envelopes,
+forward their bytes to the selected authenticated control channel, and
+complete responses using the canonical kernel-relay ABI. It MUST NOT decode
+mapping semantics. Empty nonblocking dequeues MUST use bounded polling with a
+10 ms initial delay and a 250 ms idle-delay cap.
+
+### REQ-WKR-024 - Agent failure isolation and reconnect
+
+A malformed request, missing mapping, control failure, device error,
+cancellation, worker failure, or allocation failure MUST affect only the
+owning request. The agent MUST continue serving other requests, reconnect
+after control-channel loss, and MUST NOT replay requests implicitly.
+
+### REQ-WKR-025 - Agent protocol coverage
+
+The agent path MUST support TCP, UDP, and QUIC-as-UDP requests without
+protocol-specific semantic interpretation. Host tests MUST cover all three
+protocol classes at the opaque transport boundary.
+
+### REQ-WKR-026 - Agent bounded resources and shutdown
+
+The agent MUST enforce a fixed maximum number of outstanding requests and
+bounded request, response, worker, and reconnect resources. Cancellation MUST
+propagate to the owning worker. A worker MUST complete or cancel its request
+before releasing ownership. Shutdown MUST stop admission, cancel workers,
+close the device and control channel, and finish without indefinite waits.
+
+### REQ-WKR-027 - Development deployment boundary
+
+The tranche MUST support development deployment on a disposable Windows VM
+without adding an INF, production driver package, automatic service
+registration, or production installer. Live validation MUST use an explicit
+external loader contract and MUST report missing loader prerequisites as a
+gated failure.
+
+### REQ-WKR-028 - End-to-end kernel acceptance
+
+Acceptance MUST include a loaded signed/test-signed driver, the dedicated
+agent, the Linux control service, and live TCP, UDP, and QUIC-as-UDP traffic.
+The acceptance run MUST demonstrate that agent or flow failures do not stop
+unrelated forwarding.
+
+### REQ-WKR-029 - Bounded nonblocking device pump
+
+The agent MUST treat dequeue as nonblocking. It MUST use bounded backoff,
+check shutdown and cancellation between polls, and avoid unbounded busy
+spins, unbounded queues, and blocking device calls that cannot be cancelled.
+
+### REQ-WKR-030 - Epoch ordering
+
+The driver is authoritative for accepted transport epochs. On each control
+reconnect the agent MUST propose a strictly increasing epoch, report the
+transport state, and echo each request's driver-supplied epoch unchanged.
+The agent MUST NOT accept or synthesize stale response epochs.
+
+### REQ-WKR-031 - Agent privilege and credential handling
+
+The agent MUST run with only the privileges required to open the protected
+device and use configured control credentials. It MUST reject unreadable or
+insecure credential files, redact credential values from diagnostics, and
+close credential-bearing buffers when their ownership ends.

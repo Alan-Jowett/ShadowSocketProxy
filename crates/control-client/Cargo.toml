@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: MIT
+
+[package]
+name = "shadow-socket-proxy-control-client"
+version = "0.1.0"
+edition = "2021"
+description = "Data-plane-neutral authenticated control-channel facade"
+license = "MIT"
+
+[features]
+default = []
+tls-psk = ["dep:hyper-util", "dep:openssl", "dep:tokio-openssl"]
+tls-rustls = ["dep:hyper-util", "dep:shadow-socket-proxy-tls-rustls", "dep:tokio-rustls"]
+
+[dependencies]
+http = "1"
+tonic = { version = "0.12", features = ["transport"] }
+tower = "0.5"
+tokio = { version = "1.40", features = ["net", "time"] }
+hyper-util = { version = "0.1", features = ["tokio"], optional = true }
+openssl = { version = "0.10.81", optional = true }
+tokio-openssl = { version = "0.6.5", optional = true }
+shadow-socket-proxy-tls-rustls = { path = "../tls-rustls", optional = true }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"], optional = true }

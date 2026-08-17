@@ -133,6 +133,7 @@ Kernel-mode builds publish those artifacts plus:
 
 ```text
 shadow_socket_proxy_kernel_relay.dll
+shadow-socket-proxy-kernel-agent.exe
 ```
 
 The manifest records selected features, target triples, hashes, resolved
@@ -242,19 +243,16 @@ Remove-Item .\ssp-demo.psk -ErrorAction SilentlyContinue
 
 ## Kernel-mode setup and VM deployment
 
-Kernel mode is **experimental** and is not a turnkey deployment yet. The
-repository contains the WSK driver, its bounded flow state machine, and the
-versioned IOCTL ABI, but it does not currently ship:
+Kernel mode is **experimental** and is not a production deployment yet. The
+repository contains the WSK driver, bounded flow state machine, versioned
+IOCTL ABI, and dedicated opaque mapping agent, but it does not currently ship:
 
 - An INF or signed production driver package.
 - A service-install/start command integrated into `cargo xtask`.
-- The user-mode mapping agent that dequeues opaque requests from the driver,
-  sends them to the Linux control service, and completes the responses.
 
-Therefore, a complete working kernel-mode forwarding deployment is not
-available yet. Use the user-mode deployment above for an end-to-end system.
-The steps below are the supported preparation and validation workflow for the
-kernel driver on a disposable VM.
+The supported workflow is development-only and requires an external VM driver
+loader. The agent is started separately after the loader reports that the
+device interface is ready.
 
 ### 1. Prepare the VM
 
@@ -314,10 +312,11 @@ Confirm that:
 - The driver hash matches the published artifact.
 - The recorded LLVM version is `18.1.8`.
 
-The driver artifact is:
+The driver and agent artifacts are:
 
 ```text
 target\ssp-build\release\shadow_socket_proxy_kernel_relay.dll
+target\ssp-build\release\shadow-socket-proxy-kernel-agent.exe
 ```
 
 ### 3. Driver loading boundary
@@ -340,22 +339,36 @@ interface appears before sending any IOCTLs. A future production-ready kernel
 deployment needs a driver package, service registration, and an agent
 installation step.
 
-### 4. Required user-mode agent
+### 4. Start the kernel mapping agent
 
-Kernel forwarding still needs a small privileged user-mode agent. Its job is
-to:
+The kernel agent is a separate mapping/control process. It opens
+`\\.\ShadowSocketProxyKernelRelay`, transports opaque requests over the
+authenticated control channel, and completes responses. It does not listen
+for or forward redirected payloads; do not substitute
+`shadow-socket-proxy-host.exe`.
 
-1. Open `\\.\ShadowSocketProxyKernelRelay`.
-2. Dequeue mapping requests from the driver.
-3. Forward the opaque TLS/gRPC request to the Linux control service.
-4. Complete the matching response or cancellation IOCTL.
-5. Continue operating when one flow, mapping, or transport request fails.
+For TLS-PSK:
 
-The existing `shadow-socket-proxy-host.exe` is the **user-mode data plane**; it
-is not the kernel relay agent and must not be run as a substitute for the
-IOCTL tunnel. Until that agent is provided, the kernel build is limited to
-driver loading, IOCTL, WSK, and lifecycle validation rather than complete
-forwarding.
+```powershell
+$env:SSP_KERNEL_CONTROL_ENDPOINT = 'https://127.0.0.1:50051'
+$env:SSP_KERNEL_PSK_IDENTITY = $identity
+$env:SSP_KERNEL_PSK_SECRET_FILE = (Resolve-Path .\ssp-demo.psk).Path
+.\target\ssp-build\release\shadow-socket-proxy-kernel-agent.exe
+```
+
+For rustls:
+
+```powershell
+$env:SSP_KERNEL_CONTROL_ENDPOINT = 'https://127.0.0.1:50051'
+$env:SSP_KERNEL_TLS_CERT_FILE = (Resolve-Path .\certs\client-cert.pem).Path
+$env:SSP_KERNEL_TLS_KEY_FILE = (Resolve-Path .\certs\client-key.pem).Path
+$env:SSP_KERNEL_TLS_PEER_CERT_SHA256 = $controlPin
+.\target\ssp-build\release\shadow-socket-proxy-kernel-agent.exe
+```
+
+The agent polls the nonblocking dequeue IOCTL with bounded backoff, limits
+outstanding workers, reconnects after control-channel loss, and isolates
+individual request failures. It does not implicitly replay requests.
 
 ### 5. Enable Driver Verifier
 
@@ -378,7 +391,7 @@ Restart-Computer
 
 ### 6. Runtime validation order
 
-Once the loader and agent are available, validate in this order:
+Once the external loader and agent are available, validate in this order:
 
 1. Driver load and unload with no traffic.
 2. Device open/close and malformed or unauthorized IOCTLs.
@@ -409,6 +422,9 @@ wsl -d Ubuntu -- bash -lc `
 
 # Kernel relay host-independent tests
 cargo test -p shadow-socket-proxy-kernel-relay
+
+# Kernel mapping agent
+cargo build --locked --release -p shadow-socket-proxy-kernel-agent --features tls-rustls
 ```
 
 Native WDK builds require the pinned WDK/SDK roots and an MSVC developer
@@ -423,6 +439,7 @@ Run the focused tests after code changes:
 cargo fmt --all -- --check
 cargo test -p shadow-socket-proxy-xtask
 cargo test -p shadow-socket-proxy-kernel-relay
+cargo check -p shadow-socket-proxy-kernel-agent --features tls-rustls
 ```
 
 The BPF fixture runner is Linux-only:

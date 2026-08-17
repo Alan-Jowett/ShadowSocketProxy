@@ -319,6 +319,27 @@ fn build(
     )?;
 
     if plan.kernel_relay {
+        let agent_features = tls_feature(plan.tls).ok_or_else(|| {
+            "kernel-relay requires exactly one TLS mode for the kernel agent".to_owned()
+        })?;
+        cargo_build(
+            repo,
+            profile,
+            "shadow-socket-proxy-kernel-agent",
+            Some(&agent_features),
+            None,
+        )?;
+        let agent_binary = repo
+            .join("target")
+            .join(profile)
+            .join("shadow-socket-proxy-kernel-agent.exe");
+        collect_if_exists(
+            staging,
+            "shadow-socket-proxy-kernel-agent.exe",
+            &agent_binary,
+            &mut artifacts,
+        )?;
+
         versions.push(format!(
             "llvm={}",
             detected_version("clang", &["--version"])

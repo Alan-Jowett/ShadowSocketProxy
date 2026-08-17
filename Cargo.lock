@@ -1597,6 +1597,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "shadow-socket-proxy-control-client"
+version = "0.1.0"
+dependencies = [
+ "http",
+ "hyper-util",
+ "openssl",
+ "shadow-socket-proxy-tls-rustls",
+ "tokio",
+ "tokio-openssl",
+ "tokio-rustls",
+ "tonic",
+ "tower 0.5.3",
+]
+
+[[package]]
 name = "shadow-socket-proxy-e2e-runner"
 version = "0.1.0"
 dependencies = [
@@ -1641,6 +1656,21 @@ dependencies = [
  "tower 0.5.3",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "shadow-socket-proxy-kernel-agent"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "clap",
+ "shadow-socket-proxy-control-client",
+ "shadow-socket-proxy-kernel-relay",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "windows-sys 0.61.2",
+ "zeroize",
 ]
 
 [[package]]

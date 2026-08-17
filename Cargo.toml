@@ -6,8 +6,10 @@ members = [
     "crates/bpf/fixture-runner",
     "crates/kernel-relay",
     "crates/control-service",
+    "crates/control-client",
     "crates/e2e-runner",
     "crates/host-proxy",
+    "crates/kernel-agent",
     "crates/tls-rustls",
     "tools/xtask",
 ]
